@@ -210,7 +210,7 @@ resource "aws_ecs_task_definition" "coord" {
         { containerName = "certgen", condition = "SUCCESS" },
         { containerName = "coord", condition = "START" },
       ]
-      command = ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+      command = ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
       portMappings = [{
         name          = "coord-http"
         containerPort = 8080
