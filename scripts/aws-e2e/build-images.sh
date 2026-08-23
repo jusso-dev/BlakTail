@@ -24,6 +24,7 @@ aws_cli ecr get-login-password | \
 
 build_context=$(prepare_git_context)
 cleanup() {
+  docker --context "$DOCKER_CONTEXT" logout "$registry" >/dev/null 2>&1 || :
   case "$build_context" in
     "$WORK_DIR"/build-context.*) rm -rf -- "$build_context" ;;
     *) die "refusing unsafe build-context cleanup" ;;
@@ -68,4 +69,3 @@ jq -n \
 mv "$images_tmp" "$IMAGES_TFVARS"
 validate_image_tfvars
 printf 'immutable ARM64 images ready: %s\n' "$IMAGES_TFVARS"
-

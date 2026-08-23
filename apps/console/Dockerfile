@@ -21,11 +21,11 @@ FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000
 RUN apk add --no-cache postgresql-client && addgroup -S blaktail && adduser -S blaktail -G blaktail
-COPY --from=deps /app/node_modules ./node_modules
-COPY --from=build /app/.next ./.next
-COPY --from=build /app/public ./public
-COPY apps/console/package.json apps/console/drizzle.config.ts ./ 
-COPY apps/console/drizzle ./drizzle
+COPY --chown=blaktail:blaktail --from=deps /app/node_modules ./node_modules
+COPY --chown=blaktail:blaktail --from=build /app/.next ./.next
+COPY --chown=blaktail:blaktail --from=build /app/public ./public
+COPY --chown=blaktail:blaktail apps/console/package.json apps/console/drizzle.config.ts ./
+COPY --chown=blaktail:blaktail apps/console/drizzle ./drizzle
 USER blaktail
 EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
