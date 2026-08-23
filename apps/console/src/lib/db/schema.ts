@@ -1,9 +1,11 @@
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 import {
   boolean,
+  check,
   pgTable,
   text,
   timestamp,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 
 export const user = pgTable("user", {
@@ -12,7 +14,7 @@ export const user = pgTable("user", {
   email: text("email").notNull().unique(),
   emailVerified: boolean("email_verified").notNull().default(false),
   image: text("image"),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
@@ -24,9 +26,9 @@ export const session = pgTable("session", {
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
   ipAddress: text("ip_address"),
   userAgent: text("user_agent"),
-  userId: text("user_id")
-    .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
 });
 
 export const account = pgTable("account", {
@@ -65,17 +67,30 @@ export const organisation = pgTable("organisation", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
-export const membership = pgTable("membership", {
-  id: text("id").primaryKey(),
-  organisationId: text("organisation_id")
-    .notNull()
-    .references(() => organisation.id, { onDelete: "cascade" }),
-  userId: text("user_id")
-    .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
-  role: text("role").notNull().$type<"owner" | "admin" | "member">(),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-});
+export const membership = pgTable(
+  "membership",
+  {
+    id: text("id").primaryKey(),
+    organisationId: text("organisation_id")
+      .notNull()
+      .references(() => organisation.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    role: text("role").notNull().$type<"owner" | "admin" | "member">(),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("membership_org_user_unique").on(
+      table.organisationId,
+      table.userId,
+    ),
+    check(
+      "membership_role_check",
+      sql.raw("\"role\" in ('owner', 'admin', 'member')"),
+    ),
+  ],
+);
 
 export const userRelations = relations(user, ({ many }) => ({
   sessions: many(session),

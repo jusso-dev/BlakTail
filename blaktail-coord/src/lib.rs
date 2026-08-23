@@ -7,6 +7,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -46,21 +47,6 @@ impl Store {
     pub fn memory() -> Result<Self, rusqlite::Error> {
         Self::open(":memory:")
     }
-    /// Imports a console-verified Better Auth session. The bearer token is only stored hashed.
-    pub fn put_session(
-        &self,
-        token: &str,
-        org_id: Uuid,
-        user_id: &str,
-        role: Role,
-        expires_at: i64,
-    ) -> Result<(), rusqlite::Error> {
-        self.0.lock().unwrap().execute(
-            "INSERT OR REPLACE INTO console_sessions(token_hash,org_id,user_id,role,expires_at) VALUES(?1,?2,?3,?4,?5)",
-            params![hash(token), org_id.to_string(), user_id, role.as_str(), expires_at],
-        )?;
-        Ok(())
-    }
 }
 fn ensure_column(
     db: &Connection,
@@ -83,8 +69,9 @@ fn ensure_column(
 struct AppState {
     store: Store,
     region: String,
+    auth_hmac_secret: Arc<[u8]>,
 }
-pub fn app(store: Store, region: String) -> Router {
+pub fn app(store: Store, region: String, auth_hmac_secret: impl Into<Vec<u8>>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/orgs", post(create_org))
@@ -93,11 +80,14 @@ pub fn app(store: Store, region: String) -> Router {
         .route("/v1/orgs/:org_id/nodes/:node_id", delete(admin_revoke_node))
         .route("/v1/orgs/:org_id/acl", get(get_acl))
         .route("/v1/orgs/:org_id/acl", put(put_acl))
-        .route("/v1/console/sessions", post(import_console_session))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
         .route("/v1/nodes/:node_id", delete(revoke_node))
-        .with_state(AppState { store, region })
+        .with_state(AppState {
+            store,
+            region,
+            auth_hmac_secret: auth_hmac_secret.into().into(),
+        })
 }
 #[derive(Debug, Error)]
 enum ApiError {
@@ -219,7 +209,7 @@ async fn mint_join_key(
     headers: HeaderMap,
     Json(input): Json<MintJoinKey>,
 ) -> Result<(StatusCode, Json<JoinKeyResponse>), ApiError> {
-    let session = console_session(&s.store, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id)?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
@@ -469,7 +459,7 @@ async fn list_nodes(
     UrlPath(org_id): UrlPath<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<NodeRow>>, ApiError> {
-    console_session(&s.store, &headers, org_id)?;
+    console_session(&s, &headers, org_id)?;
     let db = s.store.0.lock().unwrap();
     let mut query = db.prepare(
         "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,revoked_at IS NOT NULL FROM nodes WHERE org_id=?1 ORDER BY name",
@@ -500,7 +490,7 @@ async fn admin_revoke_node(
     UrlPath((org_id, node_id)): UrlPath<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let session = console_session(&s.store, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id)?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
@@ -515,74 +505,12 @@ async fn admin_revoke_node(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
-struct ImportSession {
-    token: String,
-    org_id: Uuid,
-    user_id: String,
-    role: Role,
-    expires_at: i64,
-}
-
-async fn import_console_session(
-    State(s): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<ImportSession>,
-) -> Result<StatusCode, ApiError> {
-    require_console_sync_secret(&headers)?;
-    if input.token.is_empty() || input.user_id.trim().is_empty() {
-        return Err(ApiError::BadRequest(
-            "token and user_id must not be empty".into(),
-        ));
-    }
-    if input.expires_at <= now() {
-        return Err(ApiError::BadRequest("expires_at must be in the future".into()));
-    }
-    let exists: bool = s
-        .store
-        .0
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT 1 FROM orgs WHERE id=?1",
-            params![input.org_id.to_string()],
-            |_| Ok(true),
-        )
-        .optional()?
-        .unwrap_or(false);
-    if !exists {
-        return Err(ApiError::NotFound);
-    }
-    s.store.put_session(
-        &input.token,
-        input.org_id,
-        input.user_id.trim(),
-        input.role,
-        input.expires_at,
-    )?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-fn require_console_sync_secret(headers: &HeaderMap) -> Result<(), ApiError> {
-    let expected = std::env::var("BLAKTAIL_CONSOLE_SYNC_SECRET").unwrap_or_default();
-    if expected.is_empty() {
-        return Err(ApiError::Unauthorized);
-    }
-    let provided = headers
-        .get("x-blaktail-console-secret")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if provided.is_empty() || provided.as_bytes() != expected.as_bytes() {
-        return Err(ApiError::Unauthorized);
-    }
-    Ok(())
-}
 async fn get_acl(
     State(s): State<AppState>,
     UrlPath(org_id): UrlPath<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    console_session(&s.store, &headers, org_id)?;
+    console_session(&s, &headers, org_id)?;
     let acl: String = s
         .store
         .0
@@ -603,7 +531,7 @@ async fn put_acl(
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    let session = console_session(&s.store, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id)?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
@@ -620,19 +548,43 @@ async fn put_acl(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Session {
+    #[serde(rename = "sub")]
     user_id: String,
+    org_id: Uuid,
     role: Role,
+    exp: i64,
 }
-fn console_session(store: &Store, headers: &HeaderMap, org_id: Uuid) -> Result<Session, ApiError> {
-    let token = bearer(headers)?;
-    let db = store.0.lock().unwrap();
-    let row:Option<(String,String)>=db.query_row("SELECT user_id,role FROM console_sessions WHERE token_hash=?1 AND org_id=?2 AND expires_at>?3",params![token,org_id.to_string(),now()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-    let (user_id, role) = row.ok_or(ApiError::Unauthorized)?;
-    Ok(Session {
-        user_id,
-        role: role.parse().map_err(|_| ApiError::Unauthorized)?,
-    })
+fn console_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    org_id: Uuid,
+) -> Result<Session, ApiError> {
+    let token = bearer_value(headers)?;
+    let (payload, signature) = token.split_once('.').ok_or(ApiError::Unauthorized)?;
+    if signature.contains('.') {
+        return Err(ApiError::Unauthorized);
+    }
+    let signature = URL_SAFE_NO_PAD
+        .decode(signature)
+        .map_err(|_| ApiError::Unauthorized)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&state.auth_hmac_secret)
+        .map_err(|_| ApiError::Unauthorized)?;
+    mac.update(payload.as_bytes());
+    mac.verify_slice(&signature)
+        .map_err(|_| ApiError::Unauthorized)?;
+    let claims: Session = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(payload)
+            .map_err(|_| ApiError::Unauthorized)?,
+    )
+    .map_err(|_| ApiError::Unauthorized)?;
+    if claims.exp <= now() || claims.org_id != org_id || claims.user_id.trim().is_empty() {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(claims)
 }
 
 fn magic_dns_name(name: &str, org_id: &str) -> String {
@@ -726,13 +678,15 @@ fn selector(roles: &[Role], tags: &[DeviceTag], s: &Subject) -> bool {
         && (tags.is_empty() || tags.iter().any(|t| s.tags.contains(t)))
 }
 fn bearer(headers: &HeaderMap) -> Result<String, ApiError> {
-    let v = headers
+    Ok(hash(bearer_value(headers)?))
+}
+fn bearer_value(headers: &HeaderMap) -> Result<&str, ApiError> {
+    headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .filter(|v| !v.is_empty())
-        .ok_or(ApiError::Unauthorized)?;
-    Ok(hash(v))
+        .ok_or(ApiError::Unauthorized)
 }
 fn now() -> i64 {
     Utc::now().timestamp()
@@ -754,6 +708,24 @@ mod tests {
         http::{Method, Request},
     };
     use tower::ServiceExt;
+    const TEST_SECRET: &[u8] = b"test-only-hmac-secret-at-least-32-bytes";
+    fn signed_session(org_id: Uuid, user_id: &str, role: Role, exp: i64) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&Session {
+                user_id: user_id.into(),
+                org_id,
+                role,
+                exp,
+            })
+            .unwrap(),
+        );
+        let mut mac = Hmac::<Sha256>::new_from_slice(TEST_SECRET).unwrap();
+        mac.update(payload.as_bytes());
+        format!(
+            "{payload}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
+    }
     async fn call(
         r: &Router,
         m: Method,
@@ -779,7 +751,7 @@ mod tests {
     #[tokio::test]
     async fn two_nodes_and_revocation() {
         let store = Store::memory().unwrap();
-        let r = app(store.clone(), "ap-southeast-2".into());
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let o: OrgResponse = body(
             call(
                 &r,
@@ -791,9 +763,7 @@ mod tests {
             .await,
         )
         .await;
-        store
-            .put_session("owner-session", o.id, "owner-1", Role::Owner, now() + 60)
-            .unwrap();
+        let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
         let mut ns = vec![];
         for n in 1..=2 {
             let k: JoinKeyResponse = body(
@@ -802,7 +772,7 @@ mod tests {
                     Method::POST,
                     &format!("/v1/orgs/{}/join-keys", o.id),
                     serde_json::json!({"expires_in_seconds":60}),
-                    Some("owner-session"),
+                    Some(&token),
                 )
                 .await,
             )
@@ -858,7 +828,11 @@ mod tests {
     }
     #[tokio::test]
     async fn health_region() {
-        let r = app(Store::memory().unwrap(), "ap-southeast-2".into());
+        let r = app(
+            Store::memory().unwrap(),
+            "ap-southeast-2".into(),
+            TEST_SECRET,
+        );
         let v: serde_json::Value =
             body(call(&r, Method::GET, "/health", serde_json::Value::Null, None).await).await;
         assert_eq!(
@@ -937,9 +911,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn console_auth_fails_closed_for_missing_forged_and_expired_assertions() {
+        let r = app(
+            Store::memory().unwrap(),
+            "ap-southeast-2".into(),
+            TEST_SECRET,
+        );
+        let o: OrgResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name":"auth-tests"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let path = format!("/v1/orgs/{}/join-keys", o.id);
+        assert_eq!(
+            call(&r, Method::POST, &path, serde_json::json!({}), None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let expired = signed_session(o.id, "owner-1", Role::Owner, now() - 1);
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &path,
+                serde_json::json!({}),
+                Some(&expired)
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut forged = signed_session(o.id, "owner-1", Role::Owner, now() + 60).into_bytes();
+        let last = forged.len() - 1;
+        forged[last] = if forged[last] == b'A' { b'B' } else { b'A' };
+        let forged = String::from_utf8(forged).unwrap();
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &path,
+                serde_json::json!({}),
+                Some(&forged)
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
     async fn member_cannot_mint_keys_or_edit_acl() {
         let store = Store::memory().unwrap();
-        let r = app(store.clone(), "ap-southeast-2".into());
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let o: OrgResponse = body(
             call(
                 &r,
@@ -951,9 +981,7 @@ mod tests {
             .await,
         )
         .await;
-        store
-            .put_session("member-session", o.id, "member-1", Role::Member, now() + 60)
-            .unwrap();
+        let token = signed_session(o.id, "member-1", Role::Member, now() + 60);
         for (method, path, value) in [
             (
                 Method::POST,
@@ -965,11 +993,14 @@ mod tests {
                 format!("/v1/orgs/{}/acl", o.id),
                 serde_json::json!({"rules":[]}),
             ),
+            (
+                Method::DELETE,
+                format!("/v1/orgs/{}/nodes/{}", o.id, Uuid::new_v4()),
+                serde_json::Value::Null,
+            ),
         ] {
             assert_eq!(
-                call(&r, method, &path, value, Some("member-session"))
-                    .await
-                    .status(),
+                call(&r, method, &path, value, Some(&token)).await.status(),
                 StatusCode::FORBIDDEN
             );
         }
@@ -978,7 +1009,7 @@ mod tests {
     #[tokio::test]
     async fn deny_rule_removes_matching_node_from_peer_response() {
         let store = Store::memory().unwrap();
-        let r = app(store.clone(), "ap-southeast-2".into());
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let o: OrgResponse = body(
             call(
                 &r,
@@ -990,9 +1021,7 @@ mod tests {
             .await,
         )
         .await;
-        store
-            .put_session("owner", o.id, "owner-1", Role::Owner, now() + 60)
-            .unwrap();
+        let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
         let mut nodes = vec![];
         for n in 1..=2 {
             let k: JoinKeyResponse = body(
@@ -1001,7 +1030,7 @@ mod tests {
                     Method::POST,
                     &format!("/v1/orgs/{}/join-keys", o.id),
                     serde_json::json!({"tags":["office"]}),
-                    Some("owner"),
+                    Some(&token),
                 )
                 .await,
             )
@@ -1009,7 +1038,7 @@ mod tests {
             let response=call(&r,Method::POST,"/v1/nodes/register",serde_json::json!({"join_key":k.key,"name":format!("office-{n}"),"wg_public_key":format!("office-key-{n}")}),None).await;
             nodes.push(body::<RegisterResponse>(response).await);
         }
-        assert_eq!(call(&r,Method::PUT,&format!("/v1/orgs/{}/acl",o.id),serde_json::json!({"rules":[{"action":"deny","src_tags":["office"],"dst_tags":["office"]}]}),Some("owner")).await.status(),StatusCode::NO_CONTENT);
+        assert_eq!(call(&r,Method::PUT,&format!("/v1/orgs/{}/acl",o.id),serde_json::json!({"rules":[{"action":"deny","src_tags":["office"],"dst_tags":["office"]}]}),Some(&token)).await.status(),StatusCode::NO_CONTENT);
         let peers: PeersResponse = body(
             call(
                 &r,
@@ -1027,7 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn console_can_list_and_revoke_nodes() {
         let store = Store::memory().unwrap();
-        let r = app(store.clone(), "ap-southeast-2".into());
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let o: OrgResponse = body(
             call(
                 &r,
@@ -1039,16 +1068,14 @@ mod tests {
             .await,
         )
         .await;
-        store
-            .put_session("owner-session", o.id, "owner-1", Role::Owner, now() + 60)
-            .unwrap();
+        let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
         let key: JoinKeyResponse = body(
             call(
                 &r,
                 Method::POST,
                 &format!("/v1/orgs/{}/join-keys", o.id),
                 serde_json::json!({}),
-                Some("owner-session"),
+                Some(&token),
             )
             .await,
         )
@@ -1074,7 +1101,7 @@ mod tests {
                 Method::GET,
                 &format!("/v1/orgs/{}/nodes", o.id),
                 serde_json::Value::Null,
-                Some("owner-session"),
+                Some(&token),
             )
             .await,
         )
@@ -1088,7 +1115,7 @@ mod tests {
                 Method::DELETE,
                 &format!("/v1/orgs/{}/nodes/{}", o.id, node.id),
                 serde_json::Value::Null,
-                Some("owner-session"),
+                Some(&token),
             )
             .await
             .status(),
@@ -1100,7 +1127,7 @@ mod tests {
                 Method::GET,
                 &format!("/v1/orgs/{}/nodes", o.id),
                 serde_json::Value::Null,
-                Some("owner-session"),
+                Some(&token),
             )
             .await,
         )

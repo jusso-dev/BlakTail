@@ -38,14 +38,6 @@ function coordBaseUrl(): string {
   return url.replace(/\/$/, "");
 }
 
-function syncSecret(): string {
-  const secret = process.env.BLAKTAIL_CONSOLE_SYNC_SECRET;
-  if (!secret) {
-    throw new Error("BLAKTAIL_CONSOLE_SYNC_SECRET is required.");
-  }
-  return secret;
-}
-
 async function coordFetch(
   path: string,
   init: RequestInit & { sessionToken?: string } = {},
@@ -75,25 +67,6 @@ async function readError(res: Response): Promise<string> {
   return `Coordinator returned ${res.status}`;
 }
 
-export async function syncSessionToCoord(ctx: ConsoleContext): Promise<void> {
-  const res = await coordFetch("/v1/console/sessions", {
-    method: "POST",
-    headers: {
-      "x-blaktail-console-secret": syncSecret(),
-    },
-    body: JSON.stringify({
-      token: ctx.sessionToken,
-      org_id: ctx.coordOrgId,
-      user_id: ctx.userId,
-      role: ctx.role,
-      expires_at: Math.floor(ctx.sessionExpiresAt.getTime() / 1000),
-    }),
-  });
-  if (!res.ok) {
-    throw new Error(await readError(res));
-  }
-}
-
 export async function getCoordHealth(): Promise<CoordHealth> {
   const res = await coordFetch("/health", { method: "GET" });
   if (!res.ok) {
@@ -103,10 +76,9 @@ export async function getCoordHealth(): Promise<CoordHealth> {
 }
 
 export async function listNodes(ctx: ConsoleContext): Promise<CoordNode[]> {
-  await syncSessionToCoord(ctx);
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/nodes`, {
     method: "GET",
-    sessionToken: ctx.sessionToken,
+    sessionToken: ctx.coordAssertion,
   });
   if (!res.ok) {
     throw new Error(await readError(res));
@@ -121,10 +93,9 @@ export async function revokeNode(
   if (ctx.role === "member") {
     throw new Error("Members cannot revoke devices.");
   }
-  await syncSessionToCoord(ctx);
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/nodes/${nodeId}`, {
     method: "DELETE",
-    sessionToken: ctx.sessionToken,
+    sessionToken: ctx.coordAssertion,
   });
   if (!res.ok) {
     throw new Error(await readError(res));
@@ -142,10 +113,9 @@ export async function mintJoinKey(
   if (ctx.role === "member") {
     throw new Error("Members cannot mint join keys.");
   }
-  await syncSessionToCoord(ctx);
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/join-keys`, {
     method: "POST",
-    sessionToken: ctx.sessionToken,
+    sessionToken: ctx.coordAssertion,
     body: JSON.stringify({
       expires_in_seconds: input.expiresInSeconds ?? 3600,
       single_use: input.singleUse ?? true,
@@ -159,10 +129,9 @@ export async function mintJoinKey(
 }
 
 export async function getAcl(ctx: ConsoleContext): Promise<unknown> {
-  await syncSessionToCoord(ctx);
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/acl`, {
     method: "GET",
-    sessionToken: ctx.sessionToken,
+    sessionToken: ctx.coordAssertion,
   });
   if (!res.ok) {
     throw new Error(await readError(res));
@@ -174,10 +143,9 @@ export async function putAcl(ctx: ConsoleContext, acl: unknown): Promise<void> {
   if (ctx.role === "member") {
     throw new Error("Members cannot edit ACL rules.");
   }
-  await syncSessionToCoord(ctx);
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/acl`, {
     method: "PUT",
-    sessionToken: ctx.sessionToken,
+    sessionToken: ctx.coordAssertion,
     body: JSON.stringify(acl),
   });
   if (!res.ok) {

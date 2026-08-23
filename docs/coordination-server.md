@@ -10,6 +10,7 @@ TLS and an explicit region are mandatory. The process refuses to start when `BLA
 BLAKTAIL_REGION=ap-southeast-2 \
 BLAKTAIL_BIND=0.0.0.0:443 \
 BLAKTAIL_DATABASE=/var/lib/blaktail/coord.sqlite3 \
+BLAKTAIL_AUTH_HMAC_SECRET=<shared-random-secret-at-least-32-bytes> \
 BLAKTAIL_TLS_CERT=/etc/blaktail/tls/fullchain.pem \
 BLAKTAIL_TLS_KEY=/etc/blaktail/tls/private.key \
 cargo run -p blaktail-coord --release
@@ -23,7 +24,6 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 - `POST /v1/orgs/{org_id}/join-keys` — owner/admin bearer session; `{ "expires_in_seconds": 3600, "single_use": true, "tags": ["office"] }`
 - `GET /v1/orgs/{org_id}/nodes` — any org user session; list devices
 - `DELETE /v1/orgs/{org_id}/nodes/{node_id}` — owner/admin session; revoke a device
-- `POST /v1/console/sessions` — console sync secret header; import a Better Auth session
 - `POST /v1/nodes/register` — join key, name, WG public key, and optional public endpoint; the server allocates a tailnet IP
 - `GET /v1/nodes/{node_id}/peers` — bearer node token; active peers only
 - `DELETE /v1/nodes/{node_id}` — bearer node token; self-revocation
@@ -33,9 +33,7 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 
 Join and node credentials are returned once; only SHA-256 hashes are stored. Join keys expire after at most 30 days and default to single-use. Peer polling has no cache, so revocation is visible on the next request (within 60 seconds).
 
-The console verifies Better Auth sessions and imports them over
-`POST /v1/console/sessions` (shared `BLAKTAIL_CONSOLE_SYNC_SECRET` via
-`x-blaktail-console-secret`). Only the token hash is retained. Roles are
+The console verifies Better Auth sessions in onshore Postgres, maps the user to an organisation and role, then issues a short-lived HMAC assertion using the shared `BLAKTAIL_AUTH_HMAC_SECRET`. Rust validates that assertion on every console request and stores no auth sessions. Use independent, randomly generated values of at least 32 bytes for this secret and `BETTER_AUTH_SECRET`. Roles are
 `owner`, `admin`, and `member`. Members can read ACLs and device lists but
 cannot mint join keys, update ACLs, or revoke devices. A join key binds its
 creator's user identity and role plus zero or more of the fixed device tags

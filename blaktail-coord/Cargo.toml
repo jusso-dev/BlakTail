@@ -12,6 +12,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+hmac = "0.12"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

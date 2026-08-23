@@ -16,11 +16,9 @@ tailnet authorisation.
 ## Auth flow
 
 1. Operators sign in with Better Auth. Sessions live in onshore Postgres.
-2. Before a mutating coordinator call, the console posts the session to
-   `POST /v1/console/sessions` with `x-blaktail-console-secret`.
-3. Later calls send `Authorization: Bearer <session token>`.
-4. Signed-out browsers never reach those server actions; the coordinator also
-   rejects missing or unknown sessions on mutating routes.
+2. For each coordinator call, the console revalidates the database session and loads the user's organisation membership.
+3. The console signs a short-lived (at most 60 seconds) org/user/role assertion with `BLAKTAIL_AUTH_HMAC_SECRET`; the assertion never contains the Better Auth cookie or session token.
+4. Rust verifies the HMAC, expiry, organisation, and role on every protected route. Missing, expired, cross-org, or forged assertions receive 401.
 
 ## Local development
 
