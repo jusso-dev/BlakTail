@@ -1,0 +1,17 @@
+# Rust build artefacts
+/target/
+**/target/
+
+# Private keys and WireGuard material
+*.key
+*.pem
+*.psk
+*.priv
+*.private
+wg*.conf
+*.wg.conf
+**/wg/configs/
+**/keys/
+.env
+.env.*
+!*.env.example
