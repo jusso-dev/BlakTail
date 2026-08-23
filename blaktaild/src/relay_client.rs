@@ -756,4 +756,17 @@ mod tests {
         assert!(KEEPALIVE_SECS < blaktail_relay::RelayConfig::default().idle_secs);
         assert_eq!(MAX_PAYLOAD, blaktail_relay::MAX_PAYLOAD);
     }
+
+    #[test]
+    fn ipv6_minimum_mtu_fits_relay_envelope() {
+        const WIREGUARD_TRANSPORT_OVERHEAD: usize = 32;
+        const IPV6_AND_UDP_OVERHEAD: usize = 40 + 8;
+        assert_eq!(
+            crate::TUNNEL_MTU.parse::<usize>().unwrap(),
+            crate::TUNNEL_MTU_BYTES
+        );
+        let encrypted_packet = crate::TUNNEL_MTU_BYTES + WIREGUARD_TRANSPORT_OVERHEAD;
+        assert!(encrypted_packet <= MAX_PAYLOAD);
+        assert!(encrypted_packet + HEADER + IPV6_AND_UDP_OVERHEAD <= 1_500);
+    }
 }

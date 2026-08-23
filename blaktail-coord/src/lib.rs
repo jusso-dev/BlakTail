@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    net::{Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
     time::Instant,
@@ -87,6 +87,7 @@ impl Store {
             [],
         )?;
         normalise_dns_names(&db)?;
+        backfill_ipv6_addresses(&db)?;
         db.execute_batch(
             "CREATE UNIQUE INDEX IF NOT EXISTS nodes_dns_name_org_idx ON nodes(org_id,dns_name) WHERE dns_name<>''",
         )?;
@@ -140,6 +141,37 @@ fn normalise_dns_names(db: &Connection) -> Result<(), rusqlite::Error> {
                 params![desired, id],
             )?;
         }
+    }
+    Ok(())
+}
+
+fn backfill_ipv6_addresses(db: &Connection) -> Result<(), rusqlite::Error> {
+    let rows = {
+        let mut query = db.prepare("SELECT id,org_id,allowed_ips_json FROM nodes")?;
+        let collected = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        collected
+    };
+    for (node_id, org_id, addresses_json) in rows {
+        let mut addresses: Vec<String> = serde_json::from_str(&addresses_json).unwrap_or_default();
+        if addresses.iter().any(|address| address.contains(':')) {
+            continue;
+        }
+        let Some(host) = assigned_ipv4_host(&addresses) else {
+            continue;
+        };
+        addresses.push(org_ula_address(&org_id, host));
+        db.execute(
+            "UPDATE nodes SET allowed_ips_json=?1 WHERE id=?2",
+            params![serde_json::to_string(&addresses).unwrap(), node_id],
+        )?;
     }
     Ok(())
 }
@@ -906,6 +938,7 @@ struct RegisterResponse {
     org_id: Uuid,
     node_token: String,
     assigned_ip: String,
+    assigned_ips: Vec<String>,
     dns_name: String,
     credential_expires_at: i64,
     /// Advertised relay endpoints plus a capability token for them.
@@ -955,7 +988,7 @@ async fn register_node(
     }
     let id = Uuid::new_v4();
     let token = secret("btn");
-    let allowed_ips = vec![allocate_ip(&tx, &grant.org_id)?];
+    let allowed_ips = allocate_ips(&tx, &grant.org_id)?;
     let assigned_ip = allowed_ips[0].clone();
     let dns_name = magic_dns_name(input.name.trim(), &grant.org_id);
     let registered_at = now();
@@ -981,6 +1014,7 @@ async fn register_node(
             org_id: Uuid::parse_str(&grant.org_id).unwrap(),
             node_token: token,
             assigned_ip,
+            assigned_ips: allowed_ips,
             dns_name,
             credential_expires_at,
             relays: s.relays.as_ref().clone(),
@@ -1228,6 +1262,7 @@ struct Peer {
 #[derive(Serialize, Deserialize)]
 struct PeersResponse {
     peers: Vec<Peer>,
+    assigned_ips: Vec<String>,
     dns_name: String,
     credential_expires_at: i64,
     #[serde(default)]
@@ -1245,6 +1280,8 @@ struct PeersResponse {
 struct PeerSelection {
     #[serde(default)]
     exit_node: Option<String>,
+    #[serde(default)]
+    ipv6: bool,
 }
 
 async fn list_peers(
@@ -1255,11 +1292,11 @@ async fn list_peers(
 ) -> Result<Json<PeersResponse>, ApiError> {
     let token = bearer(&headers)?;
     let db = s.store.0.lock().unwrap();
-    let (org, source_role, source_tags, acl_json, credential_expires_at, dns_name): (String,String,String,String,i64,String) = db
+    let (org, source_role, source_tags, acl_json, credential_expires_at, dns_name, source_addresses): (String,String,String,String,i64,String,String) = db
         .query_row(
-            "SELECT n.org_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=?1 AND n.token_hash=?2 AND n.revoked_at IS NULL",
+            "SELECT n.org_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=?1 AND n.token_hash=?2 AND n.revoked_at IS NULL",
             params![node_id.to_string(), token],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
         )
         .optional()?
         .ok_or(ApiError::Unauthorized)?;
@@ -1337,12 +1374,20 @@ async fn list_peers(
                     peer.allowed_ips.push(route);
                 }
             }
+            if !selection.ipv6 {
+                peer.allowed_ips.retain(|route| !route.contains(':'));
+            }
             Some(peer)
         })
         .collect();
+    let mut assigned_ips: Vec<String> = serde_json::from_str(&source_addresses).unwrap_or_default();
+    if !selection.ipv6 {
+        assigned_ips.retain(|address| !address.contains(':'));
+    }
     let (relay_token, relay_expires_at) = relay_credentials(&s, node_id);
     Ok(Json(PeersResponse {
         peers,
+        assigned_ips,
         dns_name,
         credential_expires_at,
         exit_node_active,
@@ -1418,7 +1463,7 @@ fn relay_capability(secret: &[u8], node_id: Uuid, expires_at_unix: u64) -> Strin
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn allocate_ip(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<String, ApiError> {
+fn allocate_ips(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<Vec<String>, ApiError> {
     let mut used = std::collections::HashSet::new();
     let mut query = tx.prepare("SELECT allowed_ips_json FROM nodes WHERE org_id=?1")?;
     let rows = query.query_map([org_id], |row| row.get::<_, String>(0))?;
@@ -1427,10 +1472,33 @@ fn allocate_ip(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<String, A
             used.insert(ip);
         }
     }
-    (1..=254)
+    let ipv4 = (1..=254)
         .map(|host| format!("100.64.0.{host}/32"))
         .find(|ip| !used.contains(ip))
-        .ok_or_else(|| ApiError::Conflict("tailnet address pool exhausted".into()))
+        .ok_or_else(|| ApiError::Conflict("tailnet address pool exhausted".into()))?;
+    let host = assigned_ipv4_host(std::slice::from_ref(&ipv4))
+        .expect("coordinator-generated IPv4 address is valid");
+    Ok(vec![ipv4, org_ula_address(org_id, host)])
+}
+
+fn assigned_ipv4_host(addresses: &[String]) -> Option<u8> {
+    addresses.iter().find_map(|address| {
+        let (address, prefix) = address.split_once('/')?;
+        if prefix != "32" {
+            return None;
+        }
+        let octets = address.parse::<Ipv4Addr>().ok()?.octets();
+        (octets[..3] == [100, 64, 0] && octets[3] != 0).then_some(octets[3])
+    })
+}
+
+fn org_ula_address(org_id: &str, host: u8) -> String {
+    let digest = Sha256::digest(org_id.as_bytes());
+    let mut octets = [0_u8; 16];
+    octets[0] = 0xfd;
+    octets[1..8].copy_from_slice(&digest[..7]);
+    octets[15] = host;
+    format!("{}/128", Ipv6Addr::from(octets))
 }
 
 fn validate_advertised_routes(routes: Vec<String>) -> Result<Vec<String>, ApiError> {
@@ -2317,6 +2385,113 @@ mod tests {
         assert!(metrics_text
             .contains("blaktail_coord_requests_total{operation=\"revoke\",result=\"success\"} 1"));
         assert!(metrics_text.contains("blaktail_coord_active_nodes 0"));
+    }
+
+    #[tokio::test]
+    async fn ipv6_addresses_are_org_scoped_and_capability_gated() {
+        fn ipv6(response: &RegisterResponse) -> Ipv6Addr {
+            response
+                .assigned_ips
+                .iter()
+                .find_map(|address| address.split('/').next()?.parse().ok())
+                .expect("dual-stack registration includes IPv6")
+        }
+
+        let store = Store::memory().unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org_a: OrgResponse = body(
+            call(
+                &router,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name":"ipv6-org-a"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let org_b: OrgResponse = body(
+            call(
+                &router,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name":"ipv6-org-b"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let owner_a = signed_session(org_a.id, "owner-a", Role::Owner, now() + 60);
+        let owner_b = signed_session(org_b.id, "owner-b", Role::Owner, now() + 60);
+        let node_a = register_test_node(&router, org_a.id, &owner_a, "a", "key-a", &[]).await;
+        let node_b = register_test_node(&router, org_a.id, &owner_a, "b", "key-b", &[]).await;
+        let node_c = register_test_node(&router, org_b.id, &owner_b, "c", "key-c", &[]).await;
+
+        assert_eq!(node_a.assigned_ips.len(), 2);
+        assert_eq!(node_a.assigned_ip, node_a.assigned_ips[0]);
+        let address_a = ipv6(&node_a).octets();
+        let address_b = ipv6(&node_b).octets();
+        let address_c = ipv6(&node_c).octets();
+        assert_eq!(address_a[0], 0xfd);
+        assert_eq!(&address_a[..8], &address_b[..8]);
+        assert_ne!(&address_a[..8], &address_c[..8]);
+        assert_ne!(address_a, address_b);
+
+        let legacy: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", node_a.id),
+                serde_json::Value::Null,
+                Some(&node_a.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(legacy.assigned_ips, vec![node_a.assigned_ip.clone()]);
+        assert_eq!(legacy.peers[0].allowed_ips.len(), 1);
+
+        let dual_stack: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers?ipv6=true", node_a.id),
+                serde_json::Value::Null,
+                Some(&node_a.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(dual_stack.assigned_ips, node_a.assigned_ips);
+        assert_eq!(dual_stack.peers[0].allowed_ips, node_b.assigned_ips);
+
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE nodes SET allowed_ips_json=?1 WHERE id=?2",
+                params![
+                    serde_json::to_string(&vec![node_b.assigned_ip.clone()]).unwrap(),
+                    node_b.id.to_string(),
+                ],
+            )
+            .unwrap();
+        backfill_ipv6_addresses(&store.0.lock().unwrap()).unwrap();
+        let restored: String = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT allowed_ips_json FROM nodes WHERE id=?1",
+                params![node_b.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&restored).unwrap(),
+            node_b.assigned_ips
+        );
     }
 
     #[tokio::test]

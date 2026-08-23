@@ -1,11 +1,13 @@
 use crate::{Error, NodeState};
+#[cfg(test)]
+use std::net::Ipv4Addr;
 #[cfg(not(target_os = "macos"))]
 use std::process::{Command, Stdio};
 use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -24,7 +26,7 @@ pub const MODE_RESOLV_CONF: &str = "resolv-conf";
 #[derive(Clone, Default)]
 struct Records {
     domain: String,
-    addresses: HashMap<String, Ipv4Addr>,
+    addresses: HashMap<String, Vec<IpAddr>>,
 }
 
 pub struct MagicDns {
@@ -130,24 +132,26 @@ fn valid_domain(domain: &str) -> bool {
 }
 
 fn state_ip(state: &NodeState) -> Result<IpAddr, Error> {
-    state
-        .assigned_ip
-        .split('/')
-        .next()
-        .and_then(|value| value.parse().ok())
+    let addresses = state
+        .interface_addresses()
+        .into_iter()
+        .filter_map(|address| address.split('/').next()?.parse::<IpAddr>().ok())
+        .collect::<Vec<_>>();
+    addresses
+        .iter()
+        .copied()
+        .find(IpAddr::is_ipv6)
+        .or_else(|| addresses.first().copied())
         .ok_or_else(|| Error::Message("assigned tailnet address is invalid".into()))
 }
 
 fn records_from_state(state: &NodeState, domain: &str) -> Records {
     let mut addresses = HashMap::new();
-    insert_record(
-        &mut addresses,
-        &state.dns_name,
-        state.assigned_ip.as_str(),
-        domain,
-    );
+    for address in state.interface_addresses() {
+        insert_record(&mut addresses, &state.dns_name, &address, domain);
+    }
     for peer in &state.peers {
-        if let Some(address) = peer.allowed_ips.first() {
+        for address in &peer.allowed_ips {
             insert_record(&mut addresses, &peer.dns_name, address, domain);
         }
     }
@@ -157,22 +161,45 @@ fn records_from_state(state: &NodeState, domain: &str) -> Records {
     }
 }
 
-fn insert_record(records: &mut HashMap<String, Ipv4Addr>, name: &str, address: &str, domain: &str) {
+fn insert_record(
+    records: &mut HashMap<String, Vec<IpAddr>>,
+    name: &str,
+    address: &str,
+    domain: &str,
+) {
     let name = name.trim_end_matches('.').to_ascii_lowercase();
     if !name.ends_with(&format!(".{domain}")) {
         return;
     }
-    let Some(address) = address
-        .split('/')
-        .next()
-        .and_then(|value| value.parse::<Ipv4Addr>().ok())
-    else {
+    let Some((address, prefix)) = address.split_once('/') else {
         return;
     };
-    if let Some((label, _)) = name.split_once('.') {
-        records.insert(label.into(), address);
+    let Some(address) = address.parse::<IpAddr>().ok() else {
+        return;
+    };
+    let host_prefix = if address.is_ipv4() { "32" } else { "128" };
+    if prefix != host_prefix {
+        return;
     }
-    records.insert(name, address);
+    let mut insert = |key: String| {
+        let values = records.entry(key).or_default();
+        if !values.contains(&address) {
+            values.push(address);
+        }
+    };
+    if let Some((label, _)) = name.split_once('.') {
+        insert(label.into());
+    }
+    insert(name);
+}
+
+fn address_for_query(addresses: &[IpAddr], query_type: u16) -> Option<IpAddr> {
+    addresses.iter().copied().find(|address| {
+        matches!(
+            (query_type, address),
+            (1, IpAddr::V4(_)) | (28, IpAddr::V6(_))
+        )
+    })
 }
 
 fn answer(query: &[u8], records: &Records) -> Option<Vec<u8>> {
@@ -195,16 +222,17 @@ fn answer(query: &[u8], records: &Records) -> Option<Vec<u8>> {
     let in_domain = !name.contains('.')
         || name == records.domain
         || name.ends_with(&format!(".{}", records.domain));
-    let address = records.addresses.get(&name).copied();
+    let addresses = records.addresses.get(&name);
+    let address = addresses.and_then(|addresses| address_for_query(addresses, query_type));
     let response_code = if !in_domain {
         5 // REFUSED: this authoritative stub never forwards public DNS.
-    } else if address.is_none() {
+    } else if addresses.is_none() {
         3 // NXDOMAIN prevents a private name from leaking to another resolver.
     } else {
         0
     };
-    let has_answer = response_code == 0 && query_type == 1 && query_class == 1;
-    let mut response = Vec::with_capacity(question_end + 16);
+    let has_answer = response_code == 0 && query_class == 1 && address.is_some();
+    let mut response = Vec::with_capacity(question_end + 28);
     response.extend_from_slice(&query[..2]);
     let response_flags = 0x8000 | 0x0400 | (flags & 0x0100) | response_code;
     response.extend_from_slice(&response_flags.to_be_bytes());
@@ -213,13 +241,21 @@ fn answer(query: &[u8], records: &Records) -> Option<Vec<u8>> {
     response.extend_from_slice(&0u16.to_be_bytes());
     response.extend_from_slice(&0u16.to_be_bytes());
     response.extend_from_slice(&query[DNS_HEADER_LEN..question_end]);
-    if has_answer {
+    if let Some(address) = address.filter(|_| has_answer) {
         response.extend_from_slice(&[0xc0, 0x0c]);
-        response.extend_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&query_type.to_be_bytes());
         response.extend_from_slice(&1u16.to_be_bytes());
         response.extend_from_slice(&DNS_TTL_SECS.to_be_bytes());
-        response.extend_from_slice(&4u16.to_be_bytes());
-        response.extend_from_slice(&address.expect("answer checked").octets());
+        match address {
+            IpAddr::V4(address) => {
+                response.extend_from_slice(&4u16.to_be_bytes());
+                response.extend_from_slice(&address.octets());
+            }
+            IpAddr::V6(address) => {
+                response.extend_from_slice(&16u16.to_be_bytes());
+                response.extend_from_slice(&address.octets());
+            }
+        }
     }
     Some(response)
 }
@@ -520,6 +556,7 @@ mod tests {
             coord: "http://localhost:3000".into(),
             interface: "blaktail0".into(),
             assigned_ip: "100.64.0.1/32".into(),
+            assigned_ips: vec!["100.64.0.1/32".into(), "fd12:3456:789a:bcde::1/128".into()],
             dns_name: "self.12345678.blaktail".into(),
             credential_expires_at: 1,
             advertised_routes: vec![],
@@ -531,7 +568,7 @@ mod tests {
                 name: "peer".into(),
                 wg_public_key: "key".into(),
                 endpoint: None,
-                allowed_ips: vec!["100.64.0.2/32".into()],
+                allowed_ips: vec!["100.64.0.2/32".into(), "fd12:3456:789a:bcde::2/128".into()],
                 dns_name: "peer.12345678.blaktail".into(),
                 tags: vec![],
                 relay_endpoint: None,
@@ -579,12 +616,29 @@ mod tests {
     }
 
     #[test]
-    fn known_name_returns_nodata_for_aaaa() {
+    fn answers_aaaa_for_dual_stack_peers() {
         let state = state();
+        assert_eq!(
+            state_ip(&state).unwrap(),
+            "fd12:3456:789a:bcde::1".parse::<IpAddr>().unwrap()
+        );
         let records = records_from_state(&state, "12345678.blaktail");
-        let response = answer(&query("peer.12345678.blaktail", 28), &records).unwrap();
+        let request = query("peer.12345678.blaktail", 28);
+        let response = answer(&request, &records).unwrap();
         assert_eq!(response[3] & 0x0f, 0);
-        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 0);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 1);
+        assert_eq!(response.len(), request.len() + 28);
+        assert_eq!(
+            u16::from_be_bytes([response[request.len() + 10], response[request.len() + 11]]),
+            16
+        );
+        assert_eq!(
+            &response[response.len() - 16..],
+            &"fd12:3456:789a:bcde::2"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        );
     }
 
     #[tokio::test]
@@ -626,6 +680,39 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(&response[length - 4..length], &[100, 64, 0, 9]);
+        dns.stop();
+    }
+
+    #[tokio::test]
+    async fn udp_stub_serves_aaaa_over_ipv6_transport() {
+        let state = state();
+        let dns = MagicDns::spawn_at(
+            "[::1]:0".parse().unwrap(),
+            &state,
+            "12345678.blaktail".into(),
+        )
+        .await
+        .unwrap();
+        let client = UdpSocket::bind("[::1]:0").await.unwrap();
+        let mut response = [0u8; 512];
+        client
+            .send_to(&query("peer.12345678.blaktail", 28), dns.listen_addr())
+            .await
+            .unwrap();
+        let length = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.recv(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            &response[length - 16..length],
+            &"fd12:3456:789a:bcde::2"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        );
         dns.stop();
     }
 

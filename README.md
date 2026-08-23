@@ -15,6 +15,7 @@ https://github.com/jusso-dev/BlakTail
 - Coordination server and AU relay the org runs
 - MagicDNS-style names and tag ACLs (office, ranger, store)
 - Owner-approved Linux subnet routers and opt-in IPv4 exit nodes
+- Dual-stack tailnets with an organisation ULA `/64` and one `/128` per node
 - Prometheus coordinator/relay metrics and an actor-attributed admin audit log
 
 ## What v1 does not do

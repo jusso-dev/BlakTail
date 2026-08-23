@@ -22,6 +22,7 @@ pub use relay_client::RelayMesh;
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/blaktail";
 pub const DEFAULT_INTERFACE: &str = "blaktail0";
 pub const TUNNEL_MTU: &str = "1280";
+pub const TUNNEL_MTU_BYTES: usize = 1_280;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -82,6 +83,8 @@ pub struct NodeState {
     pub interface: String,
     pub assigned_ip: String,
     #[serde(default)]
+    pub assigned_ips: Vec<String>,
+    #[serde(default)]
     pub dns_name: String,
     #[serde(default)]
     pub credential_expires_at: i64,
@@ -108,6 +111,25 @@ pub struct NodeState {
     pub relay_endpoint_reported_at: u64,
     #[serde(default)]
     pub dns_mode: Option<String>,
+}
+
+impl NodeState {
+    pub fn interface_addresses(&self) -> Vec<String> {
+        let mut addresses = self.assigned_ips.clone();
+        if !addresses.contains(&self.assigned_ip) {
+            addresses.insert(0, self.assigned_ip.clone());
+        }
+        addresses.retain(|address| !address.trim().is_empty());
+        addresses
+    }
+
+    pub fn ipv6_address(&self) -> Option<&str> {
+        self.assigned_ips
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(self.assigned_ip.as_str()))
+            .find(|address| address.contains(':'))
+    }
 }
 #[derive(Serialize)]
 struct RegisterRequest<'a> {
@@ -150,6 +172,8 @@ struct RegisterResponse {
     node_token: String,
     assigned_ip: String,
     #[serde(default)]
+    assigned_ips: Vec<String>,
+    #[serde(default)]
     dns_name: String,
     #[serde(default)]
     credential_expires_at: i64,
@@ -163,6 +187,8 @@ struct RegisterResponse {
 #[derive(Deserialize)]
 struct PeersResponse {
     peers: Vec<Peer>,
+    #[serde(default)]
+    assigned_ips: Vec<String>,
     #[serde(default)]
     dns_name: String,
     #[serde(default)]
@@ -299,12 +325,18 @@ impl Coordinator {
             )));
         }
         let r: RegisterResponse = response.json().await?;
+        let assigned_ips = if r.assigned_ips.is_empty() {
+            vec![r.assigned_ip.clone()]
+        } else {
+            r.assigned_ips
+        };
         Ok(NodeState {
             node_id: r.id,
             node_token: r.node_token,
             coord: self.base.clone(),
             interface: registration.interface.into(),
             assigned_ip: r.assigned_ip,
+            assigned_ips,
             dns_name: r.dns_name,
             credential_expires_at: r.credential_expires_at,
             advertised_routes: registration.advertised_routes.to_vec(),
@@ -325,6 +357,7 @@ impl Coordinator {
             .client
             .get(format!("{}/v1/nodes/{}/peers", self.base, state.node_id))
             .bearer_auth(&state.node_token);
+        request = request.query(&[("ipv6", "true")]);
         if let Some(exit_node) = state.exit_node.as_deref() {
             request = request.query(&[("exit_node", exit_node)]);
         }
@@ -338,6 +371,9 @@ impl Coordinator {
             return Err(Error::Message(message));
         }
         let body: PeersResponse = response.error_for_status()?.json().await?;
+        if !body.assigned_ips.is_empty() {
+            state.assigned_ips = body.assigned_ips;
+        }
         state.dns_name = body.dns_name;
         state.credential_expires_at = body.credential_expires_at;
         state.exit_node_active = body.exit_node_active;
@@ -470,7 +506,8 @@ pub fn read_state(dir: &Path) -> Result<NodeState, Error> {
 }
 
 pub trait Network {
-    fn setup(&mut self, interface: &str, key: &Path, address: &str) -> Result<(), Error>;
+    fn setup(&mut self, interface: &str, key: &Path, addresses: &[String]) -> Result<(), Error>;
+    fn set_addresses(&mut self, interface: &str, addresses: &[String]) -> Result<(), Error>;
     fn apply(&mut self, interface: &str, changes: &[PeerChange]) -> Result<(), Error>;
     fn down(&mut self, interface: &str) -> Result<(), Error>;
     /// Repoints one peer's transport endpoint without touching its other
@@ -502,6 +539,32 @@ pub trait Network {
             ))
         }
     }
+}
+
+fn parse_cidr(value: &str) -> Result<(std::net::IpAddr, u8), Error> {
+    let (address, prefix) = value
+        .split_once('/')
+        .ok_or_else(|| Error::Message(format!("address {value} must use CIDR notation")))?;
+    let address: std::net::IpAddr = address
+        .parse()
+        .map_err(|_| Error::Message(format!("address {value} is invalid")))?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| Error::Message(format!("address {value} has an invalid prefix")))?;
+    if (address.is_ipv4() && prefix > 32) || (address.is_ipv6() && prefix > 128) {
+        return Err(Error::Message(format!(
+            "address {value} has an invalid prefix"
+        )));
+    }
+    Ok((address, prefix))
+}
+
+fn iproute_family(value: &str) -> Result<&'static str, Error> {
+    Ok(if parse_cidr(value)?.0.is_ipv4() {
+        "-4"
+    } else {
+        "-6"
+    })
 }
 /// Normalises a base64 WireGuard public key to the hex form used by the
 /// userspace UAPI, so path-management bookkeeping is uniform per platform.
@@ -550,6 +613,34 @@ impl LinuxNetwork {
             .status();
     }
 
+    fn replace_addresses(interface: &str, addresses: &[String]) -> Result<(), Error> {
+        if addresses.is_empty() {
+            return Err(Error::Message(
+                "coordinator returned no tunnel addresses".into(),
+            ));
+        }
+        for address in addresses {
+            let (parsed, prefix) = parse_cidr(address)?;
+            if (parsed.is_ipv4() && prefix != 32) || (parsed.is_ipv6() && prefix != 128) {
+                return Err(Error::Message(format!(
+                    "tunnel address {address} must be a host route"
+                )));
+            }
+            Self::run(
+                "ip",
+                &[
+                    iproute_family(address)?,
+                    "address",
+                    "replace",
+                    address,
+                    "dev",
+                    interface,
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     fn reconcile_routes(&mut self, interface: &str) -> Result<(), Error> {
         let desired: HashSet<String> = self
             .peer_routes
@@ -563,7 +654,17 @@ impl LinuxNetwork {
             .cloned()
             .collect();
         for route in additions {
-            Self::run("ip", &["-4", "route", "add", &route, "dev", interface])?;
+            Self::run(
+                "ip",
+                &[
+                    iproute_family(&route)?,
+                    "route",
+                    "add",
+                    &route,
+                    "dev",
+                    interface,
+                ],
+            )?;
             self.installed_routes.insert(route);
         }
         let removals: Vec<_> = self
@@ -572,7 +673,17 @@ impl LinuxNetwork {
             .cloned()
             .collect();
         for route in removals {
-            Self::run("ip", &["-4", "route", "del", &route, "dev", interface])?;
+            Self::run(
+                "ip",
+                &[
+                    iproute_family(&route)?,
+                    "route",
+                    "del",
+                    &route,
+                    "dev",
+                    interface,
+                ],
+            )?;
             self.installed_routes.remove(&route);
         }
 
@@ -770,7 +881,7 @@ impl LinuxNetwork {
     }
 }
 impl Network for LinuxNetwork {
-    fn setup(&mut self, interface: &str, key: &Path, address: &str) -> Result<(), Error> {
+    fn setup(&mut self, interface: &str, key: &Path, addresses: &[String]) -> Result<(), Error> {
         Self::clear_exit_rules();
         self.peer_routes.clear();
         self.installed_routes.clear();
@@ -794,9 +905,12 @@ impl Network for LinuxNetwork {
             .to_str()
             .ok_or_else(|| Error::Message("private key path is not UTF-8".into()))?;
         Self::run("wg", &["set", interface, "private-key", key])?;
-        Self::run("ip", &["address", "replace", address, "dev", interface])?;
+        Self::replace_addresses(interface, addresses)?;
         Self::run("ip", &["link", "set", "dev", interface, "mtu", TUNNEL_MTU])?;
         Self::run("ip", &["link", "set", "up", "dev", interface])
+    }
+    fn set_addresses(&mut self, interface: &str, addresses: &[String]) -> Result<(), Error> {
+        Self::replace_addresses(interface, addresses)
     }
     fn apply(&mut self, interface: &str, changes: &[PeerChange]) -> Result<(), Error> {
         for change in changes {
@@ -1061,19 +1175,54 @@ impl MacOsNetwork {
         }
     }
 
-    fn route_target(route: &str) -> (&'static str, &str) {
-        if route.ends_with("/32") {
-            ("-host", route.split('/').next().unwrap_or(route))
+    fn run_ignore(program: &str, args: &[&str]) {
+        let _ = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    fn replace_addresses(name: &str, addresses: &[String]) -> Result<(), Error> {
+        if addresses.is_empty() {
+            return Err(Error::Message(
+                "coordinator returned no tunnel addresses".into(),
+            ));
+        }
+        for address in addresses {
+            let (parsed, prefix) = parse_cidr(address)?;
+            if parsed.is_ipv4() && prefix == 32 {
+                let address = parsed.to_string();
+                Self::run("/sbin/ifconfig", &[name, "inet", &address, &address, "up"])?;
+            } else if parsed.is_ipv6() && prefix == 128 {
+                Self::run_ignore("/sbin/ifconfig", &[name, "inet6", address, "delete"]);
+                Self::run("/sbin/ifconfig", &[name, "inet6", address, "alias"])?;
+            } else {
+                return Err(Error::Message(format!(
+                    "tunnel address {address} must be a host route"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn route_target(route: &str) -> Result<(&'static str, &'static str, &str), Error> {
+        let (address, prefix) = parse_cidr(route)?;
+        let family = if address.is_ipv4() { "-inet" } else { "-inet6" };
+        let host_prefix = if address.is_ipv4() { 32 } else { 128 };
+        if prefix == host_prefix {
+            Ok((family, "-host", route.split('/').next().unwrap_or(route)))
         } else {
-            ("-net", route)
+            Ok((family, "-net", route))
         }
     }
 
     fn remove_route(name: &str, route: &str) -> Result<(), Error> {
-        let (kind, target) = Self::route_target(route);
+        let (family, kind, target) = Self::route_target(route)?;
         Self::run(
             "/sbin/route",
-            &["-n", "delete", kind, target, "-interface", name],
+            &["-n", "delete", family, kind, target, "-interface", name],
         )
     }
 
@@ -1115,10 +1264,10 @@ impl MacOsNetwork {
             .cloned()
             .collect();
         for route in additions {
-            let (kind, target) = Self::route_target(&route);
+            let (family, kind, target) = Self::route_target(&route)?;
             Self::run(
                 "/sbin/route",
-                &["-n", "add", kind, target, "-interface", &name],
+                &["-n", "add", family, kind, target, "-interface", &name],
             )?;
             self.installed_routes.insert(route);
         }
@@ -1144,16 +1293,10 @@ impl Default for MacOsNetwork {
 
 #[cfg(target_os = "macos")]
 impl Network for MacOsNetwork {
-    fn setup(&mut self, _interface: &str, key: &Path, address: &str) -> Result<(), Error> {
+    fn setup(&mut self, _interface: &str, key: &Path, addresses: &[String]) -> Result<(), Error> {
         self.device = None;
         self.name = None;
         self.private_hex = Self::read_private_hex(key)?;
-        let ip = address
-            .split('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::Message("invalid tunnel address".into()))?
-            .to_owned();
         let name_file = tempfile::Builder::new()
             .prefix("blaktail-utun-")
             .tempfile()?
@@ -1177,12 +1320,15 @@ impl Network for MacOsNetwork {
             return Err(Error::Message("utun name was not reported".into()));
         }
         Self::run("/sbin/ifconfig", &[&name, "mtu", TUNNEL_MTU])?;
-        Self::run("/sbin/ifconfig", &[&name, "inet", &ip, &ip, "up"])?;
+        Self::replace_addresses(&name, addresses)?;
         self.device = Some(device);
         self.name = Some(name);
         self.peers.clear();
         self.installed_routes.clear();
         Ok(())
+    }
+    fn set_addresses(&mut self, _interface: &str, addresses: &[String]) -> Result<(), Error> {
+        Self::replace_addresses(self.utun_name()?, addresses)
     }
     fn apply(&mut self, _interface: &str, changes: &[PeerChange]) -> Result<(), Error> {
         if self.name.is_none() {
@@ -1290,7 +1436,16 @@ pub async fn sync_once(
     state: &mut NodeState,
     dir: &Path,
 ) -> Result<usize, Error> {
+    let previous_assigned_ips = state.assigned_ips.clone();
+    let previous_addresses = state.interface_addresses();
     let desired = coord.peers(state).await?;
+    let desired_addresses = state.interface_addresses();
+    if desired_addresses != previous_addresses {
+        if let Err(error) = network.set_addresses(&state.interface, &desired_addresses) {
+            state.assigned_ips = previous_assigned_ips;
+            return Err(error);
+        }
+    }
     let changes = peer_diff(&state.peers, &desired);
     network.apply(&state.interface, &changes)?;
     state.peers = desired;
@@ -1451,7 +1606,15 @@ mod tests {
     }
 
     impl Network for RecordingNetwork {
-        fn setup(&mut self, _interface: &str, _key: &Path, _address: &str) -> Result<(), Error> {
+        fn setup(
+            &mut self,
+            _interface: &str,
+            _key: &Path,
+            _addresses: &[String],
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn set_addresses(&mut self, _interface: &str, _addresses: &[String]) -> Result<(), Error> {
             Ok(())
         }
         fn apply(&mut self, _interface: &str, changes: &[PeerChange]) -> Result<(), Error> {
@@ -1536,6 +1699,26 @@ mod tests {
     }
 
     #[test]
+    fn dual_stack_addresses_select_the_correct_kernel_family() {
+        assert_eq!(iproute_family("100.64.0.1/32").unwrap(), "-4");
+        assert_eq!(iproute_family("fd12:3456::1/128").unwrap(), "-6");
+        assert!(parse_cidr("fd12:3456::1/129").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_routes_distinguish_ipv4_and_ipv6_hosts() {
+        assert_eq!(
+            MacOsNetwork::route_target("100.64.0.1/32").unwrap(),
+            ("-inet", "-host", "100.64.0.1")
+        );
+        assert_eq!(
+            MacOsNetwork::route_target("fd12:3456::1/128").unwrap(),
+            ("-inet6", "-host", "fd12:3456::1")
+        );
+    }
+
+    #[test]
     fn persisted_peers_are_reinstalled_after_interface_recreation() {
         let expected = peer("restored", Some("192.0.2.1:51820"));
         let state = NodeState {
@@ -1544,6 +1727,7 @@ mod tests {
             coord: "https://coord.example".into(),
             interface: "blaktail0".into(),
             assigned_ip: "100.64.0.1/32".into(),
+            assigned_ips: vec!["100.64.0.1/32".into()],
             dns_name: "self.12345678.blaktail".into(),
             credential_expires_at: 1,
             advertised_routes: vec![],

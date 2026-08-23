@@ -18,6 +18,11 @@ the key on stdin.
 
 The coordinator URL must use HTTPS except for localhost testing. The private key and credential-bearing state are stored under `/var/lib/blaktail` with mode `0600`; they are never logged. `up` polls every 30 seconds. A polling failure leaves the last applied WireGuard peer configuration untouched, so live tunnels continue while the coordinator is unavailable.
 
+The coordinator assigns both an IPv4 `/32` and an organisation-scoped ULA IPv6
+`/128`. The agent applies both addresses and both peer host routes. An upgraded
+agent also adds a missing IPv6 address returned by the coordinator to an existing
+enrollment without changing its IPv4 address.
+
 The agent sets the tunnel MTU to 1280. It starts with each peer's configured UDP
 endpoint, moves an unresponsive peer to the advertised Australian relay within one
 poll interval, and keeps WireGuard ciphertext flowing there while attempting a
@@ -25,6 +30,12 @@ nonce-confirmed UDP hole punch. Successful peer-to-peer traffic bypasses the rel
 stale direct handshakes fall back automatically. The relay socket's reflexive address
 is refreshed through the coordinator, so port forwarding is not required for the
 relay path.
+
+The 1280-byte inner IPv6 packet plus 32 bytes of WireGuard transport overhead,
+17 bytes of BlakTail relay framing, and a worst-case 48-byte outer IPv6/UDP
+header totals 1377 bytes. That stays below a 1500-byte underlay MTU and below the
+relay's 2048-byte encrypted-payload ceiling; the relay never parses the inner IP
+version.
 
 ## Subnet routers and exit nodes
 
@@ -60,13 +71,14 @@ enabled it. On an exit client, policy routing preserves local/subnet routes and
 WireGuard's marked transport packets while sending the remaining IPv4 default
 through the selected peer. Existing conflicting kernel routes fail closed instead
 of being overwritten. macOS peers can consume approved private subnet routes, but
-route advertising and exit-node selection are Linux-only in this release; IPv6 is
-tracked separately.
+route advertising and exit-node selection are Linux-only in this release. IPv6
+subnet routing and IPv6 exit nodes are not enabled by this IPv4 routing feature;
+node-to-node IPv6 is enabled independently.
 
 ## MagicDNS
 
-The agent runs an authoritative UDP DNS stub on its own tailnet address, port 53.
-It answers only A records for the node and currently authorised peers under the
+The agent runs an authoritative UDP DNS stub on its own ULA address, port 53.
+It answers A and AAAA records for the node and currently authorised peers under the
 organisation's `<org-prefix>.blaktail` domain. Unknown private names return
 `NXDOMAIN`; names outside that suffix are refused and never forwarded by BlakTail.
 Both `peer-name` and `peer-name.<org-prefix>.blaktail` resolve locally.
@@ -76,6 +88,23 @@ domain with `resolvectl`; otherwise it uses `resolvconf`. The final fallback saf
 backs up and prepends `/etc/resolv.conf`, refuses to overwrite a symlink, and restores
 the exact backup on `blaktaild down`. If the file changes after BlakTail manages it,
 the agent preserves the backup and refuses to overwrite the operator's change.
+
+Using the ULA for the local stub keeps private name resolution working when the
+BlakTail interface's IPv4 address is deliberately disabled.
+
+## IPv6-only path drill
+
+After two current agents have joined the same organisation, record each ULA from
+`blaktaild status`, then temporarily remove only the BlakTail IPv4 address:
+
+```sh
+sudo ip -4 address flush dev blaktail0
+ping -6 <other-node-ULA>
+```
+
+The ping must succeed. Restart `blaktaild` afterward to restore the coordinator-
+assigned IPv4 address. This does not disable the host's underlay IPv4 transport;
+it proves the encrypted inner path and WireGuard `allowed-ips` work over IPv6.
 
 ## Credential renewal
 

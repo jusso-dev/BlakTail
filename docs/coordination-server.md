@@ -53,6 +53,14 @@ coverage, and alerts.
 
 Join and node credentials are returned once; only SHA-256 hashes are stored. Join keys expire after at most 30 days and default to single-use. Node credentials default to 90 days, with a per-organisation policy between 1 and 365 days. An expired node receives an actionable `401`, disappears from other nodes' peer responses, and can run `blaktaild reauth` with its old node secret plus a fresh join key. Re-authentication rotates the node token and expiry while preserving the node id, WireGuard key, DNS name, and tailnet IP. Peer polling has no cache, so revocation or expiry is visible on the next request (within 60 seconds).
 
+Each organisation gets a deterministic ULA `/64` under `fd00::/8`, derived
+from its UUID. Each node receives both its existing `100.64.0.x/32` address and
+a unique `/128` in that organisation prefix. Existing SQLite rows are backfilled
+at startup. Agents request the `ipv6=true` peer capability; responses without
+that query remain IPv4-only so an upgraded coordinator does not hand IPv6 routes
+to an older agent. Registration and peer responses include `assigned_ips`, while
+the singular `assigned_ip` remains as the IPv4 compatibility field.
+
 Headless browser enrollment stores hashes of both device and user codes. The console
 approves the high-entropy device code as a short-lived, single-use join grant bound
 to the requesting node name and WireGuard public key. The raw device secret remains

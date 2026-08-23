@@ -1,6 +1,6 @@
 # macOS agent
 
-`blaktaild` uses boringtun in-process and opens an Apple `utun` device. It does not require a Network Extension or App Store sandbox. The tailnet address is assigned by the onshore coordinator at registration; the agent never chooses one locally. The agent sets MTU 1280, discovers its relay socket's reflexive UDP address, falls back through the advertised Australian relay when a configured direct endpoint fails, and upgrades to peer-to-peer UDP after a nonce-confirmed hole punch succeeds.
+`blaktaild` uses boringtun in-process and opens an Apple `utun` device. It does not require a Network Extension or App Store sandbox. IPv4 `/32` and organisation-scoped ULA IPv6 `/128` tailnet addresses are assigned by the onshore coordinator at registration; the agent never chooses them locally. The agent sets MTU 1280, discovers its relay socket's reflexive UDP address, falls back through the advertised Australian relay when a configured direct endpoint fails, and upgrades to peer-to-peer UDP after a nonce-confirmed hole punch succeeds.
 
 ## Build and install
 
@@ -31,7 +31,8 @@ sudo /usr/local/bin/blaktaild status
 
 The daemon runs `blaktaild run`, which resumes the persisted enrollment and re-applies the full peer set every poll (30 seconds by default). `KeepAlive.NetworkState` and WireGuard's 25-second persistent keepalive restore sessions after sleep/wake and apply node revocations. Logs contain node IDs and peer counts only.
 
-MagicDNS runs as an authoritative UDP stub on the node's tailnet address. The agent
+MagicDNS runs as an authoritative UDP stub on the node's ULA address and answers
+both A and AAAA records. The agent
 creates a marked `/etc/resolver/<org-prefix>.blaktail` scoped resolver, including the
 search suffix that makes both `peer-name` and the full MagicDNS name work. BlakTail
 answers only its private suffix and never forwards public DNS. Graceful shutdown and
@@ -60,3 +61,14 @@ sudo /usr/local/bin/blaktaild down
 5. Sleep Mac A for at least one minute, wake it, and confirm both pings recover within 60 seconds without restarting `blaktaild`.
 6. Run `blaktaild down` on B (after `launchctl bootout`) and confirm A removes B on its next peer refresh.
 7. Inspect `/var/log/blaktaild.log`; confirm neither join key nor node token appears.
+
+For the IPv6-only inner-path check, note both ULA addresses, remove the BlakTail
+IPv4 address from each current `utun` interface, then test both directions:
+
+```sh
+sudo ifconfig <utunX> inet <node-IPv4> delete
+ping6 <peer-ULA>
+```
+
+Restart each LaunchDaemon afterward to restore the dual-stack interface. Relay
+frames remain IP-version agnostic because they carry opaque WireGuard ciphertext.

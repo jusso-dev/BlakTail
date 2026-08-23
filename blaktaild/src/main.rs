@@ -784,7 +784,8 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                 Err(error) => return Err(error),
             };
             let mut network = make_network();
-            if let Err(error) = network.setup(&interface, &key_path, &state.assigned_ip) {
+            let interface_addresses = state.interface_addresses();
+            if let Err(error) = network.setup(&interface, &key_path, &interface_addresses) {
                 if !resumed {
                     let _ = coordinator.revoke(&state).await;
                 }
@@ -826,10 +827,15 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             if restored > 0 {
                 info!(restored, "restored persisted WireGuard peers");
             }
-            info!(node_id = %state.node_id, address = %state.assigned_ip, interface, "tailnet joined");
+            let addresses = state.interface_addresses().join(",");
+            info!(node_id = %state.node_id, %addresses, interface, "tailnet joined");
             println!(
-                "joined\nnode: {}\ninterface: {}\naddress: {}\ncoordinator: {}",
-                state.node_id, state.interface, state.assigned_ip, state.coord
+                "joined\nnode: {}\ninterface: {}\naddress: {}\nipv6 address: {}\ncoordinator: {}",
+                state.node_id,
+                state.interface,
+                state.assigned_ip,
+                state.ipv6_address().unwrap_or("unavailable"),
+                state.coord
             );
             sync_loop(
                 &coordinator,
@@ -847,7 +853,7 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             let (key_path, _) = ensure_private_key(&cli.state_dir)?;
             let coordinator = Coordinator::new(&state.coord)?;
             let mut network = make_network();
-            network.setup(&state.interface, &key_path, &state.assigned_ip)?;
+            network.setup(&state.interface, &key_path, &state.interface_addresses())?;
             state.router_previous_ipv4_forward = network.configure_router(
                 &state.interface,
                 &state.advertised_routes,
@@ -886,10 +892,11 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
         Command::Status => {
             let state = read_state(&cli.state_dir)?;
             println!(
-                "joined\nnode: {}\ninterface: {}\naddress: {}\ndns: {}\ncoordinator: {}\ncredential: {}\nadvertised routes: {}\nexit node: {}\npeers: {}",
+                "joined\nnode: {}\ninterface: {}\naddress: {}\nipv6 address: {}\ndns: {}\ncoordinator: {}\ncredential: {}\nadvertised routes: {}\nexit node: {}\npeers: {}",
                 state.node_id,
                 state.interface,
                 state.assigned_ip,
+                state.ipv6_address().unwrap_or("unavailable"),
                 if state.dns_name.is_empty() { "unknown" } else { &state.dns_name },
                 state.coord,
                 credential_status(state.credential_expires_at, blaktaild_now() as i64),
