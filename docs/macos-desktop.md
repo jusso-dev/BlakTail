@@ -61,7 +61,7 @@ UI copy uses Australian English (organisation, cancelled, unauthorised, notarisa
 ## Notarisation (do not buy certificates in CI)
 
 Developer ID Application signing and Apple notarisation are **manual operator steps**, not
-CI jobs. Self-hosted CI must not purchase, renew, or upload payment-backed signing
+CI jobs. CI must not purchase, renew, or upload payment-backed signing
 certificates.
 
 Suggested local release flow on a Mac with your organisation’s Developer ID:
@@ -75,7 +75,7 @@ xcrun stapler staple BlakTail.app
 ```
 
 Store Notary credentials in the local Keychain profile (`notarytool store-credentials`), not
-in the git repository. GitHub Actions for this repo stay on `[self-hosted]` / `[self-hosted, macOS]`
+in the git repository. GitHub Actions for this repo run on hosted runners (`ubuntu-latest`, `macos-latest`)
 runners and only build or test; they do not buy certs.
 
 ## Manual validation
@@ -91,6 +91,5 @@ On a current Mac (14+), with `blaktaild` installed and an onshore console + coor
 
 ## CI
 
-`.github/workflows/macos-desktop.yml` runs `swift test` on `[self-hosted, macOS]` when a Mac
-runner is available. `scripts/validate-macos-desktop.sh` checks structure and the locked
+`.github/workflows/macos-desktop.yml` runs `swift test` on `macos-latest`. `scripts/validate-macos-desktop.sh` checks structure and the locked
 tagline on any host.

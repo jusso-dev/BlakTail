@@ -42,7 +42,7 @@ Host it yourself, on one box or scaled out on AWS:
 - WireGuard: userspace on macOS first, kernel WG on Linux, userspace on Windows
 - Console: Next.js 16.3, Drizzle, Better Auth, Postgres onshore. Auth sessions are issued in the console and verified by Rust
 - Desktop: Mac app first (SwiftUI wrapping the LaunchDaemon agent). Windows and Linux follow
-- Self-hosted CI: `runs-on: [self-hosted]` and `[self-hosted, macOS]` for the Mac agent and desktop app
+- CI on GitHub-hosted runners: `ubuntu-latest` for Rust, console, and security jobs; `macos-latest` for the Swift desktop app
 - Apache-2.0
 
 ## Threat model
@@ -63,7 +63,7 @@ Do not commit:
 - `.env`, `BETTER_AUTH_SECRET`, `BLAKTAIL_CONSOLE_SYNC_SECRET`, database URLs
 - Live WireGuard configs (`wg*.conf`)
 
-`.gitignore` blocks the common filename patterns. Self-hosted CI still runs gitleaks on every push, plus `cargo deny` against `deny.toml`. A throwaway branch that commits a dummy secret is required to fail that job (`scripts/ci/prove-gitleaks-detects-dummy.sh`). If a real secret lands in git, rotate it; deleting the file in a later commit does not erase the blob.
+`.gitignore` blocks the common filename patterns. CI runs gitleaks on every push, plus `cargo deny` against `deny.toml`. A throwaway branch that commits a dummy secret is required to fail that job (`scripts/ci/prove-gitleaks-detects-dummy.sh`). If a real secret lands in git, rotate it; deleting the file in a later commit does not erase the blob.
 
 ## Tagline (do not rewrite)
 

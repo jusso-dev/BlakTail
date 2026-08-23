@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Download pinned gitleaks and cargo-deny onto the self-hosted runner.
+# Download pinned gitleaks and cargo-deny onto the CI runner.
 # Checksums are verified. The BlakTail tree is never uploaded to a scanner SaaS.
 set -euo pipefail
 
@@ -34,7 +34,7 @@ fetch_verified() {
   echo "${sha}  ${dest}" | sha256sum -c - >&2
 }
 
-# Some self-hosted filesystems reject GNU tar member metadata
+# Some CI filesystems reject GNU tar member metadata
 # ("Function not implemented"). Pull the named regular file out with Python.
 extract_member() {
   local archive="$1"

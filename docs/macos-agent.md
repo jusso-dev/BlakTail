@@ -4,7 +4,7 @@
 
 ## Build and install
 
-A Mac build is deliberately checked only on a self-hosted Mac runner (`[self-hosted, macOS]`). If that runner is unavailable, build manually on macOS 13 or later:
+A Mac build is checked on GitHub's hosted macOS runner (`macos-latest`). For local builds, use macOS 13 or later:
 
 ```sh
 cargo build --release -p blaktaild

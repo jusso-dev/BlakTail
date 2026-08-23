@@ -39,7 +39,7 @@ The coordinator stores hashes of join keys and node tokens, not the secrets them
 - Nodes treat the coordinator as the source of truth for membership and ACL.
 - Relays are organisation infrastructure. They forward opaque UDP. They are not a second control plane.
 - GitHub holds public code. It must not hold keys, env files, or the coordinator database.
-- CI runs on runners the organisation operates (`runs-on: [self-hosted]`). GitHub-hosted `ubuntu-latest` is out.
+- CI runs on GitHub-hosted runners (`ubuntu-latest`, `macos-latest`). The tree is never uploaded to a scanning SaaS; gitleaks and cargo-deny run as checksum-pinned binaries inside the workflow.
 
 ## Attackers we actually design for
 
@@ -204,7 +204,7 @@ If a secret does land in git: treat it as leaked, rotate it, rewrite or abandon 
 
 ## CI
 
-Self-hosted only. The security workflow must not use GitHub-hosted runners and must not upload the tree to a scanning SaaS.
+GitHub-hosted runners. The security workflow must not upload the tree to a scanning SaaS; scanners are pinned binaries fetched with verified checksums.
 
 | Check | Job |
 | --- | --- |
