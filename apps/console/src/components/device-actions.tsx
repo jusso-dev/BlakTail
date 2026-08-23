@@ -31,6 +31,7 @@ export function DeviceActions({
             <th>DNS</th>
             <th>Addresses</th>
             <th>Tags</th>
+            <th>Credential expiry</th>
             <th>State</th>
             <th />
           </tr>
@@ -50,9 +51,24 @@ export function DeviceActions({
                     ))
                   : "—"}
               </td>
+              <td className="mono">
+                <time
+                  dateTime={new Date(
+                    node.credential_expires_at * 1000,
+                  ).toISOString()}
+                >
+                  {new Date(node.credential_expires_at * 1000)
+                    .toISOString()
+                    .slice(0, 10)}
+                </time>
+              </td>
               <td>
                 {node.revoked ? (
                   <span className="badge warn">Revoked</span>
+                ) : node.expired ? (
+                  <span className="badge warn">Expired</span>
+                ) : node.expires_soon ? (
+                  <span className="badge warn">Expires soon</span>
                 ) : (
                   <span className="badge">Active</span>
                 )}

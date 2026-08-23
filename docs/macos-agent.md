@@ -31,6 +31,19 @@ sudo /usr/local/bin/blaktaild status
 
 The daemon runs `blaktaild run`, which resumes the persisted enrollment and re-applies the full peer set every poll (30 seconds by default). `KeepAlive.NetworkState` and WireGuard's 25-second persistent keepalive restore sessions after sleep/wake and apply node revocations. Logs contain node IDs and peer counts only.
 
+MagicDNS runs as an authoritative UDP stub on the node's tailnet address. The agent
+creates a marked `/etc/resolver/<org-prefix>.blaktail` scoped resolver, including the
+search suffix that makes both `peer-name` and the full MagicDNS name work. BlakTail
+answers only its private suffix and never forwards public DNS. Graceful shutdown and
+`down` remove only the marked file; an existing unmanaged file is never overwritten.
+
+`blaktaild status` shows credential expiry. To renew without changing the node's
+tailnet IP or WireGuard key, mint a fresh join key and pipe it to the agent:
+
+```sh
+printf '%s' "$BLAKTAIL_JOIN_KEY" | sudo /usr/local/bin/blaktaild reauth
+```
+
 To leave the tailnet, unload the daemon first so launchd cannot restart it, then revoke and erase local state:
 
 ```sh

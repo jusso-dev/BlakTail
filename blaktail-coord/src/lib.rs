@@ -22,6 +22,9 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
+const DEFAULT_NODE_KEY_TTL_SECS: i64 = 90 * 24 * 60 * 60;
+const MIN_NODE_KEY_TTL_SECS: i64 = 24 * 60 * 60;
+const MAX_NODE_KEY_TTL_SECS: i64 = 365 * 24 * 60 * 60;
 #[derive(Clone)]
 pub struct Store(Arc<Mutex<Connection>>);
 impl Store {
@@ -45,11 +48,78 @@ impl Store {
         ensure_column(&db, "nodes", "dns_name", "TEXT NOT NULL DEFAULT ''")?;
         ensure_column(&db, "nodes", "relay_endpoint", "TEXT")?;
         ensure_column(&db, "nodes", "relay_endpoint_updated_at", "INTEGER")?;
+        ensure_column(
+            &db,
+            "orgs",
+            "node_key_ttl_seconds",
+            "INTEGER NOT NULL DEFAULT 7776000",
+        )?;
+        ensure_column(
+            &db,
+            "nodes",
+            "credential_expires_at",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        db.execute(
+            "UPDATE nodes SET credential_expires_at=CAST(created_at AS INTEGER)+(SELECT node_key_ttl_seconds FROM orgs WHERE orgs.id=nodes.org_id) WHERE credential_expires_at=0",
+            [],
+        )?;
+        normalise_dns_names(&db)?;
+        db.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS nodes_dns_name_org_idx ON nodes(org_id,dns_name) WHERE dns_name<>''",
+        )?;
         Ok(Self(Arc::new(Mutex::new(db))))
     }
     pub fn memory() -> Result<Self, rusqlite::Error> {
         Self::open(":memory:")
     }
+}
+
+fn normalise_dns_names(db: &Connection) -> Result<(), rusqlite::Error> {
+    let rows = {
+        let mut query =
+            db.prepare("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")?;
+        let collected = query
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        collected
+    };
+    let mut used = std::collections::HashSet::new();
+    for (id, org_id, name, current) in rows {
+        let base = magic_dns_name(&name, &org_id);
+        let mut desired = base.clone();
+        if used.contains(&(org_id.clone(), desired.clone())) {
+            let id_hash = hash(&id);
+            let suffix = format!("-{}", &id_hash[..8]);
+            let (label, domain) = base.split_once('.').expect("generated DNS name has domain");
+            let keep = 63usize.saturating_sub(suffix.len());
+            desired = format!(
+                "{}{}.{}",
+                label
+                    .chars()
+                    .take(keep)
+                    .collect::<String>()
+                    .trim_end_matches('-'),
+                suffix,
+                domain
+            );
+        }
+        used.insert((org_id, desired.clone()));
+        if current != desired {
+            db.execute(
+                "UPDATE nodes SET dns_name=?1 WHERE id=?2",
+                params![desired, id],
+            )?;
+        }
+    }
+    Ok(())
 }
 fn ensure_column(
     db: &Connection,
@@ -101,7 +171,10 @@ pub fn app_with_relays(
         .route("/v1/orgs/:org_id/nodes/:node_id", delete(admin_revoke_node))
         .route("/v1/orgs/:org_id/acl", get(get_acl))
         .route("/v1/orgs/:org_id/acl", put(put_acl))
+        .route("/v1/orgs/:org_id/security", get(get_security_policy))
+        .route("/v1/orgs/:org_id/security", put(put_security_policy))
         .route("/v1/nodes/register", post(register_node))
+        .route("/v1/nodes/:node_id/reauth", post(reauth_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
         .route(
             "/v1/nodes/:node_id/relay-endpoint",
@@ -122,6 +195,8 @@ enum ApiError {
     BadRequest(String),
     #[error("authentication failed")]
     Unauthorized,
+    #[error("node credential expired; run blaktaild reauth with a fresh join key")]
+    CredentialExpired,
     #[error("permission denied")]
     Forbidden,
     #[error("resource not found")]
@@ -136,6 +211,7 @@ impl IntoResponse for ApiError {
         let status = match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
+            Self::CredentialExpired => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -161,14 +237,20 @@ struct CreateOrg {
     name: String,
     #[serde(default = "default_acl")]
     acl: serde_json::Value,
+    #[serde(default = "default_node_key_ttl")]
+    node_key_ttl_seconds: i64,
 }
 fn default_acl() -> serde_json::Value {
     serde_json::json!({"rules":[]})
+}
+fn default_node_key_ttl() -> i64 {
+    DEFAULT_NODE_KEY_TTL_SECS
 }
 #[derive(Serialize, Deserialize)]
 struct OrgResponse {
     id: Uuid,
     name: String,
+    node_key_ttl_seconds: i64,
 }
 async fn create_org(
     State(s): State<AppState>,
@@ -178,6 +260,7 @@ async fn create_org(
     if name.is_empty() {
         return Err(ApiError::BadRequest("org name must not be empty".into()));
     }
+    validate_node_key_ttl(input.node_key_ttl_seconds)?;
     let acl: Acl = serde_json::from_value(input.acl.clone())
         .map_err(|error| ApiError::BadRequest(format!("invalid ACL: {error}")))?;
     acl.validate()?;
@@ -187,8 +270,8 @@ async fn create_org(
         .lock()
         .unwrap()
         .execute(
-            "INSERT INTO orgs(id,name,acl_json,created_at) VALUES(?1,?2,?3,?4)",
-            params![id.to_string(), name, input.acl.to_string(), now()],
+            "INSERT INTO orgs(id,name,acl_json,created_at,node_key_ttl_seconds) VALUES(?1,?2,?3,?4,?5)",
+            params![id.to_string(), name, input.acl.to_string(), now(), input.node_key_ttl_seconds],
         )
         .map_err(conflict("org name already exists"))?;
     Ok((
@@ -196,8 +279,23 @@ async fn create_org(
         Json(OrgResponse {
             id,
             name: name.into(),
+            node_key_ttl_seconds: input.node_key_ttl_seconds,
         }),
     ))
+}
+
+#[derive(Deserialize, Serialize)]
+struct SecurityPolicy {
+    node_key_ttl_seconds: i64,
+}
+
+fn validate_node_key_ttl(seconds: i64) -> Result<(), ApiError> {
+    if !(MIN_NODE_KEY_TTL_SECS..=MAX_NODE_KEY_TTL_SECS).contains(&seconds) {
+        return Err(ApiError::BadRequest(format!(
+            "node_key_ttl_seconds must be between {MIN_NODE_KEY_TTL_SECS} and {MAX_NODE_KEY_TTL_SECS}"
+        )));
+    }
+    Ok(())
 }
 fn conflict(message: &'static str) -> impl FnOnce(rusqlite::Error) -> ApiError {
     move |e| match e {
@@ -275,6 +373,17 @@ struct RegisterNode {
     allowed_ips: Vec<String>,
 }
 
+struct RegistrationGrant {
+    key_id: String,
+    org_id: String,
+    single_use: bool,
+    used: bool,
+    user_id: String,
+    user_role: String,
+    tags_json: String,
+    node_key_ttl: i64,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -320,6 +429,8 @@ struct RegisterResponse {
     org_id: Uuid,
     node_token: String,
     assigned_ip: String,
+    dns_name: String,
+    credential_expires_at: i64,
     /// Advertised relay endpoints plus a capability token for them.
     #[serde(default)]
     relays: Vec<String>,
@@ -342,43 +453,107 @@ async fn register_node(
     }
     let mut db = s.store.0.lock().unwrap();
     let tx = db.transaction()?;
-    let row:Option<(String,String,bool,bool,String,String,String)>=tx.query_row("SELECT id,org_id,single_use,used_at IS NOT NULL,user_id,user_role,tags_json FROM join_keys WHERE key_hash=?1 AND revoked_at IS NULL AND expires_at>?2",params![hash(&input.join_key),now()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
-    let (key_id, org_id, single, use_done, user_id, user_role, tags_json) =
-        row.ok_or(ApiError::Unauthorized)?;
-    if single && use_done {
+    let grant: Option<RegistrationGrant> = tx.query_row("SELECT k.id,k.org_id,k.single_use,k.used_at IS NOT NULL,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds FROM join_keys k JOIN orgs o ON o.id=k.org_id WHERE k.key_hash=?1 AND k.revoked_at IS NULL AND k.expires_at>?2",params![hash(&input.join_key),now()],|r|Ok(RegistrationGrant { key_id: r.get(0)?, org_id: r.get(1)?, single_use: r.get(2)?, used: r.get(3)?, user_id: r.get(4)?, user_role: r.get(5)?, tags_json: r.get(6)?, node_key_ttl: r.get(7)? })).optional()?;
+    let grant = grant.ok_or(ApiError::Unauthorized)?;
+    if grant.single_use && grant.used {
         return Err(ApiError::Unauthorized);
     }
     let id = Uuid::new_v4();
     let token = secret("btn");
     let allowed_ips = if input.allowed_ips.is_empty() {
-        vec![allocate_ip(&tx, &org_id)?]
+        vec![allocate_ip(&tx, &grant.org_id)?]
     } else {
         input.allowed_ips
     };
     let assigned_ip = allowed_ips[0].clone();
-    let dns_name = magic_dns_name(input.name.trim(), &org_id);
-    tx.execute("INSERT INTO nodes(id,org_id,name,wg_public_key,endpoint,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![id.to_string(),org_id,input.name.trim(),input.wg_public_key.trim(),input.endpoint,serde_json::to_string(&allowed_ips).unwrap(),hash(&token),now(),user_id,user_role,tags_json,dns_name]).map_err(conflict("node name, public key, or address already exists in org"))?;
-    if single {
+    let dns_name = magic_dns_name(input.name.trim(), &grant.org_id);
+    let registered_at = now();
+    let credential_expires_at = registered_at + grant.node_key_ttl;
+    tx.execute("INSERT INTO nodes(id,org_id,name,wg_public_key,endpoint,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,credential_expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![id.to_string(),grant.org_id,input.name.trim(),input.wg_public_key.trim(),input.endpoint,serde_json::to_string(&allowed_ips).unwrap(),hash(&token),registered_at,grant.user_id,grant.user_role,grant.tags_json,dns_name,credential_expires_at]).map_err(conflict("node name, DNS name, public key, or address already exists in org"))?;
+    if grant.single_use {
         tx.execute(
             "UPDATE join_keys SET used_at=?1 WHERE id=?2",
-            params![now(), key_id],
+            params![now(), grant.key_id],
         )?;
     }
     tx.commit()?;
-    info!(node_id=%id,org_id,"node registered");
+    info!(node_id=%id, org_id=%grant.org_id, "node registered");
     let (relay_token, relay_expires_at) = relay_credentials(&s, id);
     Ok((
         StatusCode::CREATED,
         Json(RegisterResponse {
             id,
-            org_id: Uuid::parse_str(&org_id).unwrap(),
+            org_id: Uuid::parse_str(&grant.org_id).unwrap(),
             node_token: token,
             assigned_ip,
+            dns_name,
+            credential_expires_at,
             relays: s.relays.as_ref().clone(),
             relay_token,
             relay_expires_at,
         }),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReauthNode {
+    join_key: String,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ReauthResponse {
+    node_token: String,
+    credential_expires_at: i64,
+}
+
+async fn reauth_node(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<ReauthNode>,
+) -> Result<Json<ReauthResponse>, ApiError> {
+    let old_token_hash = bearer(&headers)?;
+    let mut db = s.store.0.lock().unwrap();
+    let tx = db.transaction()?;
+    let org_id: String = tx
+        .query_row(
+            "SELECT org_id FROM nodes WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL",
+            params![node_id.to_string(), old_token_hash],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ApiError::Unauthorized)?;
+    let join: Option<(String, bool, bool, String, String, String, i64)> = tx
+        .query_row(
+            "SELECT k.id,k.single_use,k.used_at IS NOT NULL,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds FROM join_keys k JOIN orgs o ON o.id=k.org_id WHERE k.key_hash=?1 AND k.org_id=?2 AND k.revoked_at IS NULL AND k.expires_at>?3",
+            params![hash(&input.join_key), org_id, now()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )
+        .optional()?;
+    let (join_id, single_use, used, user_id, user_role, tags_json, ttl) =
+        join.ok_or(ApiError::Unauthorized)?;
+    if single_use && used {
+        return Err(ApiError::Unauthorized);
+    }
+    let node_token = secret("btn");
+    let credential_expires_at = now() + ttl;
+    tx.execute(
+        "UPDATE nodes SET token_hash=?1,credential_expires_at=?2,user_id=?3,user_role=?4,tags_json=?5 WHERE id=?6",
+        params![hash(&node_token), credential_expires_at, user_id, user_role, tags_json, node_id.to_string()],
+    )?;
+    if single_use {
+        tx.execute(
+            "UPDATE join_keys SET used_at=?1 WHERE id=?2",
+            params![now(), join_id],
+        )?;
+    }
+    tx.commit()?;
+    info!(%node_id, "node credential renewed");
+    Ok(Json(ReauthResponse {
+        node_token,
+        credential_expires_at,
+    }))
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -395,6 +570,8 @@ struct Peer {
 #[derive(Serialize, Deserialize)]
 struct PeersResponse {
     peers: Vec<Peer>,
+    dns_name: String,
+    credential_expires_at: i64,
     /// Advertised relay endpoints plus a refreshed capability token.
     #[serde(default)]
     relays: Vec<String>,
@@ -410,14 +587,17 @@ async fn list_peers(
 ) -> Result<Json<PeersResponse>, ApiError> {
     let token = bearer(&headers)?;
     let db = s.store.0.lock().unwrap();
-    let (org, source_role, source_tags, acl_json): (String,String,String,String) = db
+    let (org, source_role, source_tags, acl_json, credential_expires_at, dns_name): (String,String,String,String,i64,String) = db
         .query_row(
-            "SELECT n.org_id,n.user_role,n.tags_json,o.acl_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=?1 AND n.token_hash=?2 AND n.revoked_at IS NULL",
+            "SELECT n.org_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=?1 AND n.token_hash=?2 AND n.revoked_at IS NULL",
             params![node_id.to_string(), token],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
+            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
         )
         .optional()?
         .ok_or(ApiError::Unauthorized)?;
+    if credential_expires_at <= now() {
+        return Err(ApiError::CredentialExpired);
+    }
     let source = Subject {
         role: source_role
             .parse()
@@ -426,10 +606,15 @@ async fn list_peers(
     };
     let acl: Acl = serde_json::from_str(&acl_json)
         .map_err(|_| ApiError::Database(rusqlite::Error::InvalidQuery))?;
-    let mut q=db.prepare("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>?3 THEN relay_endpoint ELSE NULL END FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL ORDER BY name")?;
+    let mut q=db.prepare("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>?3 THEN relay_endpoint ELSE NULL END FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL AND credential_expires_at>?4 ORDER BY name")?;
     let peers = q
         .query_map(
-            params![org, node_id.to_string(), now() - RELAY_ENDPOINT_FRESH_SECS],
+            params![
+                org,
+                node_id.to_string(),
+                now() - RELAY_ENDPOINT_FRESH_SECS,
+                now()
+            ],
             |r| {
                 let id: String = r.get(0)?;
                 let ips: String = r.get(4)?;
@@ -460,6 +645,8 @@ async fn list_peers(
     let (relay_token, relay_expires_at) = relay_credentials(&s, node_id);
     Ok(Json(PeersResponse {
         peers,
+        dns_name,
+        credential_expires_at,
         relays: s.relays.as_ref().clone(),
         relay_token,
         relay_expires_at,
@@ -489,13 +676,22 @@ async fn update_relay_endpoint(
         ));
     }
     let token = bearer(&headers)?;
-    let changed = s.store.0.lock().unwrap().execute(
-        "UPDATE nodes SET relay_endpoint=?1,relay_endpoint_updated_at=?2 WHERE id=?3 AND token_hash=?4 AND revoked_at IS NULL",
-        params![endpoint.to_string(), now(), node_id.to_string(), token],
-    )?;
-    if changed == 0 {
-        return Err(ApiError::Unauthorized);
+    let db = s.store.0.lock().unwrap();
+    let expires_at: i64 = db
+        .query_row(
+            "SELECT credential_expires_at FROM nodes WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL",
+            params![node_id.to_string(), token],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ApiError::Unauthorized)?;
+    if expires_at <= now() {
+        return Err(ApiError::CredentialExpired);
     }
+    db.execute(
+        "UPDATE nodes SET relay_endpoint=?1,relay_endpoint_updated_at=?2 WHERE id=?3",
+        params![endpoint.to_string(), now(), node_id.to_string()],
+    )?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -565,6 +761,9 @@ struct NodeRow {
     user_role: String,
     tags: Vec<DeviceTag>,
     created_at: i64,
+    credential_expires_at: i64,
+    expired: bool,
+    expires_soon: bool,
     revoked: bool,
 }
 
@@ -576,25 +775,31 @@ async fn list_nodes(
     console_session(&s, &headers, org_id)?;
     let db = s.store.0.lock().unwrap();
     let mut query = db.prepare(
-        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,revoked_at IS NOT NULL FROM nodes WHERE org_id=?1 ORDER BY name",
+        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,credential_expires_at,credential_expires_at<=?2,credential_expires_at<=?3,revoked_at IS NOT NULL FROM nodes WHERE org_id=?1 ORDER BY name",
     )?;
     let rows = query
-        .query_map(params![org_id.to_string()], |r| {
-            let created_raw: String = r.get(9)?;
-            Ok(NodeRow {
-                id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap(),
-                name: r.get(1)?,
-                wg_public_key: r.get(2)?,
-                endpoint: r.get(3)?,
-                allowed_ips: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
-                dns_name: r.get(5)?,
-                user_id: r.get(6)?,
-                user_role: r.get(7)?,
-                tags: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
-                created_at: created_raw.parse::<i64>().unwrap_or(0),
-                revoked: r.get(10)?,
-            })
-        })?
+        .query_map(
+            params![org_id.to_string(), now(), now() + 14 * 24 * 60 * 60],
+            |r| {
+                let created_raw: String = r.get(9)?;
+                Ok(NodeRow {
+                    id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap(),
+                    name: r.get(1)?,
+                    wg_public_key: r.get(2)?,
+                    endpoint: r.get(3)?,
+                    allowed_ips: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+                    dns_name: r.get(5)?,
+                    user_id: r.get(6)?,
+                    user_role: r.get(7)?,
+                    tags: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
+                    created_at: created_raw.parse::<i64>().unwrap_or(0),
+                    credential_expires_at: r.get(10)?,
+                    expired: r.get(11)?,
+                    expires_soon: r.get(12)?,
+                    revoked: r.get(13)?,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(rows))
 }
@@ -662,6 +867,50 @@ async fn put_acl(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn get_security_policy(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<SecurityPolicy>, ApiError> {
+    console_session(&s, &headers, org_id)?;
+    let node_key_ttl_seconds = s
+        .store
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT node_key_ttl_seconds FROM orgs WHERE id=?1",
+            params![org_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(SecurityPolicy {
+        node_key_ttl_seconds,
+    }))
+}
+
+async fn put_security_policy(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(policy): Json<SecurityPolicy>,
+) -> Result<StatusCode, ApiError> {
+    let session = console_session(&s, &headers, org_id)?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    validate_node_key_ttl(policy.node_key_ttl_seconds)?;
+    let changed = s.store.0.lock().unwrap().execute(
+        "UPDATE orgs SET node_key_ttl_seconds=?1 WHERE id=?2",
+        params![policy.node_key_ttl_seconds, org_id.to_string()],
+    )?;
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Session {
@@ -702,7 +951,17 @@ fn console_session(
 }
 
 fn magic_dns_name(name: &str, org_id: &str) -> String {
-    format!("{}.{}.blaktail", dns_label(name), &org_id[..8])
+    let prefix: String = org_id
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .take(8)
+        .collect();
+    let prefix = if prefix.len() == 8 {
+        prefix
+    } else {
+        hash(org_id)[..8].into()
+    };
+    format!("{}.{}.blaktail", dns_label(name), prefix)
 }
 fn dns_label(name: &str) -> String {
     let s: String = name
@@ -716,7 +975,8 @@ fn dns_label(name: &str) -> String {
             }
         })
         .collect();
-    let label = s.trim_matches('-');
+    let truncated: String = s.trim_matches('-').chars().take(63).collect();
+    let label = truncated.trim_matches('-');
     if label.is_empty() {
         "node".into()
     } else {
@@ -898,6 +1158,7 @@ mod tests {
             .await,
         )
         .await;
+        assert_eq!(o.node_key_ttl_seconds, DEFAULT_NODE_KEY_TTL_SECS);
         let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
         let mut ns = vec![];
         for n in 1..=2 {
@@ -917,6 +1178,8 @@ mod tests {
             ns.push(body::<RegisterResponse>(x).await)
         }
         for node in &ns {
+            assert!(node.credential_expires_at >= now() + DEFAULT_NODE_KEY_TTL_SECS - 1);
+            assert!(node.dns_name.ends_with(".blaktail"));
             assert_eq!(node.relays, vec!["relay.example.org:3478"]);
             assert_eq!(
                 node.relay_token,
@@ -927,6 +1190,33 @@ mod tests {
                 relay_capability(TEST_SECRET, node.id, node.relay_expires_at)
             );
         }
+        let collision_key: JoinKeyResponse = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", o.id),
+                serde_json::json!({"expires_in_seconds":60}),
+                Some(&token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                "/v1/nodes/register",
+                serde_json::json!({
+                    "join_key": collision_key.key,
+                    "name": "node 1",
+                    "wg_public_key": "distinct-key"
+                }),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
         assert_eq!(
             call(
                 &r,
@@ -995,7 +1285,137 @@ mod tests {
                 p.peers[0].relay_endpoint,
                 Some(format!("198.51.100.{}:{}", 2 - i, 40_002 - i))
             );
+            assert_eq!(p.credential_expires_at, n.credential_expires_at);
+            assert_eq!(p.dns_name, n.dns_name);
         }
+
+        let policy: SecurityPolicy = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/security", o.id),
+                serde_json::Value::Null,
+                Some(&token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(policy.node_key_ttl_seconds, DEFAULT_NODE_KEY_TTL_SECS);
+        assert_eq!(
+            call(
+                &r,
+                Method::PUT,
+                &format!("/v1/orgs/{}/security", o.id),
+                serde_json::json!({"node_key_ttl_seconds": MIN_NODE_KEY_TTL_SECS}),
+                Some(&token),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE nodes SET credential_expires_at=?1 WHERE id=?2",
+                params![now() - 1, ns[0].id.to_string()],
+            )
+            .unwrap();
+        let expired = call(
+            &r,
+            Method::GET,
+            &format!("/v1/nodes/{}/peers", ns[0].id),
+            serde_json::Value::Null,
+            Some(&ns[0].node_token),
+        )
+        .await;
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+        let expired_body: serde_json::Value = body(expired).await;
+        assert!(expired_body["error"]
+            .as_str()
+            .unwrap()
+            .contains("blaktaild reauth"));
+        let peers_after_expiry: PeersResponse = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", ns[1].id),
+                serde_json::Value::Null,
+                Some(&ns[1].node_token),
+            )
+            .await,
+        )
+        .await;
+        assert!(peers_after_expiry.peers.is_empty());
+
+        let renewal_key: JoinKeyResponse = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", o.id),
+                serde_json::json!({"expires_in_seconds":60}),
+                Some(&token),
+            )
+            .await,
+        )
+        .await;
+        let old_token = ns[0].node_token.clone();
+        let renewed: ReauthResponse = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/nodes/{}/reauth", ns[0].id),
+                serde_json::json!({"join_key": renewal_key.key}),
+                Some(&old_token),
+            )
+            .await,
+        )
+        .await;
+        assert_ne!(renewed.node_token, old_token);
+        assert!(renewed.credential_expires_at >= now() + MIN_NODE_KEY_TTL_SECS - 1);
+        assert_eq!(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", ns[0].id),
+                serde_json::Value::Null,
+                Some(&old_token),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        ns[0].node_token = renewed.node_token;
+        ns[0].credential_expires_at = renewed.credential_expires_at;
+        let peers_after_renewal: PeersResponse = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", ns[1].id),
+                serde_json::Value::Null,
+                Some(&ns[1].node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(peers_after_renewal.peers[0].id, ns[0].id);
+        let preserved_ip: String = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT allowed_ips_json FROM nodes WHERE id=?1",
+                params![ns[0].id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&preserved_ip).unwrap()[0],
+            ns[0].assigned_ip
+        );
+
         store
             .0
             .lock()
@@ -1212,6 +1632,11 @@ mod tests {
                 serde_json::json!({"rules":[]}),
             ),
             (
+                Method::PUT,
+                format!("/v1/orgs/{}/security", o.id),
+                serde_json::json!({"node_key_ttl_seconds": MIN_NODE_KEY_TTL_SECS}),
+            ),
+            (
                 Method::DELETE,
                 format!("/v1/orgs/{}/nodes/{}", o.id, Uuid::new_v4()),
                 serde_json::Value::Null,
@@ -1371,5 +1796,67 @@ mod tests {
             magic_dns_name("Alice's Laptop", "12345678-0000-0000-0000-000000000000"),
             "alice-s-laptop.12345678.blaktail"
         );
+        assert_eq!(dns_label(&"a".repeat(100)).len(), 63);
+        assert!(!dns_label(&format!("{}-suffix", "a".repeat(62))).ends_with('-'));
+    }
+
+    #[test]
+    fn existing_database_gains_credential_expiry_without_losing_nodes() {
+        let path =
+            std::env::temp_dir().join(format!("blaktail-migration-{}.sqlite3", Uuid::new_v4()));
+        let created_at = now() - 100;
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE orgs(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,acl_json TEXT NOT NULL,created_at TEXT NOT NULL);
+                 CREATE TABLE nodes(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,wg_public_key TEXT NOT NULL,endpoint TEXT,allowed_ips_json TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,revoked_at TEXT,UNIQUE(org_id,name),UNIQUE(org_id,wg_public_key));",
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO orgs(id,name,acl_json,created_at) VALUES('org','Org','{\"rules\":[]}',?1)",
+                params![created_at],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO nodes(id,org_id,name,wg_public_key,allowed_ips_json,token_hash,created_at) VALUES('node','org','Node','key','[\"100.64.0.1/32\"]','hash',?1)",
+                params![created_at],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO nodes(id,org_id,name,wg_public_key,allowed_ips_json,token_hash,created_at) VALUES('node-2','org','Node@','key-2','[\"100.64.0.2/32\"]','hash-2',?1)",
+                params![created_at + 1],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let (ttl, expires): (i64, i64) = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT o.node_key_ttl_seconds,n.credential_expires_at FROM orgs o JOIN nodes n ON n.org_id=o.id WHERE n.id='node'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ttl, DEFAULT_NODE_KEY_TTL_SECS);
+        assert_eq!(expires, created_at + DEFAULT_NODE_KEY_TTL_SECS);
+        let dns_names = {
+            let db = store.0.lock().unwrap();
+            let mut query = db
+                .prepare("SELECT dns_name FROM nodes ORDER BY id")
+                .unwrap();
+            let collected = query
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            collected
+        };
+        assert_eq!(dns_names.len(), 2);
+        assert!(dns_names.iter().all(|name| !name.is_empty()));
+        assert_ne!(dns_names[0], dns_names[1]);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
     }
 }

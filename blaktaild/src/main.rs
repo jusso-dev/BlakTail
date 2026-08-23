@@ -1,6 +1,7 @@
 use blaktaild::{
-    ensure_private_key, peer_key_hex, read_state, sync_once, validate_interface, write_state,
-    Coordinator, Network, RelayMesh, DEFAULT_INTERFACE, DEFAULT_STATE_DIR, DIRECT_GRACE_SECS,
+    configure_system_dns, dns_domain, ensure_private_key, peer_key_hex, read_state,
+    remove_system_dns, restore_peers, sync_once, validate_interface, write_state, Coordinator,
+    MagicDns, Network, RelayMesh, DEFAULT_INTERFACE, DEFAULT_STATE_DIR, DIRECT_GRACE_SECS,
     DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
 };
 use clap::{Parser, Subcommand};
@@ -54,6 +55,12 @@ enum Command {
     Run {
         #[arg(long, default_value_t = 30)]
         poll_seconds: u64,
+    },
+    /// Renew this enrollment with a fresh join key without changing its tailnet IP.
+    Reauth {
+        /// Fresh join key. Omit to read it from stdin.
+        #[arg(long, hide_env_values = true, env = "BLAKTAIL_JOIN_KEY")]
+        join_key: Option<String>,
     },
     /// Show persisted node and peer status without exposing credentials.
     Status,
@@ -138,21 +145,24 @@ async fn sync_loop(
     exit_after_join: bool,
 ) -> Result<(), blaktaild::Error> {
     let mut mesh: Option<RelayMesh> = None;
+    let mut dns: Option<MagicDns> = None;
     let mut paths: HashMap<Uuid, PeerPath> = HashMap::new();
     loop {
         match sync_once(coordinator, network, state, state_dir).await {
             Ok(changes) if changes > 0 => info!(changes, "WireGuard peers synchronized"),
             Ok(_) => {}
             Err(error) => {
-                warn!(%error, "coordinator unavailable; retaining existing tunnel configuration")
+                warn!(%error, "peer synchronization failed; retaining existing tunnel configuration")
             }
         }
+        manage_magic_dns(&mut dns, state, state_dir).await;
         manage_paths(network, &mut mesh, state, &mut paths).await;
         report_relay_endpoint(coordinator, mesh.as_ref(), state, state_dir).await;
         if exit_after_join {
             if let Some(active) = mesh.take() {
                 active.stop();
             }
+            shutdown_magic_dns(&mut dns, state, state_dir);
             info!("initial peer sync complete; handing over to the service manager");
             return Ok(());
         }
@@ -164,7 +174,90 @@ async fn sync_loop(
     if let Some(active) = mesh.take() {
         active.stop();
     }
+    shutdown_magic_dns(&mut dns, state, state_dir);
     Ok(())
+}
+
+async fn manage_magic_dns(
+    dns: &mut Option<MagicDns>,
+    state: &mut blaktaild::NodeState,
+    state_dir: &std::path::Path,
+) {
+    let Some(domain) = dns_domain(&state.dns_name) else {
+        return;
+    };
+    if dns.as_ref().is_some_and(|active| !active.matches(state)) {
+        let old_domain = dns
+            .as_ref()
+            .map(|active| active.domain().to_owned())
+            .expect("active resolver checked");
+        if let Err(error) = remove_system_dns(
+            state_dir,
+            &state.interface,
+            &old_domain,
+            state.dns_mode.as_deref(),
+        ) {
+            warn!(%error, "could not remove stale MagicDNS configuration");
+            return;
+        }
+        if let Some(active) = dns.take() {
+            active.stop();
+        }
+        state.dns_mode = None;
+    }
+    if dns.is_none() {
+        let created = match MagicDns::spawn(state).await {
+            Ok(created) => created,
+            Err(error) => {
+                warn!(%error, "could not bind local MagicDNS resolver");
+                return;
+            }
+        };
+        let mode =
+            match configure_system_dns(state_dir, &state.interface, created.bind_ip(), &domain) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    created.stop();
+                    warn!(%error, "could not configure system MagicDNS routing");
+                    return;
+                }
+            };
+        info!(%domain, mode, "MagicDNS resolver active");
+        state.dns_mode = Some(mode);
+        if let Err(error) = write_state(state_dir, state) {
+            warn!(%error, "could not persist MagicDNS configuration state");
+        }
+        *dns = Some(created);
+    }
+    if let Some(active) = dns.as_ref() {
+        active.update(state);
+    }
+}
+
+fn shutdown_magic_dns(
+    dns: &mut Option<MagicDns>,
+    state: &mut blaktaild::NodeState,
+    state_dir: &std::path::Path,
+) {
+    let Some(active) = dns.take() else {
+        return;
+    };
+    let domain = active.domain().to_owned();
+    active.stop();
+    match remove_system_dns(
+        state_dir,
+        &state.interface,
+        &domain,
+        state.dns_mode.as_deref(),
+    ) {
+        Ok(()) => {
+            state.dns_mode = None;
+            if let Err(error) = write_state(state_dir, state) {
+                warn!(%error, "could not persist MagicDNS shutdown state");
+            }
+        }
+        Err(error) => warn!(%error, "could not remove MagicDNS configuration"),
+    }
 }
 
 const RELAY_ENDPOINT_REPORT_SECS: u64 = 60;
@@ -595,6 +688,10 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                 }
                 return Err(error);
             }
+            let restored = restore_peers(network.as_mut(), &state)?;
+            if restored > 0 {
+                info!(restored, "restored persisted WireGuard peers");
+            }
             write_state(&cli.state_dir, &state)?;
             info!(node_id = %state.node_id, address = %state.assigned_ip, interface, "tailnet joined");
             println!(
@@ -618,6 +715,10 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             let coordinator = Coordinator::new(&state.coord)?;
             let mut network = make_network();
             network.setup(&state.interface, &key_path, &state.assigned_ip)?;
+            let restored = restore_peers(network.as_mut(), &state)?;
+            if restored > 0 {
+                info!(restored, "restored persisted WireGuard peers");
+            }
             write_state(&cli.state_dir, &state)?;
             info!(node_id = %state.node_id, interface = %state.interface, "resuming enrollment");
             sync_loop(
@@ -630,14 +731,29 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             )
             .await?;
         }
+        Command::Reauth { join_key } => {
+            let mut state = read_state(&cli.state_dir)?;
+            let coordinator = Coordinator::new(&state.coord)?;
+            let mut join_key = resolve_join_key(join_key)?;
+            let result = coordinator.reauth(&mut state, &join_key).await;
+            join_key.zeroize();
+            result?;
+            write_state(&cli.state_dir, &state)?;
+            println!(
+                "node credential renewed\n{}",
+                credential_status(state.credential_expires_at, blaktaild_now() as i64)
+            );
+        }
         Command::Status => {
             let state = read_state(&cli.state_dir)?;
             println!(
-                "joined\nnode: {}\ninterface: {}\naddress: {}\ncoordinator: {}\npeers: {}",
+                "joined\nnode: {}\ninterface: {}\naddress: {}\ndns: {}\ncoordinator: {}\ncredential: {}\npeers: {}",
                 state.node_id,
                 state.interface,
                 state.assigned_ip,
+                if state.dns_name.is_empty() { "unknown" } else { &state.dns_name },
                 state.coord,
+                credential_status(state.credential_expires_at, blaktaild_now() as i64),
                 state.peers.len()
             );
             for peer in state.peers {
@@ -651,6 +767,14 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
         }
         Command::Down => {
             let state = read_state(&cli.state_dir)?;
+            if let Some(domain) = dns_domain(&state.dns_name) {
+                remove_system_dns(
+                    &cli.state_dir,
+                    &state.interface,
+                    &domain,
+                    state.dns_mode.as_deref(),
+                )?;
+            }
             let coordinator = Coordinator::new(&state.coord)?;
             coordinator.revoke(&state).await?;
             make_network().down(&state.interface)?;
@@ -659,6 +783,17 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
         }
     }
     Ok(())
+}
+
+fn credential_status(expires_at: i64, now: i64) -> String {
+    if expires_at == 0 {
+        return "expiry unknown; run the agent to refresh status".into();
+    }
+    if expires_at <= now {
+        return format!("expired at Unix {expires_at}; run blaktaild reauth");
+    }
+    let days = (expires_at - now + 86_399) / 86_400;
+    format!("expires at Unix {expires_at} (in {days} day(s))")
 }
 
 #[cfg(test)]
@@ -769,6 +904,13 @@ mod tests {
         assert_eq!(resolve_relay(&relays, None).await, Some(first));
         assert_eq!(resolve_relay(&relays, Some(first)).await, Some(second));
         assert_eq!(resolve_relay(&relays[..1], Some(first)).await, Some(first));
+    }
+
+    #[test]
+    fn credential_status_is_actionable() {
+        assert!(credential_status(0, 100).contains("unknown"));
+        assert!(credential_status(99, 100).contains("reauth"));
+        assert!(credential_status(86_500, 100).contains("1 day"));
     }
 
     fn candidate() -> std::net::SocketAddr {

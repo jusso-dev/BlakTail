@@ -1,7 +1,9 @@
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS orgs (
  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
- acl_json TEXT NOT NULL CHECK (json_valid(acl_json)), created_at TEXT NOT NULL
+ acl_json TEXT NOT NULL CHECK (json_valid(acl_json)), created_at TEXT NOT NULL,
+ node_key_ttl_seconds INTEGER NOT NULL DEFAULT 7776000
+   CHECK (node_key_ttl_seconds BETWEEN 86400 AND 31536000)
 );
 CREATE TABLE IF NOT EXISTS join_keys (
  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -20,6 +22,7 @@ CREATE TABLE IF NOT EXISTS nodes (
  user_id TEXT NOT NULL DEFAULT '', user_role TEXT NOT NULL DEFAULT 'owner',
  tags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags_json)),
  dns_name TEXT NOT NULL DEFAULT '',
+ credential_expires_at INTEGER NOT NULL DEFAULT 0,
  relay_endpoint TEXT,
  relay_endpoint_updated_at INTEGER,
  UNIQUE(org_id,name), UNIQUE(org_id,wg_public_key)

@@ -14,7 +14,9 @@ use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
+pub mod dns;
 pub mod relay_client;
+pub use dns::{configure_system_dns, dns_domain, remove_system_dns, MagicDns};
 pub use relay_client::RelayMesh;
 
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/blaktail";
@@ -80,6 +82,10 @@ pub struct NodeState {
     pub interface: String,
     pub assigned_ip: String,
     #[serde(default)]
+    pub dns_name: String,
+    #[serde(default)]
+    pub credential_expires_at: i64,
+    #[serde(default)]
     pub peers: Vec<Peer>,
     /// Advertised relay endpoints (host:port UDP) and our capability token.
     #[serde(default)]
@@ -92,6 +98,8 @@ pub struct NodeState {
     pub relay_endpoint: Option<String>,
     #[serde(default)]
     pub relay_endpoint_reported_at: u64,
+    #[serde(default)]
+    pub dns_mode: Option<String>,
 }
 #[derive(Serialize)]
 struct RegisterRequest<'a> {
@@ -107,6 +115,10 @@ struct RegisterResponse {
     node_token: String,
     assigned_ip: String,
     #[serde(default)]
+    dns_name: String,
+    #[serde(default)]
+    credential_expires_at: i64,
+    #[serde(default)]
     relays: Vec<String>,
     #[serde(default)]
     relay_token: String,
@@ -117,11 +129,31 @@ struct RegisterResponse {
 struct PeersResponse {
     peers: Vec<Peer>,
     #[serde(default)]
+    dns_name: String,
+    #[serde(default)]
+    credential_expires_at: i64,
+    #[serde(default)]
     relays: Vec<String>,
     #[serde(default)]
     relay_token: String,
     #[serde(default)]
     relay_expires_at: u64,
+}
+
+#[derive(Serialize)]
+struct ReauthRequest<'a> {
+    join_key: &'a str,
+}
+
+#[derive(Deserialize)]
+struct ReauthResponse {
+    node_token: String,
+    credential_expires_at: i64,
+}
+
+#[derive(Deserialize)]
+struct ApiErrorResponse {
+    error: String,
 }
 
 #[derive(Clone)]
@@ -178,27 +210,58 @@ impl Coordinator {
             coord: self.base.clone(),
             interface: interface.into(),
             assigned_ip: r.assigned_ip,
+            dns_name: r.dns_name,
+            credential_expires_at: r.credential_expires_at,
             peers: vec![],
             relays: r.relays,
             relay_token: r.relay_token,
             relay_expires_at: r.relay_expires_at,
             relay_endpoint: None,
             relay_endpoint_reported_at: 0,
+            dns_mode: None,
         })
     }
     pub async fn peers(&self, state: &mut NodeState) -> Result<Vec<Peer>, Error> {
-        let r = self
+        let response = self
             .client
             .get(format!("{}/v1/nodes/{}/peers", self.base, state.node_id))
             .bearer_auth(&state.node_token)
             .send()
-            .await?
-            .error_for_status()?;
-        let body: PeersResponse = r.json().await?;
+            .await?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let message = response
+                .json::<ApiErrorResponse>()
+                .await
+                .map(|body| body.error)
+                .unwrap_or_else(|_| "node authentication rejected".into());
+            return Err(Error::Message(message));
+        }
+        let body: PeersResponse = response.error_for_status()?.json().await?;
+        state.dns_name = body.dns_name;
+        state.credential_expires_at = body.credential_expires_at;
         state.relays = body.relays;
         state.relay_token = body.relay_token;
         state.relay_expires_at = body.relay_expires_at;
         Ok(body.peers)
+    }
+    pub async fn reauth(&self, state: &mut NodeState, join_key: &str) -> Result<(), Error> {
+        let response = self
+            .client
+            .post(format!("{}/v1/nodes/{}/reauth", self.base, state.node_id))
+            .bearer_auth(&state.node_token)
+            .json(&ReauthRequest { join_key })
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(Error::Message(format!(
+                "re-authentication rejected by coordinator ({})",
+                response.status()
+            )));
+        }
+        let renewed: ReauthResponse = response.json().await?;
+        state.node_token = renewed.node_token;
+        state.credential_expires_at = renewed.credential_expires_at;
+        Ok(())
     }
     pub async fn revoke(&self, state: &NodeState) -> Result<(), Error> {
         self.client
@@ -664,6 +727,7 @@ impl Network for MacOsNetwork {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl MacOsNetwork {
     /// UAPI `get=1` dump as ordered key/value pairs: per-peer blocks carry
     /// `public_key=<hex>` followed by `last_handshake_time_sec=<n>` (absent or
@@ -702,6 +766,21 @@ pub async fn sync_once(
     write_state(dir, state)?;
     Ok(changes.len())
 }
+
+/// Reinstalls the persisted peer set after a platform backend recreates its
+/// WireGuard interface. This keeps the last known mesh usable during a
+/// coordinator outage and makes daemon restarts deterministic.
+pub fn restore_peers(network: &mut dyn Network, state: &NodeState) -> Result<usize, Error> {
+    let changes: Vec<_> = state
+        .peers
+        .iter()
+        .cloned()
+        .map(PeerChange::Upsert)
+        .collect();
+    network.apply(&state.interface, &changes)?;
+    Ok(changes.len())
+}
+
 pub fn validate_interface(name: &str) -> Result<(), Error> {
     if name.is_empty()
         || name.len() > 15
@@ -719,6 +798,42 @@ pub fn validate_interface(name: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordingNetwork {
+        applied: Vec<PeerChange>,
+    }
+
+    impl Network for RecordingNetwork {
+        fn setup(&mut self, _interface: &str, _key: &Path, _address: &str) -> Result<(), Error> {
+            Ok(())
+        }
+        fn apply(&mut self, _interface: &str, changes: &[PeerChange]) -> Result<(), Error> {
+            self.applied.extend_from_slice(changes);
+            Ok(())
+        }
+        fn down(&mut self, _interface: &str) -> Result<(), Error> {
+            Ok(())
+        }
+        fn set_peer_endpoint(
+            &mut self,
+            _interface: &str,
+            _peer_key_b64: &str,
+            _endpoint: &str,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn latest_handshakes(&mut self, _interface: &str) -> Result<HashMap<String, u64>, Error> {
+            Ok(HashMap::new())
+        }
+        fn listen_endpoint(
+            &mut self,
+            _interface: &str,
+        ) -> Result<Option<std::net::SocketAddr>, Error> {
+            Ok(None)
+        }
+    }
+
     fn peer(key: &str, endpoint: Option<&str>) -> Peer {
         Peer {
             id: Uuid::nil(),
@@ -744,6 +859,30 @@ mod tests {
                 PeerChange::Upsert(peer("new", None))
             ]
         );
+    }
+
+    #[test]
+    fn persisted_peers_are_reinstalled_after_interface_recreation() {
+        let expected = peer("restored", Some("192.0.2.1:51820"));
+        let state = NodeState {
+            node_id: Uuid::nil(),
+            node_token: "secret".into(),
+            coord: "https://coord.example".into(),
+            interface: "blaktail0".into(),
+            assigned_ip: "100.64.0.1/32".into(),
+            dns_name: "self.12345678.blaktail".into(),
+            credential_expires_at: 1,
+            peers: vec![expected.clone()],
+            relays: vec![],
+            relay_token: String::new(),
+            relay_expires_at: 0,
+            relay_endpoint: None,
+            relay_endpoint_reported_at: 0,
+            dns_mode: None,
+        };
+        let mut network = RecordingNetwork::default();
+        assert_eq!(restore_peers(&mut network, &state).unwrap(), 1);
+        assert_eq!(network.applied, vec![PeerChange::Upsert(expected)]);
     }
     #[test]
     fn key_file_is_created_with_0600() {

@@ -15,6 +15,9 @@ export type CoordNode = {
   user_role: string;
   tags: DeviceTag[];
   created_at: number;
+  credential_expires_at: number;
+  expired: boolean;
+  expires_soon: boolean;
   revoked: boolean;
 };
 

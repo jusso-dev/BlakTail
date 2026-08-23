@@ -17,6 +17,7 @@ BlakTail is a WireGuard mesh. Devices join an organisation tailnet, talk peer to
 | ACL | Coordinator DB; edited in the console | Who may reach whom. Default is deny across device tags |
 | Relay mapping | In-memory on the AU relay | Node id to UDP address, timing, and packet sizes |
 | Reflexive candidates | Coordinator node records, expiring after 180 seconds | Node id to recently observed relay-socket address |
+| Node credential expiry | Coordinator node records | Default 90-day control-plane and peer-map lifetime; re-auth rotates the token |
 | Relay capability secret | Coordinator and relay env only | Attacker can register or hijack relay identities; it is separate from console-session signing |
 | Console sessions and `BETTER_AUTH_SECRET` | Onshore Postgres and console env | Account takeover of the operator UI |
 | `BLAKTAIL_AUTH_HMAC_SECRET` | Console and coordinator env | Forgery of console sessions into the coordinator |
@@ -82,6 +83,7 @@ These are not optional hardening. They are the v1 bar.
 2. **Key files are `0600`.** `blaktaild` writes `private.key` and `state.json` with mode `0600` under a `0700` state directory. It refuses to run if an existing private key is world- or group-readable. Put `/etc/blaktail/blaktaild.env` at `0600` as well, and delete `BLAKTAIL_JOIN_KEY` from it after the first successful join.
 3. **Revoke path.** Owners and admins can revoke from the console, the node can self-revoke with `blaktaild down`, and the coordinator API plus SQLite remain available when the UI is not. Copy-paste steps are below. Members cannot mint keys, edit ACLs, or revoke devices.
 4. **No payload logs on the relay.** The relay forwards bytes. It must not log WireGuard payloads, plaintext, or packet bodies. Startup may log region and bind address only. Coordinator logs may include node ids and org ids; they must not include join keys, node tokens, or private keys.
+5. **MagicDNS is authoritative-only.** Each agent answers its current private peer map locally. Unknown `*.blaktail` names return `NXDOMAIN`; public names are refused rather than forwarded, so a tailnet label is never leaked by the BlakTail stub to an upstream resolver.
 
 ## Honest limits
 
@@ -90,6 +92,13 @@ Say these out loud. Do not market around them.
 **Metadata is visible.** WireGuard hides payload contents from the relay and from the network path. It does not hide that two devices exist, when they talk, how much they send, or which configured and reflexive endpoints the coordinator recorded. The coordinator database is a complete membership directory: names, tags, roles, MagicDNS names, public keys, allowed IPs, endpoints. Reflexive candidates age out of peer responses after 180 seconds, but the latest value remains in the database until replaced or the node is removed. Anyone with that database can map the org's tailnet. Anyone with relay access can add timing. BlakTail is not an anonymity network.
 
 **Unlocked or unencrypted disk is game over for that node.** `0600` is not a substitute for full-disk encryption, a screen lock, or firmware passwords. If the laptop is stolen while unlocked, or the disk is imaged without encryption, the thief has the private key and the node token. Revoke immediately. Re-enrol the user on known-good hardware. We cannot remotely wipe a machine we no longer control.
+
+Node credentials expire after the organisation's configured lifetime (90 days by
+default). Expired nodes stop receiving peer maps and are removed from other nodes'
+maps on their next poll. Re-authentication requires both the prior node secret and a
+fresh join key, rotates the node token, and preserves the existing tailnet identity.
+Routine re-authentication intentionally keeps the WireGuard key. It is not compromise
+recovery: if the private key may have leaked, revoke the node and enrol a new one.
 
 **Join-key theft enrols an attacker.** If they redeem the key before you revoke it, you now have a hostile node with whatever tags that key carried. Revoking the join key afterwards does not kick them off; you must revoke the node they created. Unused keys in chat logs, email, ticket systems, or shell history are live credentials.
 
