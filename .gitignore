@@ -1,0 +1,20 @@
+# macOS / Xcode
+apps/macos/.build/
+apps/macos/*.xcodeproj/
+apps/macos/*.xcworkspace/
+**/DerivedData/
+*.xcuserstate
+
+# Private keys and local secrets
+*.key
+*.pem
+*.psk
+*.priv
+*.private
+.env
+.env.*
+!*.env.example
+
+# Rust (when merged with agent branches)
+/target/
+**/target/

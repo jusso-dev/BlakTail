@@ -28,10 +28,22 @@ https://github.com/jusso-dev/BlakTail
 - Rust workspace: `blaktaild` (node agent), `blaktail-coord`, `blaktail-relay`
 - WireGuard: userspace on macOS first, kernel WG on Linux, userspace on Windows
 - Console: Next.js 16.3, Drizzle, Better Auth, Postgres onshore. Auth sessions are issued in the console and verified by Rust
-- Desktop: Mac app first (Swift or Tauri wrapping the agent). Windows and Linux follow
-- Self-hosted CI: `runs-on: [self-hosted]` and `[self-hosted, macOS]` for the Mac agent
+- Desktop: Mac app first (SwiftUI wrapping the LaunchDaemon agent). Windows and Linux follow
+- Self-hosted CI: `runs-on: [self-hosted]` and `[self-hosted, macOS]` for the Mac agent and desktop app
 - Apache-2.0
 
 ## Tagline (do not rewrite)
 
 Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.
+
+## macOS desktop
+
+SwiftUI menu bar app in `apps/macos`. Minimum **macOS 14 Sonoma**. Signs in via Better Auth (ASWebAuthenticationSession), stores the session token in Keychain, and starts/stops local `blaktaild` without the terminal. Join keys travel on stdin only and are not left in argv on quit.
+
+See [`docs/macos-desktop.md`](docs/macos-desktop.md) for build steps, manual validation, and **notarisation** notes (do not buy signing certificates in CI).
+
+```bash
+bash scripts/validate-macos-desktop.sh
+# on a Mac runner or Mac workstation:
+cd apps/macos && swift test
+```
