@@ -5,4 +5,4 @@ RUN apk add --no-cache openssl
 COPY deploy/docker/e2e-coord-proxy.Caddyfile /etc/caddy/Caddyfile
 
 EXPOSE 8080
-CMD ["run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+CMD ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]

@@ -10,8 +10,8 @@ done
 assert_aws_identity
 assert_stack_identity
 case "$(cat "$STAGE_FILE" 2>/dev/null || true)" in
-  bootstrap | prepare) ;;
-  *) die "bootstrap or prepare stage required" ;;
+  bootstrap | prepare | activate) ;;
+  *) die "bootstrap, prepare, or activate stage required" ;;
 esac
 
 docker_arch=$(docker --context "$DOCKER_CONTEXT" info --format '{{.Architecture}}')
