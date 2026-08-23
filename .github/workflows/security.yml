@@ -1,0 +1,45 @@
+name: Security
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: blaktail-self-hosted
+  cancel-in-progress: false
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install scanners
+        run: |
+          tools="$(scripts/ci/install-security-tools.sh)"
+          echo "${tools}" >> "${GITHUB_PATH}"
+
+      - name: Scan this revision
+        run: scripts/ci/gitleaks-scan.sh
+
+      - name: Dummy secret on a test branch must fail
+        run: scripts/ci/prove-gitleaks-detects-dummy.sh
+
+  cargo-deny:
+    name: cargo deny
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install scanners
+        run: |
+          tools="$(scripts/ci/install-security-tools.sh)"
+          echo "${tools}" >> "${GITHUB_PATH}"
+
+      - name: cargo deny
+        run: scripts/ci/cargo-deny-check.sh

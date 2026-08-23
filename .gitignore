@@ -16,6 +16,14 @@ wg*.conf
 .env.*
 !*.env.example
 
+# Coordinator databases
+*.sqlite
+*.sqlite3
+*.db
+
+# Local scanner installs
+.tools/
+
 # Node / Next.js
 node_modules/
 **/node_modules/

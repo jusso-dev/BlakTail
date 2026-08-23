@@ -1,0 +1,224 @@
+# Threat model
+
+Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.
+
+That sentence is a product constraint. This document says what we protect, what we do not, and what an operator does when something goes wrong. It is not an IRAP package and does not claim one.
+
+BlakTail is a WireGuard mesh. Devices join an organisation tailnet, talk peer to peer, and fall back through a relay the organisation runs. The organisation holds the keys. The coordination server and relays stay in Australia. The code is public; the secrets are not.
+
+## What we protect
+
+| Asset | Where it lives | If it leaks |
+| --- | --- | --- |
+| Node WireGuard private key | `/var/lib/blaktail/private.key` on the device, mode `0600` | Attacker impersonates that node on the tailnet until revoke |
+| Node token (`btn_…`) | `/var/lib/blaktail/state.json`, mode `0600` | Attacker polls peers and self-revokes; does not yield the WG private key by itself |
+| Join key (`btk_…`) | Shown once at mint; optional `/etc/blaktail/blaktaild.env` | Attacker enrols a new node, with that key's tags and role, until the key is used, expired, or revoked |
+| Coordinator database | Org host (`blaktail-coord.sqlite3` or `BLAKTAIL_DATABASE`) | Peer graph, public keys, endpoints, ACL, hashed join keys and tokens, MagicDNS names |
+| ACL | Coordinator DB; edited in the console | Who may reach whom. Default is deny across device tags |
+| Relay mapping | In-memory on the AU relay | Node id to UDP address, timing, and packet sizes |
+| Console sessions and `BETTER_AUTH_SECRET` | Onshore Postgres and console env | Account takeover of the operator UI |
+| `BLAKTAIL_CONSOLE_SYNC_SECRET` | Console and coordinator env | Forgery of console sessions into the coordinator |
+| TLS private key | Coordinator host | Intercept of control-plane HTTP |
+
+The coordinator stores hashes of join keys and node tokens, not the secrets themselves. It never stores user file contents. WireGuard payload ciphertext is not a coordinator asset.
+
+## Trust boundaries
+
+```
+[operator laptop] --HTTPS--> [console, onshore Postgres]
+                                  |
+                                  | session + sync secret
+                                  v
+[node /var/lib/blaktail] --HTTPS--> [blaktail-coord in Australia]
+        |                                    |
+        | WireGuard (usually direct)         | peer list, public keys, ACL
+        v                                    v
+   [peer node] <---- UDP fallback ---- [blaktail-relay in Australia]
+```
+
+- Nodes treat the coordinator as the source of truth for membership and ACL.
+- Relays are organisation infrastructure. They forward opaque UDP. They are not a second control plane.
+- GitHub holds public code. It must not hold keys, env files, or the coordinator database.
+- CI runs on runners the organisation operates (`runs-on: [self-hosted]`). GitHub-hosted `ubuntu-latest` is out.
+
+## Attackers we actually design for
+
+### Stolen or unattended laptop
+
+The node private key and node token sit in ordinary files. Mode `0600` stops other Unix users on a locked-down host. It does nothing once an attacker is in the logged-in session, or once they image an unencrypted disk.
+
+Assume compromise of that node. Revoke it from a different, trusted admin machine. Do not wait to recover the laptop. After revoke, remaining peers drop the public key on their next poll (30 seconds by default, within 60 seconds if the coordinator is reachable).
+
+### Leaked join key
+
+A join key is a capability. Anyone who has a still-valid key can register a node with the tags and role bound to that key. Single-use and short expiry shrink the window; they do not shrink it to zero. A time-boxed reusable key is worse.
+
+Treat a leaked unused key as: revoke that key (or every unused key for the org), then look at `nodes` created after the leak and revoke anything you did not enrol yourself.
+
+### Curious relay operator
+
+The relay does not decrypt WireGuard payloads and must not log them. It still sees UDP 5-tuples, 16-byte node ids, packet sizes, and timing. A person with shell on the relay host can watch who talks to whom. v1 registration is not mutually authenticated: treat the relay as trusted org kit on an Australian network, not as an untrusted public DERP.
+
+### Offshore SaaS mistake
+
+Typical ways to break the onshore rule without dropping a key in Slack:
+
+- Coordinator or relay in `us-east-1`, `ap-southeast-1` (Singapore), or any non-AU region
+- GitHub-hosted Actions runners
+- Console on Vercel, Netlify, or another offshore app host
+- Error, analytics, or font CDNs outside Australia
+- Secret scanning SaaS that uploads the repository
+- `cargo deny` / gitleaks run somewhere that ships the tree off the runner
+
+The relay refuses to start unless `BLAKTAIL_REGION` is an Australian cloud region (`ap-southeast-2`, `australiaeast`, `australiasoutheast`, `australia-southeast1`, `australia-southeast2`). The coordinator refuses to start when `BLAKTAIL_REGION` is empty and reports that label on `GET /health`. Operators still have to set an Australian value; a non-empty offshore label on the coordinator is a human mistake the process will currently honour. Pin the coordinator the same way you pin the relay.
+
+## Required controls
+
+These are not optional hardening. They are the v1 bar.
+
+1. **Region pin.** Relays must use the Australian allow-list above. Coordinators must have a non-empty region and should use the same allow-list. Health checks show the label so an operator can see drift.
+2. **Key files are `0600`.** `blaktaild` writes `private.key` and `state.json` with mode `0600` under a `0700` state directory. It refuses to run if an existing private key is world- or group-readable. Put `/etc/blaktail/blaktaild.env` at `0600` as well, and delete `BLAKTAIL_JOIN_KEY` from it after the first successful join.
+3. **Revoke path.** Owners and admins can revoke from the console, the node can self-revoke with `blaktaild down`, and the coordinator API plus SQLite remain available when the UI is not. Copy-paste steps are below. Members cannot mint keys, edit ACLs, or revoke devices.
+4. **No payload logs on the relay.** The relay forwards bytes. It must not log WireGuard payloads, plaintext, or packet bodies. Startup may log region and bind address only. Coordinator logs may include node ids and org ids; they must not include join keys, node tokens, or private keys.
+
+## Honest limits
+
+Say these out loud. Do not market around them.
+
+**Metadata is visible.** WireGuard hides payload contents from the relay and from the network path. It does not hide that two devices exist, when they talk, how much they send, or which public endpoints the coordinator recorded. The coordinator database is a complete membership directory: names, tags, roles, MagicDNS names, public keys, allowed IPs, endpoints. Anyone with that database can map the org's tailnet. Anyone with relay access can add timing. BlakTail is not an anonymity network.
+
+**Unlocked or unencrypted disk is game over for that node.** `0600` is not a substitute for full-disk encryption, a screen lock, or firmware passwords. If the laptop is stolen while unlocked, or the disk is imaged without encryption, the thief has the private key and the node token. Revoke immediately. Re-enrol the user on known-good hardware. We cannot remotely wipe a machine we no longer control.
+
+**Join-key theft enrols an attacker.** If they redeem the key before you revoke it, you now have a hostile node with whatever tags that key carried. Revoking the join key afterwards does not kick them off; you must revoke the node they created. Unused keys in chat logs, email, ticket systems, or shell history are live credentials.
+
+**Revoke is not instant if the coordinator is down.** Peers keep the last applied WireGuard configuration when polling fails, so existing tunnels survive a coordinator outage. That is deliberate. It also means a revoke does not propagate until peers can reach the coordinator again.
+
+**This is not IRAP.** Public code, org-held keys, and onshore hosting are the product. Formal accreditation is out of scope.
+
+## Revoke
+
+Do this from a trusted admin host, not from the stolen device.
+
+Replace `COORD`, `ORG_ID`, `NODE_ID`, `JOIN_KEY`, and `CONSOLE_SESSION` with your values. `COORD` is an `https://` coordinator URL.
+
+### 1. Console (preferred)
+
+Sign in as owner or admin.
+
+1. Open `/devices`.
+2. Press **Revoke** on the compromised node.
+3. Confirm the row shows **Revoked**.
+4. Open `/join-keys`. Mint replacements only after unused leaked keys are revoked (step 4).
+5. Wait one poll interval (30 seconds, worst case 60) then `ping` a remaining node from another remaining node.
+
+### 2. Node self-revoke (machine you still control)
+
+```sh
+sudo blaktaild down
+```
+
+That calls `DELETE /v1/nodes/{node_id}` with the persisted node token, removes `blaktail0`, and deletes `state.json`. It does not delete `private.key`; remove that yourself if the device is being retired.
+
+### 3. Coordinator API
+
+Owner or admin session, after the console has synced it:
+
+```sh
+curl -sS -o /tmp/blaktail-revoke-http -w "%{http_code}\n" -X DELETE \
+  -H "Authorization: Bearer ${CONSOLE_SESSION}" \
+  "${COORD}/v1/orgs/${ORG_ID}/nodes/${NODE_ID}"
+```
+
+`204` means the node is revoked. `403` means the session is a member. `404` means the id is wrong or already revoked.
+
+List, then confirm `revoked` is true:
+
+```sh
+curl -sS -H "Authorization: Bearer ${CONSOLE_SESSION}" \
+  "${COORD}/v1/orgs/${ORG_ID}/nodes"
+```
+
+### 4. SQLite emergency (coordinator host)
+
+On the coordinator box. Default DB path is `blaktail-coord.sqlite3` unless you set `BLAKTAIL_DATABASE`.
+
+Revoke one node:
+
+```sh
+sqlite3 "${BLAKTAIL_DATABASE:-blaktail-coord.sqlite3}" \
+  "UPDATE nodes SET revoked_at=strftime('%s','now') WHERE id='${NODE_ID}' AND revoked_at IS NULL;"
+```
+
+Revoke every unused join key for the org (leaked key, not sure which one):
+
+```sh
+sqlite3 "${BLAKTAIL_DATABASE:-blaktail-coord.sqlite3}" \
+  "UPDATE join_keys SET revoked_at=strftime('%s','now')
+     WHERE org_id='${ORG_ID}' AND used_at IS NULL AND revoked_at IS NULL;"
+```
+
+Revoke one known leaked join key (SHA-256 of the secret string, including the `btk_` prefix):
+
+```sh
+JOIN_HASH="$(printf '%s' "${JOIN_KEY}" | sha256sum | awk '{print $1}')"
+sqlite3 "${BLAKTAIL_DATABASE:-blaktail-coord.sqlite3}" \
+  "UPDATE join_keys SET revoked_at=strftime('%s','now')
+     WHERE key_hash='${JOIN_HASH}' AND revoked_at IS NULL;"
+```
+
+Nodes created with a stolen key stay active until you revoke those rows too:
+
+```sh
+sqlite3 "${BLAKTAIL_DATABASE:-blaktail-coord.sqlite3}" \
+  "SELECT id,name,created_at FROM nodes WHERE org_id='${ORG_ID}' AND revoked_at IS NULL ORDER BY created_at;"
+```
+
+### 5. After revoke
+
+On the compromised device, if you get it back, do not rejoin until it is rebuilt:
+
+```sh
+sudo ip link delete dev blaktail0 || true
+sudo rm -f /var/lib/blaktail/private.key /var/lib/blaktail/state.json
+sudo shred -u /etc/blaktail/blaktaild.env 2>/dev/null || sudo rm -f /etc/blaktail/blaktaild.env
+```
+
+Mint a new single-use join key with a short expiry (an hour, not a month). Enrol only the replacement device. Rotate `BLAKTAIL_CONSOLE_SYNC_SECRET` and `BETTER_AUTH_SECRET` if those files were on the same laptop.
+
+## What never goes in git
+
+The public repository is the product. Keys are not.
+
+Never commit:
+
+- Node private keys, TLS private keys, WireGuard PSKs, `*.key`, `*.pem`, `*.psk`
+- Join keys, node tokens, or any `btk_` / `btn_` secret
+- Coordinator SQLite/Postgres dumps
+- `.env`, `/etc/blaktail/blaktaild.env`, `BETTER_AUTH_SECRET`, `BLAKTAIL_CONSOLE_SYNC_SECRET`, database URLs
+- `wg*.conf` and other live WireGuard configs
+- Real `BLAKTAIL_TLS_KEY` material
+
+`.gitignore` already excludes the filename patterns. CI runs gitleaks on every push, including custom rules for `btk_` and `btn_` prefixes. That is a backstop, not a licence to paste a key into a test branch that will be merged.
+
+If a secret does land in git: treat it as leaked, rotate it, rewrite or abandon the branch, and keep the dummy-secret proof in CI (it exists so a throwaway branch with `AKIA`/`btk_` material fails). Do not "fix" a leak by deleting the file in a follow-up commit and leaving the blob in history.
+
+## CI
+
+Self-hosted only. The security workflow must not use GitHub-hosted runners and must not upload the tree to a scanning SaaS.
+
+| Check | Job |
+| --- | --- |
+| gitleaks against this revision | `.github/workflows/security.yml` job `gitleaks` |
+| Throwaway branch with a dummy secret must fail gitleaks | `scripts/ci/prove-gitleaks-detects-dummy.sh` |
+| `cargo deny` advisories, licences, bans, sources | job `cargo-deny`, policy in `deny.toml` |
+
+Reproduce locally:
+
+```sh
+scripts/ci/install-security-tools.sh
+scripts/ci/gitleaks-scan.sh
+scripts/ci/prove-gitleaks-detects-dummy.sh
+scripts/ci/cargo-deny-check.sh
+```
+
+The dummy-secret script builds a disposable git repo, commits a constructed AWS example access key and a constructed `btk_` join key, and requires gitleaks to exit non-zero. Those values are assembled at runtime so this repository itself stays clean.
