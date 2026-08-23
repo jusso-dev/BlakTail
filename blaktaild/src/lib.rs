@@ -44,6 +44,10 @@ pub struct Peer {
     pub dns_name: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Reflexive UDP address of the peer's relay-client socket. A nonce exchange
+    /// proves reachability before opaque WireGuard ciphertext uses this path.
+    #[serde(default)]
+    pub relay_endpoint: Option<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerChange {
@@ -84,6 +88,10 @@ pub struct NodeState {
     pub relay_token: String,
     #[serde(default)]
     pub relay_expires_at: u64,
+    #[serde(default)]
+    pub relay_endpoint: Option<String>,
+    #[serde(default)]
+    pub relay_endpoint_reported_at: u64,
 }
 #[derive(Serialize)]
 struct RegisterRequest<'a> {
@@ -174,6 +182,8 @@ impl Coordinator {
             relays: r.relays,
             relay_token: r.relay_token,
             relay_expires_at: r.relay_expires_at,
+            relay_endpoint: None,
+            relay_endpoint_reported_at: 0,
         })
     }
     pub async fn peers(&self, state: &mut NodeState) -> Result<Vec<Peer>, Error> {
@@ -194,6 +204,23 @@ impl Coordinator {
         self.client
             .delete(format!("{}/v1/nodes/{}", self.base, state.node_id))
             .bearer_auth(&state.node_token)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+    pub async fn report_relay_endpoint(
+        &self,
+        state: &NodeState,
+        endpoint: std::net::SocketAddr,
+    ) -> Result<(), Error> {
+        self.client
+            .put(format!(
+                "{}/v1/nodes/{}/relay-endpoint",
+                self.base, state.node_id
+            ))
+            .bearer_auth(&state.node_token)
+            .json(&serde_json::json!({"endpoint": endpoint.to_string()}))
             .send()
             .await?
             .error_for_status()?;
@@ -275,7 +302,7 @@ pub fn peer_key_hex(peer_key_b64: &str) -> Option<String> {
 }
 /// Decides when a peer's direct path is considered dead (no handshake within
 /// this window after first observation) and how long we keep re-trying it.
-pub const DIRECT_GRACE_SECS: u64 = 90;
+pub const DIRECT_GRACE_SECS: u64 = 30;
 pub const HANDSHAKE_FRESH_SECS: u64 = 180;
 pub const DIRECT_RETRY_SECS: u64 = 300;
 #[derive(Default)]
@@ -701,6 +728,7 @@ mod tests {
             allowed_ips: vec!["100.64.0.1/32".into()],
             dns_name: format!("{key}.tail.blaktail"),
             tags: vec![],
+            relay_endpoint: None,
         }
     }
     #[test]

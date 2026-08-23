@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS nodes (
  user_id TEXT NOT NULL DEFAULT '', user_role TEXT NOT NULL DEFAULT 'owner',
  tags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags_json)),
  dns_name TEXT NOT NULL DEFAULT '',
+ relay_endpoint TEXT,
+ relay_endpoint_updated_at INTEGER,
  UNIQUE(org_id,name), UNIQUE(org_id,wg_public_key)
 );
 CREATE INDEX IF NOT EXISTS nodes_active_org_idx ON nodes(org_id, revoked_at);

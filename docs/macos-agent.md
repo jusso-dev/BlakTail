@@ -1,6 +1,6 @@
 # macOS agent
 
-`blaktaild` uses boringtun in-process and opens an Apple `utun` device. It does not require a Network Extension or App Store sandbox. The first cut expects peers to have mutually reachable UDP endpoints; NAT traversal and relay fallback are separate work. The tailnet address is assigned by the onshore coordinator at registration; the agent never chooses one locally.
+`blaktaild` uses boringtun in-process and opens an Apple `utun` device. It does not require a Network Extension or App Store sandbox. The tailnet address is assigned by the onshore coordinator at registration; the agent never chooses one locally. The agent sets MTU 1280, discovers its relay socket's reflexive UDP address, falls back through the advertised Australian relay when a configured direct endpoint fails, and upgrades to peer-to-peer UDP after a nonce-confirmed hole punch succeeds.
 
 ## Build and install
 
@@ -41,8 +41,8 @@ sudo /usr/local/bin/blaktaild down
 ## Manual two-device test
 
 1. Start `blaktail-coord` on an Australian-hosted TLS endpoint and create one organisation plus two single-use join keys.
-2. On Mac A, join as `mac-one`. Note the address printed by `up` (assigned by the coordinator) and configure a UDP endpoint reachable on port 51820.
-3. On Mac B (or a compatible Linux WireGuard node), join as `mac-two` with its reachable UDP endpoint. Allow inbound UDP 51820 on both hosts/firewalls.
+2. On Mac A, join as `mac-one`. Note the address printed by `up` (assigned by the coordinator). A reachable `--endpoint` gives the agent an immediate direct candidate; otherwise the relay path remains available.
+3. On Mac B (or a compatible Linux WireGuard node), join as `mac-two`. Confirm both devices can send outbound UDP to the relay; inbound port forwarding is optional.
 4. Start both LaunchDaemons. Within 30 seconds, run `ping <address-of-B>` from A and `ping <address-of-A>` from B. Both must reply.
 5. Sleep Mac A for at least one minute, wake it, and confirm both pings recover within 60 seconds without restarting `blaktaild`.
 6. Run `blaktaild down` on B (after `launchctl bootout`) and confirm A removes B on its next peer refresh.

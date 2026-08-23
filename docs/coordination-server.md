@@ -26,6 +26,7 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 - `DELETE /v1/orgs/{org_id}/nodes/{node_id}` — owner/admin session; revoke a device
 - `POST /v1/nodes/register` — join key, name, WG public key, and optional public endpoint; the server allocates a tailnet IP
 - `GET /v1/nodes/{node_id}/peers` — bearer node token; active peers only
+- `PUT /v1/nodes/{node_id}/relay-endpoint` — bearer node token; refresh this node's reflexive UDP candidate
 - `DELETE /v1/nodes/{node_id}` — bearer node token; self-revocation
 - `GET /v1/orgs/{org_id}/acl` — any org user session
 - `PUT /v1/orgs/{org_id}/acl` — owner/admin only
@@ -44,6 +45,9 @@ ACL JSON uses `rules` with `action` (`allow` or `deny`) and optional `src_roles`
 deny wins over allow. Without a matching rule, tagged nodes can see only peers sharing
 a tag (default deny across tags); legacy untagged nodes can see other untagged nodes.
 Peer results include a stable MagicDNS name in the form `<node>.<org-prefix>.blaktail`.
+They also include a node-reported relay-socket candidate only while its coordinator
+timestamp is less than 180 seconds old. Agents use that candidate for a bounded,
+nonce-confirmed UDP hole punch while keeping relayed WireGuard traffic available.
 
 ## SQLite schema dump
 
@@ -57,7 +61,8 @@ CREATE TABLE join_keys (id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
   single_use INTEGER NOT NULL, used_at TEXT, revoked_at TEXT, created_at TEXT NOT NULL);
 CREATE TABLE nodes (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, name TEXT NOT NULL,
   wg_public_key TEXT NOT NULL, endpoint TEXT, allowed_ips_json TEXT NOT NULL,
-  token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT);
+  token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT,
+  relay_endpoint TEXT, relay_endpoint_updated_at INTEGER);
 ```
 
 The full schema includes foreign keys, JSON checks, uniqueness constraints, and indexes.

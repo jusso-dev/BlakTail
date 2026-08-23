@@ -148,6 +148,7 @@ async fn sync_loop(
             }
         }
         manage_paths(network, &mut mesh, state, &mut paths).await;
+        report_relay_endpoint(coordinator, mesh.as_ref(), state, state_dir).await;
         if exit_after_join {
             if let Some(active) = mesh.take() {
                 active.stop();
@@ -166,27 +167,34 @@ async fn sync_loop(
     Ok(())
 }
 
+const RELAY_ENDPOINT_REPORT_SECS: u64 = 60;
+
 #[derive(Clone, Copy, Debug)]
 enum PeerPath {
     Direct { since: Instant },
     Relayed { since: Instant },
     DirectProbe { since: Instant, baseline: u64 },
+    PeerDirect { last_fresh: Instant },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PathAction {
     None,
     MaintainRelay,
+    MaintainPeerDirect,
     UseRelay,
-    ProbeDirect,
+    ProbeNativeDirect,
     DirectRecovered,
+    PeerDirectRecovered,
 }
 
 fn path_action(
     path: PeerPath,
     direct_handshake_fresh: bool,
     latest_handshake: u64,
-    has_direct_endpoint: bool,
+    has_native_endpoint: bool,
+    peer_endpoint: Option<std::net::SocketAddr>,
+    peer_direct_reachable: bool,
 ) -> PathAction {
     match path {
         PeerPath::Direct { since }
@@ -194,10 +202,15 @@ fn path_action(
         {
             PathAction::UseRelay
         }
-        PeerPath::Relayed { since }
-            if has_direct_endpoint && since.elapsed().as_secs() >= DIRECT_RETRY_SECS =>
-        {
-            PathAction::ProbeDirect
+        PeerPath::Relayed { .. } if peer_endpoint.is_some() && peer_direct_reachable => {
+            PathAction::PeerDirectRecovered
+        }
+        PeerPath::Relayed { since, .. } if since.elapsed().as_secs() >= DIRECT_RETRY_SECS => {
+            if has_native_endpoint {
+                PathAction::ProbeNativeDirect
+            } else {
+                PathAction::MaintainRelay
+            }
         }
         PeerPath::Relayed { .. } => PathAction::MaintainRelay,
         PeerPath::DirectProbe { baseline, .. } if latest_handshake > baseline => {
@@ -206,13 +219,21 @@ fn path_action(
         PeerPath::DirectProbe { since, .. } if since.elapsed().as_secs() >= DIRECT_GRACE_SECS => {
             PathAction::UseRelay
         }
+        PeerPath::PeerDirect { .. } if peer_endpoint.is_none() => PathAction::UseRelay,
+        PeerPath::PeerDirect { .. } if direct_handshake_fresh => PathAction::MaintainPeerDirect,
+        PeerPath::PeerDirect { last_fresh }
+            if last_fresh.elapsed().as_secs() >= DIRECT_GRACE_SECS =>
+        {
+            PathAction::UseRelay
+        }
+        PeerPath::PeerDirect { .. } => PathAction::MaintainPeerDirect,
         _ => PathAction::None,
     }
 }
 
 /// Keeps each peer on its best available transport. Failed direct paths move
-/// to relay. Relayed peers periodically get a bounded direct-path probe; only
-/// a new handshake during that probe moves them back to direct transport.
+/// to a relay-assisted localhost forwarder. Encrypted relay traffic continues
+/// while that forwarder attempts a coordinator-mediated UDP hole punch.
 async fn manage_paths(
     network: &mut dyn Network,
     mesh: &mut Option<RelayMesh>,
@@ -226,8 +247,20 @@ async fn manage_paths(
         return;
     }
     let interface = &state.interface;
+    let failed_relay = mesh.as_ref().and_then(|active| {
+        (!active.relay_healthy()).then(|| {
+            let address = active.relay_addr();
+            warn!(%address, "relay health probe expired; trying another endpoint");
+            address
+        })
+    });
+    if failed_relay.is_some() {
+        if let Some(active) = mesh.take() {
+            active.stop();
+        }
+    }
     if mesh.is_none() {
-        let Some(relay_addr) = resolve_relay(&state.relays).await else {
+        let Some(relay_addr) = resolve_relay(&state.relays, failed_relay).await else {
             warn!("could not resolve any advertised relay; direct paths only");
             return;
         };
@@ -278,7 +311,20 @@ async fn manage_paths(
             since: Instant::now(),
         });
         let current = *path;
-        let next = match path_action(current, fresh, stamp, peer.endpoint.is_some()) {
+        let peer_endpoint = peer
+            .relay_endpoint
+            .as_deref()
+            .and_then(|endpoint| endpoint.parse::<std::net::SocketAddr>().ok());
+        let peer_direct_reachable =
+            peer_endpoint.is_some_and(|endpoint| mesh.peer_direct_reachable(peer.id, endpoint));
+        let next = match path_action(
+            current,
+            fresh,
+            stamp,
+            peer.endpoint.is_some(),
+            peer_endpoint,
+            peer_direct_reachable,
+        ) {
             PathAction::UseRelay => {
                 if switch_to_relay(network, mesh, interface, peer).await {
                     Some(PeerPath::Relayed {
@@ -299,7 +345,38 @@ async fn manage_paths(
                     })
                 }
             }
-            PathAction::ProbeDirect => {
+            PathAction::PeerDirectRecovered => {
+                let endpoint = peer_endpoint.expect("action requires peer endpoint");
+                if switch_to_peer_direct(network, mesh, interface, peer, endpoint).await {
+                    info!(peer = %peer.name, %endpoint, "peer-direct UDP path established");
+                    Some(PeerPath::PeerDirect {
+                        last_fresh: Instant::now(),
+                    })
+                } else {
+                    let _ = switch_to_relay(network, mesh, interface, peer).await;
+                    Some(PeerPath::Relayed {
+                        since: Instant::now(),
+                    })
+                }
+            }
+            PathAction::MaintainPeerDirect => {
+                let endpoint = peer_endpoint.expect("action requires peer endpoint");
+                if switch_to_peer_direct(network, mesh, interface, peer, endpoint).await {
+                    Some(if fresh {
+                        PeerPath::PeerDirect {
+                            last_fresh: Instant::now(),
+                        }
+                    } else {
+                        current
+                    })
+                } else {
+                    let _ = switch_to_relay(network, mesh, interface, peer).await;
+                    Some(PeerPath::Relayed {
+                        since: Instant::now(),
+                    })
+                }
+            }
+            PathAction::ProbeNativeDirect => {
                 let endpoint = peer.endpoint.as_deref().expect("action requires endpoint");
                 match network.set_peer_endpoint(interface, &peer.wg_public_key, endpoint) {
                     Ok(()) => {
@@ -339,6 +416,13 @@ async fn switch_to_relay(
     let already_relayed = mesh.has_forwarder(peer.id);
     match mesh.ensure_forwarder(peer.id).await {
         Ok(port) => {
+            let peer_endpoint = peer
+                .relay_endpoint
+                .as_deref()
+                .and_then(|endpoint| endpoint.parse::<std::net::SocketAddr>().ok());
+            if !mesh.use_relay(peer.id, peer_endpoint) {
+                return false;
+            }
             let local = format!("127.0.0.1:{port}");
             if let Err(error) = network.set_peer_endpoint(interface, &peer.wg_public_key, &local) {
                 warn!(%error, peer = %peer.name, "could not switch to relay path");
@@ -346,7 +430,7 @@ async fn switch_to_relay(
                 false
             } else {
                 if !already_relayed {
-                    info!(peer = %peer.name, %local, "using relay path");
+                    info!(peer = %peer.name, %local, "using relay-assisted path");
                 }
                 true
             }
@@ -355,6 +439,66 @@ async fn switch_to_relay(
             warn!(%error, peer = %peer.name, "relay forwarder failed");
             false
         }
+    }
+}
+
+async fn switch_to_peer_direct(
+    network: &mut dyn Network,
+    mesh: &RelayMesh,
+    interface: &str,
+    peer: &blaktaild::Peer,
+    endpoint: std::net::SocketAddr,
+) -> bool {
+    match mesh.ensure_forwarder(peer.id).await {
+        Ok(port) => {
+            if !mesh.use_peer_direct(peer.id, endpoint) {
+                return false;
+            }
+            let local = format!("127.0.0.1:{port}");
+            if let Err(error) = network.set_peer_endpoint(interface, &peer.wg_public_key, &local) {
+                warn!(%error, peer = %peer.name, "could not use peer-direct path");
+                mesh.drop_forwarder(peer.id);
+                false
+            } else {
+                true
+            }
+        }
+        Err(error) => {
+            warn!(%error, peer = %peer.name, "peer-direct forwarder failed");
+            false
+        }
+    }
+}
+
+async fn report_relay_endpoint(
+    coordinator: &Coordinator,
+    mesh: Option<&RelayMesh>,
+    state: &mut blaktaild::NodeState,
+    state_dir: &std::path::Path,
+) {
+    let Some(endpoint) = mesh.and_then(RelayMesh::observed_endpoint) else {
+        return;
+    };
+    let now = blaktaild_now();
+    let endpoint_text = endpoint.to_string();
+    let unchanged = state.relay_endpoint.as_deref() == Some(endpoint_text.as_str());
+    if unchanged
+        && now.saturating_sub(state.relay_endpoint_reported_at) < RELAY_ENDPOINT_REPORT_SECS
+    {
+        return;
+    }
+    match coordinator.report_relay_endpoint(state, endpoint).await {
+        Ok(()) => {
+            if !unchanged {
+                info!(%endpoint, "reported reflexive UDP endpoint");
+            }
+            state.relay_endpoint = Some(endpoint_text);
+            state.relay_endpoint_reported_at = now;
+            if let Err(error) = write_state(state_dir, state) {
+                warn!(%error, "could not persist reported relay endpoint");
+            }
+        }
+        Err(error) => warn!(%error, "could not report reflexive UDP endpoint"),
     }
 }
 
@@ -378,15 +522,22 @@ fn disable_relay(
     paths.clear();
 }
 
-async fn resolve_relay(relays: &[String]) -> Option<std::net::SocketAddr> {
+async fn resolve_relay(
+    relays: &[String],
+    excluded: Option<std::net::SocketAddr>,
+) -> Option<std::net::SocketAddr> {
+    let mut fallback = None;
     for relay in relays {
         if let Ok(mut addresses) = tokio::net::lookup_host(relay).await {
-            if let Some(address) = addresses.next() {
-                return Some(address);
+            for address in &mut addresses {
+                fallback.get_or_insert(address);
+                if Some(address) != excluded {
+                    return Some(address);
+                }
             }
         }
     }
-    None
+    fallback
 }
 
 fn blaktaild_now() -> u64 {
@@ -516,23 +667,39 @@ mod tests {
 
     #[test]
     fn relayed_handshake_does_not_masquerade_as_direct_recovery() {
+        let candidate = std::net::SocketAddr::from(([198, 51, 100, 1], 40_001));
         let path = PeerPath::Relayed {
             since: Instant::now(),
         };
         assert_eq!(
-            path_action(path, true, 100, true),
+            path_action(path, true, 100, true, Some(candidate), false),
             PathAction::MaintainRelay
         );
     }
 
     #[test]
-    fn relayed_path_gets_bounded_direct_probe() {
+    fn relayed_path_uses_proven_peer_direct_or_retries_native() {
+        let candidate = std::net::SocketAddr::from(([198, 51, 100, 1], 40_001));
         let path = PeerPath::Relayed {
             since: Instant::now() - Duration::from_secs(DIRECT_RETRY_SECS + 1),
         };
-        assert_eq!(path_action(path, true, 100, true), PathAction::ProbeDirect);
         assert_eq!(
-            path_action(path, true, 100, false),
+            path_action(path, true, 100, true, Some(candidate), true),
+            PathAction::PeerDirectRecovered
+        );
+        assert_eq!(
+            path_action(path, true, 100, true, Some(candidate), false),
+            PathAction::ProbeNativeDirect
+        );
+        assert_eq!(
+            path_action(path, true, 100, false, Some(candidate), false),
+            PathAction::MaintainRelay
+        );
+        let waiting = PeerPath::Relayed {
+            since: Instant::now(),
+        };
+        assert_eq!(
+            path_action(waiting, true, 100, true, Some(candidate), false),
             PathAction::MaintainRelay
         );
     }
@@ -544,7 +711,7 @@ mod tests {
             baseline: 100,
         };
         assert_eq!(
-            path_action(probing, true, 101, true),
+            path_action(probing, true, 101, true, Some(candidate()), false),
             PathAction::DirectRecovered
         );
         let timed_out = PeerPath::DirectProbe {
@@ -552,7 +719,7 @@ mod tests {
             baseline: 100,
         };
         assert_eq!(
-            path_action(timed_out, false, 100, true),
+            path_action(timed_out, false, 100, true, None, false),
             PathAction::UseRelay
         );
     }
@@ -562,7 +729,49 @@ mod tests {
         let path = PeerPath::Direct {
             since: Instant::now() - Duration::from_secs(DIRECT_GRACE_SECS + 1),
         };
-        assert_eq!(path_action(path, false, 0, true), PathAction::UseRelay);
-        assert_eq!(path_action(path, true, 100, true), PathAction::None);
+        assert_eq!(
+            path_action(path, false, 0, true, Some(candidate()), false),
+            PathAction::UseRelay
+        );
+        assert_eq!(
+            path_action(path, true, 100, true, Some(candidate()), false),
+            PathAction::None
+        );
+    }
+
+    #[test]
+    fn peer_direct_path_returns_to_relay_when_stale_or_candidate_disappears() {
+        let healthy = PeerPath::PeerDirect {
+            last_fresh: Instant::now(),
+        };
+        assert_eq!(
+            path_action(healthy, true, 100, true, Some(candidate()), true),
+            PathAction::MaintainPeerDirect
+        );
+        assert_eq!(
+            path_action(healthy, false, 100, true, None, false),
+            PathAction::UseRelay
+        );
+        let stale = PeerPath::PeerDirect {
+            last_fresh: Instant::now() - Duration::from_secs(DIRECT_GRACE_SECS + 1),
+        };
+        assert_eq!(
+            path_action(stale, false, 100, true, Some(candidate()), false),
+            PathAction::UseRelay
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_resolution_rotates_away_from_failed_address() {
+        let first = std::net::SocketAddr::from(([127, 0, 0, 1], 3478));
+        let second = std::net::SocketAddr::from(([127, 0, 0, 2], 3478));
+        let relays = vec![first.to_string(), second.to_string()];
+        assert_eq!(resolve_relay(&relays, None).await, Some(first));
+        assert_eq!(resolve_relay(&relays, Some(first)).await, Some(second));
+        assert_eq!(resolve_relay(&relays[..1], Some(first)).await, Some(first));
+    }
+
+    fn candidate() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([198, 51, 100, 1], 40_001))
     }
 }

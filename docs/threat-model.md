@@ -16,6 +16,7 @@ BlakTail is a WireGuard mesh. Devices join an organisation tailnet, talk peer to
 | Coordinator database | Org host (`blaktail-coord.sqlite3` or `BLAKTAIL_DATABASE`) | Peer graph, public keys, endpoints, ACL, hashed join keys and tokens, MagicDNS names |
 | ACL | Coordinator DB; edited in the console | Who may reach whom. Default is deny across device tags |
 | Relay mapping | In-memory on the AU relay | Node id to UDP address, timing, and packet sizes |
+| Reflexive candidates | Coordinator node records, expiring after 180 seconds | Node id to recently observed relay-socket address |
 | Relay capability secret | Coordinator and relay env only | Attacker can register or hijack relay identities; it is separate from console-session signing |
 | Console sessions and `BETTER_AUTH_SECRET` | Onshore Postgres and console env | Account takeover of the operator UI |
 | `BLAKTAIL_AUTH_HMAC_SECRET` | Console and coordinator env | Forgery of console sessions into the coordinator |
@@ -86,7 +87,7 @@ These are not optional hardening. They are the v1 bar.
 
 Say these out loud. Do not market around them.
 
-**Metadata is visible.** WireGuard hides payload contents from the relay and from the network path. It does not hide that two devices exist, when they talk, how much they send, or which public endpoints the coordinator recorded. The coordinator database is a complete membership directory: names, tags, roles, MagicDNS names, public keys, allowed IPs, endpoints. Anyone with that database can map the org's tailnet. Anyone with relay access can add timing. BlakTail is not an anonymity network.
+**Metadata is visible.** WireGuard hides payload contents from the relay and from the network path. It does not hide that two devices exist, when they talk, how much they send, or which configured and reflexive endpoints the coordinator recorded. The coordinator database is a complete membership directory: names, tags, roles, MagicDNS names, public keys, allowed IPs, endpoints. Reflexive candidates age out of peer responses after 180 seconds, but the latest value remains in the database until replaced or the node is removed. Anyone with that database can map the org's tailnet. Anyone with relay access can add timing. BlakTail is not an anonymity network.
 
 **Unlocked or unencrypted disk is game over for that node.** `0600` is not a substitute for full-disk encryption, a screen lock, or firmware passwords. If the laptop is stolen while unlocked, or the disk is imaged without encryption, the thief has the private key and the node token. Revoke immediately. Re-enrol the user on known-good hardware. We cannot remotely wipe a machine we no longer control.
 

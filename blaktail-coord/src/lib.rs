@@ -13,6 +13,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    net::SocketAddr,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -42,6 +43,8 @@ impl Store {
         ensure_column(&db, "nodes", "user_role", "TEXT NOT NULL DEFAULT 'owner'")?;
         ensure_column(&db, "nodes", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
         ensure_column(&db, "nodes", "dns_name", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&db, "nodes", "relay_endpoint", "TEXT")?;
+        ensure_column(&db, "nodes", "relay_endpoint_updated_at", "INTEGER")?;
         Ok(Self(Arc::new(Mutex::new(db))))
     }
     pub fn memory() -> Result<Self, rusqlite::Error> {
@@ -100,6 +103,10 @@ pub fn app_with_relays(
         .route("/v1/orgs/:org_id/acl", put(put_acl))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
+        .route(
+            "/v1/nodes/:node_id/relay-endpoint",
+            put(update_relay_endpoint),
+        )
         .route("/v1/nodes/:node_id", delete(revoke_node))
         .with_state(AppState {
             store,
@@ -383,6 +390,7 @@ struct Peer {
     allowed_ips: Vec<String>,
     dns_name: String,
     tags: Vec<DeviceTag>,
+    relay_endpoint: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct PeersResponse {
@@ -418,29 +426,33 @@ async fn list_peers(
     };
     let acl: Acl = serde_json::from_str(&acl_json)
         .map_err(|_| ApiError::Database(rusqlite::Error::InvalidQuery))?;
-    let mut q=db.prepare("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL ORDER BY name")?;
+    let mut q=db.prepare("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>?3 THEN relay_endpoint ELSE NULL END FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL ORDER BY name")?;
     let peers = q
-        .query_map(params![org, node_id.to_string()], |r| {
-            let id: String = r.get(0)?;
-            let ips: String = r.get(4)?;
-            let tags: Vec<DeviceTag> =
-                serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default();
-            Ok((
-                Peer {
-                    id: Uuid::parse_str(&id).unwrap(),
-                    name: r.get(1)?,
-                    wg_public_key: r.get(2)?,
-                    endpoint: r.get(3)?,
-                    allowed_ips: serde_json::from_str(&ips).unwrap(),
-                    dns_name: r.get(5)?,
-                    tags: tags.clone(),
-                },
-                Subject {
-                    role: r.get::<_, String>(6)?.parse().unwrap(),
-                    tags,
-                },
-            ))
-        })?
+        .query_map(
+            params![org, node_id.to_string(), now() - RELAY_ENDPOINT_FRESH_SECS],
+            |r| {
+                let id: String = r.get(0)?;
+                let ips: String = r.get(4)?;
+                let tags: Vec<DeviceTag> =
+                    serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default();
+                Ok((
+                    Peer {
+                        id: Uuid::parse_str(&id).unwrap(),
+                        name: r.get(1)?,
+                        wg_public_key: r.get(2)?,
+                        endpoint: r.get(3)?,
+                        allowed_ips: serde_json::from_str(&ips).unwrap(),
+                        dns_name: r.get(5)?,
+                        tags: tags.clone(),
+                        relay_endpoint: r.get(8)?,
+                    },
+                    Subject {
+                        role: r.get::<_, String>(6)?.parse().unwrap(),
+                        tags,
+                    },
+                ))
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter_map(|(p, d)| acl.allows(&source, &d).then_some(p))
@@ -453,8 +465,43 @@ async fn list_peers(
         relay_expires_at,
     }))
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayEndpointUpdate {
+    endpoint: String,
+}
+
+async fn update_relay_endpoint(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<RelayEndpointUpdate>,
+) -> Result<StatusCode, ApiError> {
+    let endpoint: SocketAddr = input
+        .endpoint
+        .trim()
+        .parse()
+        .map_err(|_| ApiError::BadRequest("endpoint must be an IP socket address".into()))?;
+    if endpoint.port() == 0 || endpoint.ip().is_unspecified() || endpoint.ip().is_multicast() {
+        return Err(ApiError::BadRequest(
+            "endpoint must use a unicast IP and non-zero port".into(),
+        ));
+    }
+    let token = bearer(&headers)?;
+    let changed = s.store.0.lock().unwrap().execute(
+        "UPDATE nodes SET relay_endpoint=?1,relay_endpoint_updated_at=?2 WHERE id=?3 AND token_hash=?4 AND revoked_at IS NULL",
+        params![endpoint.to_string(), now(), node_id.to_string(), token],
+    )?;
+    if changed == 0 {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Capability token TTL for relay registration (7 days, refreshed each poll).
 const RELAY_TOKEN_TTL_SECS: u64 = 604_800;
+const RELAY_ENDPOINT_FRESH_SECS: i64 = 180;
 fn relay_credentials(state: &AppState, node_id: Uuid) -> (String, u64) {
     if state.relays.is_empty() || state.relay_auth_secret.is_empty() {
         return (String::new(), 0);
@@ -880,6 +927,48 @@ mod tests {
                 relay_capability(TEST_SECRET, node.id, node.relay_expires_at)
             );
         }
+        assert_eq!(
+            call(
+                &r,
+                Method::PUT,
+                &format!("/v1/nodes/{}/relay-endpoint", ns[0].id),
+                serde_json::json!({"endpoint":"198.51.100.1:40001"}),
+                Some("wrong-node-token"),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for endpoint in ["relay.example.org:3478", "0.0.0.0:3478", "224.0.0.1:3478"] {
+            assert_eq!(
+                call(
+                    &r,
+                    Method::PUT,
+                    &format!("/v1/nodes/{}/relay-endpoint", ns[0].id),
+                    serde_json::json!({"endpoint": endpoint}),
+                    Some(&ns[0].node_token),
+                )
+                .await
+                .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        for (index, node) in ns.iter().enumerate() {
+            assert_eq!(
+                call(
+                    &r,
+                    Method::PUT,
+                    &format!("/v1/nodes/{}/relay-endpoint", node.id),
+                    serde_json::json!({
+                        "endpoint": format!("198.51.100.{}:{}", index + 1, 40_001 + index)
+                    }),
+                    Some(&node.node_token),
+                )
+                .await
+                .status(),
+                StatusCode::NO_CONTENT
+            );
+        }
         for (i, n) in ns.iter().enumerate() {
             let p: PeersResponse = body(
                 call(
@@ -902,7 +991,32 @@ mod tests {
                 p.relay_token,
                 relay_capability(TEST_RELAY_SECRET, n.id, p.relay_expires_at)
             );
+            assert_eq!(
+                p.peers[0].relay_endpoint,
+                Some(format!("198.51.100.{}:{}", 2 - i, 40_002 - i))
+            );
         }
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE nodes SET relay_endpoint_updated_at=?1 WHERE id=?2",
+                params![now() - RELAY_ENDPOINT_FRESH_SECS - 1, ns[0].id.to_string()],
+            )
+            .unwrap();
+        let stale: PeersResponse = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", ns[1].id),
+                serde_json::Value::Null,
+                Some(&ns[1].node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(stale.peers[0].relay_endpoint, None);
         let n = &ns[1];
         assert_eq!(
             call(
