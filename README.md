@@ -9,12 +9,11 @@ https://github.com/jusso-dev/BlakTail
 ## What v1 does
 
 - Org tailnet: approve devices, issue join keys, revoke a node
-- WireGuard tunnels between nodes (Linux kernel WG, userspace Rust elsewhere)
-- Coordination server the org runs (Sydney or another AU region they pick)
-- Optional AU relay when NAT blocks a direct path (DERP-style, Rust)
-- MagicDNS-style names: `laptop.org.blaktail`
-- ACLs: who can reach which tags (office, ranger, store)
-- Linux first, then Windows and macOS. Android later
+- Next.js 16.3 console: Drizzle ORM, Better Auth, talks to the Rust control plane for auth and ACLs
+- WireGuard agents: macOS first, then Linux and Windows
+- Desktop apps for Mac, then Windows and Linux, that drive the local agent
+- Coordination server and AU relay the org runs
+- MagicDNS-style names and tag ACLs (office, ranger, store)
 
 ## What v1 does not do
 
@@ -22,14 +21,15 @@ https://github.com/jusso-dev/BlakTail
 - No closed-source agent
 - Not a file sync tool (that is BlakSync)
 - Not a clone of Tailscale's trademark or UI assets
-- No Go or Zig in v1
+- No Go or Zig
 
 ## Stack (locked for first cut)
 
-- Rust (edition 2021), one workspace: `blaktaild` (node), `blaktail-coord` (control plane), `blaktail-relay`
-- WireGuard: kernel module on Linux, `boringtun` or equivalent userspace where needed
-- Headscale and Tailscale are references only. Do not vendor Go. Speak the ideas, write Rust.
-- Self-hosted CI: `runs-on: [self-hosted]`
+- Rust workspace: `blaktaild` (node agent), `blaktail-coord`, `blaktail-relay`
+- WireGuard: userspace on macOS first, kernel WG on Linux, userspace on Windows
+- Console: Next.js 16.3, Drizzle, Better Auth, Postgres onshore. Auth sessions are issued in the console and verified by Rust
+- Desktop: Mac app first (Swift or Tauri wrapping the agent). Windows and Linux follow
+- Self-hosted CI: `runs-on: [self-hosted]` and `[self-hosted, macOS]` for the Mac agent
 - Apache-2.0
 
 ## Tagline (do not rewrite)
