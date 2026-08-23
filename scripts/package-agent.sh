@@ -98,11 +98,11 @@ package_pkg() {
   if [ -n "${BLAKTAIL_INSTALLER_IDENTITY:-}" ]; then
     COPYFILE_DISABLE=1 pkgbuild --root "$root" --ownership recommended \
       --identifier org.blaktail.agent --version "$version" \
-      --install-location / --sign "$BLAKTAIL_INSTALLER_IDENTITY" "$asset"
+      --install-location / --sign "$BLAKTAIL_INSTALLER_IDENTITY" "$asset" >&2
   else
     COPYFILE_DISABLE=1 pkgbuild --root "$root" --ownership recommended \
       --identifier org.blaktail.agent --version "$version" \
-      --install-location / "$asset"
+      --install-location / "$asset" >&2
   fi
 }
 
@@ -136,7 +136,7 @@ if command -v systemctl >/dev/null 2>&1; then
 fi
 EOF
   chmod 0755 "$root/DEBIAN/postinst"
-  dpkg-deb --root-owner-group --build "$root" "$asset"
+  dpkg-deb --root-owner-group --build "$root" "$asset" >&2
 }
 
 package_rpm() {
@@ -192,7 +192,7 @@ install -D -m 0644 %{SOURCE2} %{buildroot}/usr/share/doc/blaktaild/README.md
 - Automated release package.
 EOF
   rpmbuild --define "_topdir $top" --define "_build_id_links none" \
-    --target "$rpm_arch" -bb "$top/SPECS/blaktaild.spec"
+    --target "$rpm_arch" -bb "$top/SPECS/blaktaild.spec" >&2
   set -- "$top/RPMS/$rpm_arch/"*.rpm
   [ "$#" -eq 1 ] && [ -f "$1" ] || die "rpmbuild did not produce exactly one package"
   cp "$1" "$asset"
