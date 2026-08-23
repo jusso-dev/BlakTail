@@ -1,0 +1,18 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  pre_build:
+    commands:
+      - set -euo pipefail
+      - test -n "${IMAGE_URI:-}" && test -n "${IMAGE_TAG:-}"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${IMAGE_URI%%/*}"
+  build:
+    commands:
+      - docker build --platform linux/arm64 --file deploy/docker/coord.Dockerfile --tag "$IMAGE_URI:$IMAGE_TAG" .
+      - docker push "$IMAGE_URI:$IMAGE_TAG"
+  post_build:
+    commands:
+      - docker logout "${IMAGE_URI%%/*}"
