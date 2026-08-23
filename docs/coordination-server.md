@@ -20,14 +20,27 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 ## HTTP API
 
 - `POST /v1/orgs` — `{ "name": "org", "acl": { "rules": [] } }`
-- `POST /v1/orgs/{org_id}/join-keys` — `{ "expires_in_seconds": 3600, "single_use": true }`
+- `POST /v1/orgs/{org_id}/join-keys` — owner/admin bearer session; `{ "expires_in_seconds": 3600, "single_use": true, "tags": ["office"] }`
 - `POST /v1/nodes/register` — join key, name, WG public key, and optional public endpoint; the server allocates a tailnet IP
 - `GET /v1/nodes/{node_id}/peers` — bearer node token; active peers only
 - `DELETE /v1/nodes/{node_id}` — bearer node token; self-revocation
-- `GET /v1/orgs/{org_id}/acl`
+- `GET /v1/orgs/{org_id}/acl` — any org user session
+- `PUT /v1/orgs/{org_id}/acl` — owner/admin only
 - `GET /health`
 
 Join and node credentials are returned once; only SHA-256 hashes are stored. Join keys expire after at most 30 days and default to single-use. Peer polling has no cache, so revocation is visible on the next request (within 60 seconds).
+
+The console verifies Better Auth sessions and imports the resulting org, user id, role,
+expiry, and bearer token through `Store::put_session`; only the token hash is retained.
+Roles are `owner`, `admin`, and `member`. Members can read ACLs but cannot mint join
+keys or update ACLs. A join key binds its creator's user identity and role plus zero or
+more of the fixed device tags `office`, `ranger`, and `store` to the enrolled node.
+
+ACL JSON uses `rules` with `action` (`allow` or `deny`) and optional `src_roles`,
+`src_tags`, `dst_roles`, and `dst_tags` arrays. A blank selector matches all. Explicit
+deny wins over allow. Without a matching rule, tagged nodes can see only peers sharing
+a tag (default deny across tags); legacy untagged nodes can see other untagged nodes.
+Peer results include a stable MagicDNS name in the form `<node>.<org-prefix>.blaktail`.
 
 ## SQLite schema dump
 

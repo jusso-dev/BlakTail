@@ -1,59 +1,29 @@
-//! BlakTail relay — NAT fallback path (stub).
+use blaktail_relay::{is_australian_region, serve};
+use clap::Parser;
+use std::net::SocketAddr;
+use tokio::net::UdpSocket;
+use tracing::info;
 
-const NAME: &str = "blaktail-relay";
-const TAGLINE: &str = "Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.";
-
-fn main() {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("-h") | Some("--help") => print_help(),
-        Some("-V") | Some("--version") => print_version(),
-        Some(other) => {
-            eprintln!("{NAME}: unrecognised argument '{other}'");
-            eprintln!("Try '{NAME} --help' for more information.");
-            std::process::exit(2);
-        }
-        None => {
-            print_version();
-            println!("{TAGLINE}");
-        }
-    }
+#[derive(Debug, Parser)]
+#[command(about = "Australia-pinned BlakTail UDP relay", version)]
+struct Config {
+    #[arg(long, env = "BLAKTAIL_REGION")]
+    region: String,
+    #[arg(long, env = "BLAKTAIL_RELAY_BIND", default_value = "0.0.0.0:3478")]
+    bind: SocketAddr,
 }
 
-fn print_version() {
-    println!("{NAME} {}", env!("CARGO_PKG_VERSION"));
-}
-
-fn print_help() {
-    println!("{NAME} {}", env!("CARGO_PKG_VERSION"));
-    println!();
-    println!("BlakTail relay for Indigenous organisations.");
-    println!(
-        "Prints the version and public tagline. DERP-style relay traffic is not yet implemented."
-    );
-    println!();
-    println!("Usage:");
-    println!("  {NAME} [OPTIONS]");
-    println!();
-    println!("Options:");
-    println!("  -h, --help     Show this help");
-    println!("  -V, --version  Show version only");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tagline_matches_public_contract() {
-        assert_eq!(
-            TAGLINE,
-            "Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency."
-        );
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+    let config = Config::parse();
+    if !is_australian_region(&config.region) {
+        return Err("relay region must be an approved Australian cloud region".into());
     }
-
-    #[test]
-    fn package_name_is_blaktail_relay() {
-        assert_eq!(NAME, "blaktail-relay");
-    }
+    let socket = UdpSocket::bind(config.bind).await?;
+    info!(region=config.region,bind=%config.bind,"starting Australia-pinned relay");
+    serve(socket).await?;
+    Ok(())
 }

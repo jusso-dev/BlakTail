@@ -1,6 +1,6 @@
 [package]
 name = "blaktail-relay"
-description = "BlakTail relay (stub)"
+description = "Australia-pinned BlakTail UDP relay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,3 +9,9 @@ repository.workspace = true
 [[bin]]
 name = "blaktail-relay"
 path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
