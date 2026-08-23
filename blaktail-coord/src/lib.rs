@@ -536,7 +536,9 @@ async fn import_console_session(
         ));
     }
     if input.expires_at <= now() {
-        return Err(ApiError::BadRequest("expires_at must be in the future".into()));
+        return Err(ApiError::BadRequest(
+            "expires_at must be in the future".into(),
+        ));
     }
     let exists: bool = s
         .store
