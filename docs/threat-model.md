@@ -24,6 +24,9 @@ BlakTail is a WireGuard mesh. Devices join an organisation tailnet, talk peer to
 | TLS private key | Coordinator host | Intercept of control-plane HTTP |
 
 The coordinator stores hashes of join keys and node tokens, not the secrets themselves. It never stores user file contents. WireGuard payload ciphertext is not a coordinator asset.
+Browser enrollment follows the same rule: SQLite stores hashes of the high-entropy
+device secret and the short display code. Approval creates a single-use grant bound
+to the waiting node name and WireGuard public key; the raw secret stays in the agent.
 
 ## Trust boundaries
 

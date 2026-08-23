@@ -35,7 +35,7 @@ enum Command {
     Up {
         #[arg(long)]
         coord: String,
-        /// Single-use join key. Omit to read it from stdin.
+        /// Single-use join key. Omit for browser enrollment or pipe a key on stdin.
         #[arg(long, hide_env_values = true, env = "BLAKTAIL_JOIN_KEY")]
         join_key: Option<String>,
         #[arg(long, default_value = DEFAULT_INTERFACE)]
@@ -96,7 +96,7 @@ fn detect_hostname() -> String {
 }
 
 /// Join keys arrive on stdin (never argv) when the caller is another program.
-fn resolve_join_key(provided: Option<String>) -> Result<String, blaktaild::Error> {
+fn resolve_optional_join_key(provided: Option<String>) -> Result<Option<String>, blaktaild::Error> {
     if let Some(key) = provided {
         let key = key.trim().to_owned();
         if key.is_empty() {
@@ -104,13 +104,11 @@ fn resolve_join_key(provided: Option<String>) -> Result<String, blaktaild::Error
                 "join key must not be empty".into(),
             ));
         }
-        return Ok(key);
+        return Ok(Some(key));
     }
     use std::io::IsTerminal;
     if std::io::stdin().is_terminal() {
-        return Err(blaktaild::Error::Message(
-            "a join key is required: pass --join-key or pipe it to stdin".into(),
-        ));
+        return Ok(None);
     }
     let mut key = String::new();
     std::io::stdin()
@@ -118,11 +116,50 @@ fn resolve_join_key(provided: Option<String>) -> Result<String, blaktaild::Error
         .map_err(|e| blaktaild::Error::Message(format!("could not read join key: {e}")))?;
     let key = key.trim().to_owned();
     if key.is_empty() {
-        return Err(blaktaild::Error::Message(
-            "join key must not be empty".into(),
-        ));
+        return Ok(None);
     }
-    Ok(key)
+    Ok(Some(key))
+}
+
+fn resolve_join_key(provided: Option<String>) -> Result<String, blaktaild::Error> {
+    resolve_optional_join_key(provided)?.ok_or_else(|| {
+        blaktaild::Error::Message("a fresh join key must be passed or piped to stdin".into())
+    })
+}
+
+async fn browser_join_key(
+    coordinator: &Coordinator,
+    name: &str,
+    public_key: &str,
+) -> Result<String, blaktaild::Error> {
+    let authorization = coordinator
+        .begin_device_authorization(name, public_key)
+        .await?;
+    println!(
+        "Authenticate this device in a browser:\n{}\n\nCode: {}",
+        authorization.verification_url, authorization.user_code
+    );
+    let mut device_code = authorization.device_code;
+    let interval = Duration::from_secs(authorization.interval_seconds.clamp(1, 10));
+    loop {
+        if blaktaild_now() as i64 >= authorization.expires_at {
+            device_code.zeroize();
+            return Err(blaktaild::Error::Message(
+                "browser enrollment expired; run blaktaild up again".into(),
+            ));
+        }
+        match coordinator
+            .device_authorization_approved(&device_code)
+            .await
+        {
+            Ok(true) => return Ok(device_code),
+            Ok(false) => tokio::time::sleep(interval).await,
+            Err(error) => {
+                device_code.zeroize();
+                return Err(error);
+            }
+        }
+    }
 }
 
 fn make_network() -> Box<dyn Network> {
@@ -652,7 +689,6 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             exit_after_join,
         } => {
             validate_interface(&interface)?;
-            let mut join_key = resolve_join_key(join_key)?;
             let (key_path, public_key) = ensure_private_key(&cli.state_dir)?;
             let coordinator = Coordinator::new(&coord)?;
             let name = name.unwrap_or_else(detect_hostname);
@@ -668,7 +704,11 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                 Err(blaktaild::Error::Io(error))
                     if error.kind() == std::io::ErrorKind::NotFound =>
                 {
-                    coordinator
+                    let mut join_key = match resolve_optional_join_key(join_key)? {
+                        Some(join_key) => join_key,
+                        None => browser_join_key(&coordinator, &name, &public_key).await?,
+                    };
+                    let registration = coordinator
                         .register(
                             &join_key,
                             &name,
@@ -676,11 +716,12 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                             endpoint.as_deref(),
                             &interface,
                         )
-                        .await?
+                        .await;
+                    join_key.zeroize();
+                    registration?
                 }
                 Err(error) => return Err(error),
             };
-            join_key.zeroize();
             let mut network = make_network();
             if let Err(error) = network.setup(&interface, &key_path, &state.assigned_ip) {
                 if !resumed {

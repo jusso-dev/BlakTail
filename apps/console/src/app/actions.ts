@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import {
+  approveDeviceAuthorization,
   getAcl,
   mintJoinKey,
   putAcl,
@@ -43,6 +44,32 @@ export async function mintJoinKeyAction(
     return {
       ok: false,
       error: error instanceof Error ? error.message : "Could not mint join key.",
+    };
+  }
+}
+
+export async function approveDeviceAuthorizationAction(
+  formData: FormData,
+): Promise<ActionResult<{ expiresAt: number }>> {
+  try {
+    const ctx = await requireConsoleContext();
+    const code = String(formData.get("code") ?? "").trim();
+    if (!code) {
+      return { ok: false, error: "Device code is required." };
+    }
+    const tags = canMutateTailnet(ctx.role)
+      ? formData.getAll("tags").map(String).filter(isDeviceTag)
+      : [];
+    const result = await approveDeviceAuthorization(ctx, code, tags);
+    revalidatePath("/enroll");
+    return { ok: true, data: { expiresAt: result.expires_at } };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not approve device enrollment.",
     };
   }
 }

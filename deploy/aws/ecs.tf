@@ -144,6 +144,7 @@ resource "aws_ecs_task_definition" "coord" {
       { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
       { name = "BLAKTAIL_DATABASE", value = "/data/blaktail-coord.sqlite3" },
       { name = "BLAKTAIL_RELAYS", value = "${aws_lb.relay.dns_name}:3478" },
+      { name = "BLAKTAIL_CONSOLE_URL", value = local.better_auth_url },
     ]
     secrets = [
       { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },

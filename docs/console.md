@@ -20,6 +20,12 @@ tailnet authorisation.
 3. The console signs a short-lived (at most 60 seconds) org/user/role assertion with `BLAKTAIL_AUTH_HMAC_SECRET`; the assertion never contains the Better Auth cookie or session token.
 4. Rust verifies the HMAC, expiry, organisation, and role on every protected route. Missing, expired, cross-org, or forged assertions receive 401.
 
+For headless Linux enrollment, `blaktaild up` prints `/enroll?code=...`. The
+page preserves that destination through sign-in, displays the requested node name
+and WireGuard-key fingerprint, and requires an explicit approval. Any signed-in
+organisation member can enroll their own untagged device; only owners and admins
+can attach privileged device tags. The browser code is not the join secret.
+
 ## Local development
 
 ```sh

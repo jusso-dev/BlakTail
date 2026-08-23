@@ -25,6 +25,10 @@ const SCHEMA: &str = include_str!("../schema.sql");
 const DEFAULT_NODE_KEY_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_NODE_KEY_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_NODE_KEY_TTL_SECS: i64 = 365 * 24 * 60 * 60;
+const DEVICE_AUTH_TTL_SECS: i64 = 10 * 60;
+const DEVICE_AUTH_POLL_SECS: u64 = 2;
+const MAX_PENDING_DEVICE_AUTHS: i64 = 1_000;
+const DEFAULT_CONSOLE_URL: &str = "https://console.invalid";
 #[derive(Clone)]
 pub struct Store(Arc<Mutex<Connection>>);
 impl Store {
@@ -146,14 +150,16 @@ struct AppState {
     relay_auth_secret: Arc<[u8]>,
     /// Advertised relay endpoints (host:port, UDP) handed to nodes.
     relays: Arc<Vec<String>>,
+    console_url: Arc<String>,
 }
 pub fn app(store: Store, region: String, auth_hmac_secret: impl Into<Vec<u8>>) -> Router {
-    app_with_relays(
+    app_with_relays_and_console(
         store,
         region,
         auth_hmac_secret,
         Vec::<u8>::new(),
         Vec::new(),
+        DEFAULT_CONSOLE_URL.into(),
     )
 }
 pub fn app_with_relays(
@@ -163,10 +169,39 @@ pub fn app_with_relays(
     relay_auth_secret: impl Into<Vec<u8>>,
     relays: Vec<String>,
 ) -> Router {
+    app_with_relays_and_console(
+        store,
+        region,
+        auth_hmac_secret,
+        relay_auth_secret,
+        relays,
+        DEFAULT_CONSOLE_URL.into(),
+    )
+}
+pub fn app_with_relays_and_console(
+    store: Store,
+    region: String,
+    auth_hmac_secret: impl Into<Vec<u8>>,
+    relay_auth_secret: impl Into<Vec<u8>>,
+    relays: Vec<String>,
+    console_url: String,
+) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route(
+            "/v1/device-authorizations",
+            post(create_device_authorization),
+        )
+        .route(
+            "/v1/device-authorizations/:device_code",
+            get(poll_device_authorization),
+        )
         .route("/v1/orgs", post(create_org))
         .route("/v1/orgs/:org_id/join-keys", post(mint_join_key))
+        .route(
+            "/v1/orgs/:org_id/device-authorizations/:user_code",
+            get(get_device_authorization).post(approve_device_authorization),
+        )
         .route("/v1/orgs/:org_id/nodes", get(list_nodes))
         .route("/v1/orgs/:org_id/nodes/:node_id", delete(admin_revoke_node))
         .route("/v1/orgs/:org_id/acl", get(get_acl))
@@ -187,6 +222,7 @@ pub fn app_with_relays(
             auth_hmac_secret: auth_hmac_secret.into().into(),
             relay_auth_secret: relay_auth_secret.into().into(),
             relays: Arc::new(relays),
+            console_url: Arc::new(console_url.trim_end_matches('/').to_owned()),
         })
 }
 #[derive(Debug, Error)]
@@ -201,6 +237,10 @@ enum ApiError {
     Forbidden,
     #[error("resource not found")]
     NotFound,
+    #[error("device authorization expired; run blaktaild up again")]
+    Gone,
+    #[error("too many pending device authorizations; try again later")]
+    TooManyRequests,
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("database error")]
@@ -214,6 +254,8 @@ impl IntoResponse for ApiError {
             Self::CredentialExpired => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Gone => StatusCode::GONE,
+            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -230,6 +272,295 @@ async fn health(State(s): State<AppState>) -> Json<Health> {
         status: "ok",
         region: s.region,
     })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateDeviceAuthorization {
+    name: String,
+    wg_public_key: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeviceAuthorizationResponse {
+    device_code: String,
+    user_code: String,
+    verification_url: String,
+    expires_at: i64,
+    interval_seconds: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeviceAuthorizationStatus {
+    status: String,
+    expires_at: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeviceAuthorizationPreview {
+    name: String,
+    public_key_fingerprint: String,
+    expires_at: i64,
+    approved: bool,
+}
+
+struct DeviceAuthorizationPreviewRow {
+    name: String,
+    public_key: String,
+    expires_at: i64,
+    approved_at: Option<i64>,
+    approved_org: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveDeviceAuthorization {
+    #[serde(default)]
+    tags: Vec<DeviceTag>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeviceAuthorizationApproval {
+    status: String,
+    expires_at: i64,
+}
+
+struct DeviceAuthorizationApprovalRow {
+    device_code_hash: String,
+    expires_at: i64,
+    approved_at: Option<i64>,
+    approved_org: Option<String>,
+    approved_user: Option<String>,
+}
+
+async fn create_device_authorization(
+    State(s): State<AppState>,
+    Json(input): Json<CreateDeviceAuthorization>,
+) -> Result<(StatusCode, Json<DeviceAuthorizationResponse>), ApiError> {
+    let name = input.name.trim();
+    let public_key = input.wg_public_key.trim();
+    if name.is_empty() || public_key.is_empty() || name.chars().count() > 128 {
+        return Err(ApiError::BadRequest(
+            "name and wg_public_key are required; name must be at most 128 characters".into(),
+        ));
+    }
+
+    let created_at = now();
+    let expires_at = created_at + DEVICE_AUTH_TTL_SECS;
+    let db = s.store.0.lock().unwrap();
+    db.execute(
+        "DELETE FROM device_authorizations WHERE expires_at<=?1",
+        params![created_at],
+    )?;
+    let pending: i64 = db.query_row(
+        "SELECT COUNT(*) FROM device_authorizations WHERE approved_at IS NULL AND expires_at>?1",
+        params![created_at],
+        |row| row.get(0),
+    )?;
+    if pending >= MAX_PENDING_DEVICE_AUTHS {
+        return Err(ApiError::TooManyRequests);
+    }
+
+    for _ in 0..5 {
+        let device_code = secret("btd");
+        let user_code = user_code();
+        let result = db.execute(
+            "INSERT INTO device_authorizations(id,device_code_hash,user_code_hash,requested_name,wg_public_key,expires_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                Uuid::new_v4().to_string(),
+                hash(&device_code),
+                hash(&normalise_user_code(&user_code).expect("generated user code is valid")),
+                name,
+                public_key,
+                expires_at,
+            ],
+        );
+        match result {
+            Ok(_) => {
+                return Ok((
+                    StatusCode::CREATED,
+                    Json(DeviceAuthorizationResponse {
+                        device_code,
+                        user_code: user_code.clone(),
+                        verification_url: format!("{}/enroll?code={user_code}", s.console_url),
+                        expires_at,
+                        interval_seconds: DEVICE_AUTH_POLL_SECS,
+                    }),
+                ));
+            }
+            Err(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == 2067 => {}
+            Err(error) => return Err(ApiError::Database(error)),
+        }
+    }
+    Err(ApiError::Conflict(
+        "could not allocate a unique device authorization code".into(),
+    ))
+}
+
+async fn poll_device_authorization(
+    State(s): State<AppState>,
+    UrlPath(device_code): UrlPath<String>,
+) -> Result<Response, ApiError> {
+    let db = s.store.0.lock().unwrap();
+    let row: Option<(i64, Option<i64>, Option<i64>)> = db
+        .query_row(
+            "SELECT expires_at,approved_at,consumed_at FROM device_authorizations WHERE device_code_hash=?1",
+            params![hash(device_code.trim())],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (expires_at, approved_at, consumed_at) = row.ok_or(ApiError::Unauthorized)?;
+    if expires_at <= now() || consumed_at.is_some() {
+        return Err(ApiError::Gone);
+    }
+    let (status, state) = if approved_at.is_some() {
+        (StatusCode::OK, "approved")
+    } else {
+        (StatusCode::ACCEPTED, "pending")
+    };
+    Ok((
+        status,
+        Json(DeviceAuthorizationStatus {
+            status: state.into(),
+            expires_at,
+        }),
+    )
+        .into_response())
+}
+
+async fn get_device_authorization(
+    State(s): State<AppState>,
+    UrlPath((org_id, user_code)): UrlPath<(Uuid, String)>,
+    headers: HeaderMap,
+) -> Result<Json<DeviceAuthorizationPreview>, ApiError> {
+    console_session(&s, &headers, org_id)?;
+    let code = normalise_user_code(&user_code)
+        .ok_or_else(|| ApiError::BadRequest("device code must contain eight characters".into()))?;
+    let db = s.store.0.lock().unwrap();
+    let row: Option<DeviceAuthorizationPreviewRow> = db
+        .query_row(
+            "SELECT requested_name,wg_public_key,expires_at,approved_at,org_id FROM device_authorizations WHERE user_code_hash=?1",
+            params![hash(&code)],
+            |row| {
+                Ok(DeviceAuthorizationPreviewRow {
+                    name: row.get(0)?,
+                    public_key: row.get(1)?,
+                    expires_at: row.get(2)?,
+                    approved_at: row.get(3)?,
+                    approved_org: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    let row = row.ok_or(ApiError::NotFound)?;
+    if row.expires_at <= now() {
+        return Err(ApiError::Gone);
+    }
+    if row
+        .approved_org
+        .as_deref()
+        .is_some_and(|id| id != org_id.to_string())
+    {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Json(DeviceAuthorizationPreview {
+        name: row.name,
+        public_key_fingerprint: hash(&row.public_key)[..12].into(),
+        expires_at: row.expires_at,
+        approved: row.approved_at.is_some(),
+    }))
+}
+
+async fn approve_device_authorization(
+    State(s): State<AppState>,
+    UrlPath((org_id, user_code)): UrlPath<(Uuid, String)>,
+    headers: HeaderMap,
+    Json(input): Json<ApproveDeviceAuthorization>,
+) -> Result<Json<DeviceAuthorizationApproval>, ApiError> {
+    let session = console_session(&s, &headers, org_id)?;
+    let code = normalise_user_code(&user_code)
+        .ok_or_else(|| ApiError::BadRequest("device code must contain eight characters".into()))?;
+    let tags = if session.role == Role::Member {
+        Vec::new()
+    } else {
+        canonical_tags(input.tags)
+    };
+    let mut db = s.store.0.lock().unwrap();
+    let tx = db.transaction()?;
+    let row: Option<DeviceAuthorizationApprovalRow> = tx
+        .query_row(
+            "SELECT device_code_hash,expires_at,approved_at,org_id,user_id FROM device_authorizations WHERE user_code_hash=?1",
+            params![hash(&code)],
+            |row| {
+                Ok(DeviceAuthorizationApprovalRow {
+                    device_code_hash: row.get(0)?,
+                    expires_at: row.get(1)?,
+                    approved_at: row.get(2)?,
+                    approved_org: row.get(3)?,
+                    approved_user: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    let row = row.ok_or(ApiError::NotFound)?;
+    if row.expires_at <= now() {
+        return Err(ApiError::Gone);
+    }
+    if row.approved_at.is_some() {
+        if row.approved_org.as_deref() == Some(&org_id.to_string())
+            && row.approved_user.as_deref() == Some(session.user_id.as_str())
+        {
+            return Ok(Json(DeviceAuthorizationApproval {
+                status: "approved".into(),
+                expires_at: row.expires_at,
+            }));
+        }
+        return Err(ApiError::Conflict(
+            "device authorization was already approved".into(),
+        ));
+    }
+    let join_key_id = Uuid::new_v4();
+    let tags_json = serde_json::to_string(&tags).unwrap();
+    let inserted = tx
+        .execute(
+        "INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT ?1,id,?2,?3,1,?4,?5,?6,?7 FROM orgs WHERE id=?8",
+        params![
+            join_key_id.to_string(),
+            row.device_code_hash,
+            row.expires_at,
+            now(),
+            session.user_id,
+            session.role.as_str(),
+            tags_json,
+            org_id.to_string(),
+        ],
+    )
+        .map_err(conflict("device authorization was already approved"))?;
+    if inserted != 1 {
+        return Err(ApiError::NotFound);
+    }
+    let changed = tx.execute(
+        "UPDATE device_authorizations SET approved_at=?1,org_id=?2,user_id=?3,user_role=?4,tags_json=?5 WHERE user_code_hash=?6 AND approved_at IS NULL",
+        params![
+            now(),
+            org_id.to_string(),
+            session.user_id,
+            session.role.as_str(),
+            serde_json::to_string(&tags).unwrap(),
+            hash(&code),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(ApiError::Conflict(
+            "device authorization was already approved".into(),
+        ));
+    }
+    tx.commit()?;
+    info!(%org_id, user_id = %session.user_id, "device authorization approved");
+    Ok(Json(DeviceAuthorizationApproval {
+        status: "approved".into(),
+        expires_at: row.expires_at,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -382,6 +713,8 @@ struct RegistrationGrant {
     user_role: String,
     tags_json: String,
     node_key_ttl: i64,
+    bound_name: Option<String>,
+    bound_wg_public_key: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -453,10 +786,25 @@ async fn register_node(
     }
     let mut db = s.store.0.lock().unwrap();
     let tx = db.transaction()?;
-    let grant: Option<RegistrationGrant> = tx.query_row("SELECT k.id,k.org_id,k.single_use,k.used_at IS NOT NULL,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds FROM join_keys k JOIN orgs o ON o.id=k.org_id WHERE k.key_hash=?1 AND k.revoked_at IS NULL AND k.expires_at>?2",params![hash(&input.join_key),now()],|r|Ok(RegistrationGrant { key_id: r.get(0)?, org_id: r.get(1)?, single_use: r.get(2)?, used: r.get(3)?, user_id: r.get(4)?, user_role: r.get(5)?, tags_json: r.get(6)?, node_key_ttl: r.get(7)? })).optional()?;
+    let input_key_hash = hash(&input.join_key);
+    let grant: Option<RegistrationGrant> = tx.query_row("SELECT k.id,k.org_id,k.single_use,k.used_at IS NOT NULL,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds,d.requested_name,d.wg_public_key FROM join_keys k JOIN orgs o ON o.id=k.org_id LEFT JOIN device_authorizations d ON d.device_code_hash=k.key_hash WHERE k.key_hash=?1 AND k.revoked_at IS NULL AND k.expires_at>?2",params![input_key_hash,now()],|r|Ok(RegistrationGrant { key_id: r.get(0)?, org_id: r.get(1)?, single_use: r.get(2)?, used: r.get(3)?, user_id: r.get(4)?, user_role: r.get(5)?, tags_json: r.get(6)?, node_key_ttl: r.get(7)?, bound_name: r.get(8)?, bound_wg_public_key: r.get(9)? })).optional()?;
     let grant = grant.ok_or(ApiError::Unauthorized)?;
     if grant.single_use && grant.used {
         return Err(ApiError::Unauthorized);
+    }
+    if grant
+        .bound_name
+        .as_deref()
+        .is_some_and(|name| name != input.name.trim())
+        || grant
+            .bound_wg_public_key
+            .as_deref()
+            .is_some_and(|key| key != input.wg_public_key.trim())
+    {
+        return Err(ApiError::BadRequest(
+            "browser authorization is bound to another device identity; run blaktaild up again"
+                .into(),
+        ));
     }
     let id = Uuid::new_v4();
     let token = secret("btn");
@@ -476,6 +824,10 @@ async fn register_node(
             params![now(), grant.key_id],
         )?;
     }
+    tx.execute(
+        "UPDATE device_authorizations SET consumed_at=?1 WHERE device_code_hash=?2",
+        params![now(), input_key_hash],
+    )?;
     tx.commit()?;
     info!(node_id=%id, org_id=%grant.org_id, "node registered");
     let (relay_token, relay_expires_at) = relay_credentials(&s, id);
@@ -526,7 +878,7 @@ async fn reauth_node(
         .ok_or(ApiError::Unauthorized)?;
     let join: Option<(String, bool, bool, String, String, String, i64)> = tx
         .query_row(
-            "SELECT k.id,k.single_use,k.used_at IS NOT NULL,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds FROM join_keys k JOIN orgs o ON o.id=k.org_id WHERE k.key_hash=?1 AND k.org_id=?2 AND k.revoked_at IS NULL AND k.expires_at>?3",
+            "SELECT k.id,k.single_use,k.used_at IS NOT NULL,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds FROM join_keys k JOIN orgs o ON o.id=k.org_id WHERE k.key_hash=?1 AND k.org_id=?2 AND k.revoked_at IS NULL AND k.expires_at>?3 AND NOT EXISTS(SELECT 1 FROM device_authorizations d WHERE d.device_code_hash=k.key_hash)",
             params![hash(&input.join_key), org_id, now()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
         )
@@ -1074,6 +1426,26 @@ fn secret(prefix: &str) -> String {
     format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(b))
 }
 
+fn user_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut random = [0u8; 8];
+    OsRng.fill_bytes(&mut random);
+    let characters: String = random
+        .iter()
+        .map(|byte| ALPHABET[*byte as usize % ALPHABET.len()] as char)
+        .collect();
+    format!("{}-{}", &characters[..4], &characters[4..])
+}
+
+fn normalise_user_code(value: &str) -> Option<String> {
+    let code: String = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .map(|character| character.to_ascii_uppercase())
+        .collect();
+    (code.len() == 8).then_some(code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,6 +1509,293 @@ mod tests {
     async fn body<T: serde::de::DeserializeOwned>(r: Response) -> T {
         serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap()
     }
+
+    #[tokio::test]
+    async fn browser_enrollment_is_expiring_single_use_and_bound_to_device() {
+        let store = Store::memory().unwrap();
+        let r = app_with_relays_and_console(
+            store.clone(),
+            "ap-southeast-2".into(),
+            TEST_SECRET,
+            TEST_RELAY_SECRET,
+            vec![],
+            "https://console.example.org.au/".into(),
+        );
+        let org: OrgResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name":"browser-org"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let existing_key: JoinKeyResponse = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", org.id),
+                serde_json::json!({"expires_in_seconds":60}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let existing: RegisterResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/nodes/register",
+                serde_json::json!({
+                    "join_key": existing_key.key,
+                    "name": "existing-node",
+                    "wg_public_key": "existing-public-key"
+                }),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let started_response = call(
+            &r,
+            Method::POST,
+            "/v1/device-authorizations",
+            serde_json::json!({"name":"ssh-node","wg_public_key":"browser-public-key"}),
+            None,
+        )
+        .await;
+        assert_eq!(started_response.status(), StatusCode::CREATED);
+        let started: DeviceAuthorizationResponse = body(started_response).await;
+        assert_eq!(
+            started.verification_url,
+            format!(
+                "https://console.example.org.au/enroll?code={}",
+                started.user_code
+            )
+        );
+        assert_eq!(started.interval_seconds, DEVICE_AUTH_POLL_SECS);
+        assert!(started.expires_at > now());
+
+        assert_eq!(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/device-authorizations/{}", started.device_code),
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        let preview: DeviceAuthorizationPreview = body(
+            call(
+                &r,
+                Method::GET,
+                &format!(
+                    "/v1/orgs/{}/device-authorizations/{}",
+                    org.id, started.user_code
+                ),
+                serde_json::Value::Null,
+                Some(&member),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(preview.name, "ssh-node");
+        assert_eq!(
+            preview.public_key_fingerprint,
+            &hash("browser-public-key")[..12]
+        );
+        assert!(!preview.approved);
+
+        let approval: DeviceAuthorizationApproval = body(
+            call(
+                &r,
+                Method::POST,
+                &format!(
+                    "/v1/orgs/{}/device-authorizations/{}",
+                    org.id, started.user_code
+                ),
+                serde_json::json!({"tags":["office"]}),
+                Some(&member),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(approval.status, "approved");
+        assert_eq!(approval.expires_at, started.expires_at);
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/nodes/{}/reauth", existing.id),
+                serde_json::json!({"join_key":started.device_code}),
+                Some(&existing.node_token),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/device-authorizations/{}", started.device_code),
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let wrong_identity = call(
+            &r,
+            Method::POST,
+            "/v1/nodes/register",
+            serde_json::json!({
+                "join_key": started.device_code,
+                "name": "different-node",
+                "wg_public_key": "browser-public-key"
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(wrong_identity.status(), StatusCode::BAD_REQUEST);
+        let registered_response = call(
+            &r,
+            Method::POST,
+            "/v1/nodes/register",
+            serde_json::json!({
+                "join_key": started.device_code,
+                "name": "ssh-node",
+                "wg_public_key": "browser-public-key"
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(registered_response.status(), StatusCode::CREATED);
+        let registered: RegisterResponse = body(registered_response).await;
+        assert_eq!(registered.assigned_ip, "100.64.0.2/32");
+        assert_eq!(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/device-authorizations/{}", started.device_code),
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                "/v1/nodes/register",
+                serde_json::json!({
+                    "join_key": started.device_code,
+                    "name": "ssh-node",
+                    "wg_public_key": "browser-public-key"
+                }),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let db = store.0.lock().unwrap();
+        let (role, tags): (String, String) = db
+            .query_row(
+                "SELECT user_role,tags_json FROM nodes WHERE id=?1",
+                params![registered.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(role, "member");
+        assert_eq!(tags, "[]");
+        let raw_secrets: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM device_authorizations d JOIN join_keys k ON k.key_hash=d.device_code_hash WHERE d.device_code_hash=?1 OR k.key_hash=?1",
+                params![started.device_code],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_secrets, 0);
+    }
+
+    #[tokio::test]
+    async fn expired_browser_enrollment_cannot_be_polled_or_approved() {
+        let store = Store::memory().unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org: OrgResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name":"expired-browser-org"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let started: DeviceAuthorizationResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/device-authorizations",
+                serde_json::json!({"name":"late-node","wg_public_key":"late-key"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE device_authorizations SET expires_at=?1 WHERE device_code_hash=?2",
+                params![now() - 1, hash(&started.device_code)],
+            )
+            .unwrap();
+        assert_eq!(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/device-authorizations/{}", started.device_code),
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::GONE
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &format!(
+                    "/v1/orgs/{}/device-authorizations/{}",
+                    org.id, started.user_code
+                ),
+                serde_json::json!({}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::GONE
+        );
+    }
+
     #[tokio::test]
     async fn two_nodes_and_revocation() {
         let store = Store::memory().unwrap();

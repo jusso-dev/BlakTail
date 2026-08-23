@@ -5,11 +5,14 @@
 ## Run on an Australian host
 
 TLS and an explicit region are mandatory. The process refuses to start when `BLAKTAIL_REGION` is missing or empty.
+`BLAKTAIL_CONSOLE_URL` is also required so the coordinator can return a complete
+browser-enrollment link. Use HTTPS for every non-local deployment.
 
 ```sh
 BLAKTAIL_REGION=ap-southeast-2 \
 BLAKTAIL_BIND=0.0.0.0:443 \
 BLAKTAIL_DATABASE=/var/lib/blaktail/coord.sqlite3 \
+BLAKTAIL_CONSOLE_URL=https://console.example.org.au \
 BLAKTAIL_AUTH_HMAC_SECRET=<shared-random-secret-at-least-32-bytes> \
 BLAKTAIL_TLS_CERT=/etc/blaktail/tls/fullchain.pem \
 BLAKTAIL_TLS_KEY=/etc/blaktail/tls/private.key \
@@ -22,6 +25,9 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 
 - `POST /v1/orgs` — `{ "name": "org", "acl": { "rules": [] } }`
 - `POST /v1/orgs/{org_id}/join-keys` — owner/admin bearer session; `{ "expires_in_seconds": 3600, "single_use": true, "tags": ["office"] }`
+- `POST /v1/device-authorizations` — begin a ten-minute browser enrollment for a bound node name and WireGuard key
+- `GET /v1/device-authorizations/{device_code}` — agent poll; reveals only pending/approved state
+- `GET|POST /v1/orgs/{org_id}/device-authorizations/{user_code}` — signed-in console preview and approval
 - `GET /v1/orgs/{org_id}/nodes` — any org user session; list devices
 - `GET /v1/orgs/{org_id}/security` — any org user session; read node-key lifetime policy
 - `PUT /v1/orgs/{org_id}/security` — owner/admin session; set node-key lifetime from 1 to 365 days
@@ -36,6 +42,11 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 - `GET /health`
 
 Join and node credentials are returned once; only SHA-256 hashes are stored. Join keys expire after at most 30 days and default to single-use. Node credentials default to 90 days, with a per-organisation policy between 1 and 365 days. An expired node receives an actionable `401`, disappears from other nodes' peer responses, and can run `blaktaild reauth` with its old node secret plus a fresh join key. Re-authentication rotates the node token and expiry while preserving the node id, WireGuard key, DNS name, and tailnet IP. Peer polling has no cache, so revocation or expiry is visible on the next request (within 60 seconds).
+
+Headless browser enrollment stores hashes of both device and user codes. The console
+approves the high-entropy device code as a short-lived, single-use join grant bound
+to the requesting node name and WireGuard public key. The raw device secret remains
+only in `blaktaild`; a copied browser link cannot register a different device.
 
 The console verifies Better Auth sessions in onshore Postgres, maps the user to an organisation and role, then issues a short-lived HMAC assertion using the shared `BLAKTAIL_AUTH_HMAC_SECRET`. Rust validates that assertion on every console request and stores no auth sessions. Use independent, randomly generated values of at least 32 bytes for this secret and `BETTER_AUTH_SECRET`. Roles are
 `owner`, `admin`, and `member`. Members can read ACLs and device lists but
@@ -63,6 +74,11 @@ CREATE TABLE orgs (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
 CREATE TABLE join_keys (id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
   key_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL,
   single_use INTEGER NOT NULL, used_at TEXT, revoked_at TEXT, created_at TEXT NOT NULL);
+CREATE TABLE device_authorizations (id TEXT PRIMARY KEY,
+  device_code_hash TEXT NOT NULL UNIQUE, user_code_hash TEXT NOT NULL UNIQUE,
+  requested_name TEXT NOT NULL, wg_public_key TEXT NOT NULL,
+  expires_at INTEGER NOT NULL, approved_at INTEGER, consumed_at INTEGER,
+  org_id TEXT, user_id TEXT, user_role TEXT, tags_json TEXT NOT NULL);
 CREATE TABLE nodes (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, name TEXT NOT NULL,
   wg_public_key TEXT NOT NULL, endpoint TEXT, allowed_ips_json TEXT NOT NULL,
   token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT,

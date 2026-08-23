@@ -13,6 +13,20 @@ CREATE TABLE IF NOT EXISTS join_keys (
  user_id TEXT NOT NULL DEFAULT '', user_role TEXT NOT NULL DEFAULT 'owner',
  tags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags_json))
 );
+CREATE TABLE IF NOT EXISTS device_authorizations (
+ id TEXT PRIMARY KEY,
+ device_code_hash TEXT NOT NULL UNIQUE,
+ user_code_hash TEXT NOT NULL UNIQUE,
+ requested_name TEXT NOT NULL,
+ wg_public_key TEXT NOT NULL,
+ expires_at INTEGER NOT NULL,
+ approved_at INTEGER,
+ consumed_at INTEGER,
+ org_id TEXT REFERENCES orgs(id) ON DELETE CASCADE,
+ user_id TEXT,
+ user_role TEXT,
+ tags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags_json))
+);
 CREATE TABLE IF NOT EXISTS nodes (
  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
  name TEXT NOT NULL, wg_public_key TEXT NOT NULL,
@@ -28,3 +42,5 @@ CREATE TABLE IF NOT EXISTS nodes (
  UNIQUE(org_id,name), UNIQUE(org_id,wg_public_key)
 );
 CREATE INDEX IF NOT EXISTS nodes_active_org_idx ON nodes(org_id, revoked_at);
+CREATE INDEX IF NOT EXISTS device_authorizations_expiry_idx
+ ON device_authorizations(expires_at);

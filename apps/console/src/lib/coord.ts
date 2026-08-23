@@ -28,6 +28,13 @@ export type JoinKeyResult = {
   single_use: boolean;
 };
 
+export type DeviceAuthorizationPreview = {
+  name: string;
+  public_key_fingerprint: string;
+  expires_at: number;
+  approved: boolean;
+};
+
 export type CoordHealth = {
   status: string;
   region: string;
@@ -129,6 +136,42 @@ export async function mintJoinKey(
     throw new Error(await readError(res));
   }
   return res.json() as Promise<JoinKeyResult>;
+}
+
+export async function getDeviceAuthorization(
+  ctx: ConsoleContext,
+  code: string,
+): Promise<DeviceAuthorizationPreview> {
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/device-authorizations/${encodeURIComponent(code)}`,
+    {
+      method: "GET",
+      sessionToken: ctx.coordAssertion,
+    },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<DeviceAuthorizationPreview>;
+}
+
+export async function approveDeviceAuthorization(
+  ctx: ConsoleContext,
+  code: string,
+  tags: DeviceTag[],
+): Promise<{ status: string; expires_at: number }> {
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/device-authorizations/${encodeURIComponent(code)}`,
+    {
+      method: "POST",
+      sessionToken: ctx.coordAssertion,
+      body: JSON.stringify({ tags }),
+    },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<{ status: string; expires_at: number }>;
 }
 
 export async function getAcl(ctx: ConsoleContext): Promise<unknown> {

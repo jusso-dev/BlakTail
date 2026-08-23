@@ -29,6 +29,9 @@ struct Config {
     /// Comma-separated relay endpoints (host:port UDP) advertised to nodes.
     #[arg(long, env = "BLAKTAIL_RELAYS", default_value = "")]
     relays: String,
+    /// Public console URL printed for browser-based headless enrollment.
+    #[arg(long, env = "BLAKTAIL_CONSOLE_URL")]
+    console_url: String,
 }
 
 #[tokio::main]
@@ -43,6 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if config.auth_hmac_secret.len() < 32 {
         return Err("BLAKTAIL_AUTH_HMAC_SECRET must be at least 32 bytes".into());
+    }
+    let console_url = config.console_url.trim_end_matches('/').to_owned();
+    if !(console_url.starts_with("https://") || console_url.starts_with("http://")) {
+        return Err("BLAKTAIL_CONSOLE_URL must be an HTTP(S) URL".into());
     }
     let store = Store::open(&config.database)?;
     let tls = RustlsConfig::from_pem_file(&config.tls_cert, &config.tls_key).await?;
@@ -63,12 +70,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(region, bind = %config.bind, relays = relays.len(), "starting BlakTail coordination server");
     axum_server::bind_rustls(config.bind, tls)
         .serve(
-            blaktail_coord::app_with_relays(
+            blaktail_coord::app_with_relays_and_console(
                 store,
                 region.to_owned(),
                 config.auth_hmac_secret.into_bytes(),
                 relay_auth_secret.into_bytes(),
                 relays,
+                console_url,
             )
             .into_make_service(),
         )

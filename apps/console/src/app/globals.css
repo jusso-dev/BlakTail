@@ -224,6 +224,26 @@ h2 {
   word-break: break-all;
 }
 
+.details {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.details div {
+  display: grid;
+  grid-template-columns: minmax(9rem, 0.35fr) 1fr;
+  gap: 0.75rem;
+}
+
+.details dt {
+  color: var(--muted);
+}
+
+.details dd {
+  margin: 0;
+}
+
 .sign-in {
   min-height: 100vh;
   display: grid;

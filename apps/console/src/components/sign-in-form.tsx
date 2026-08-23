@@ -5,7 +5,7 @@ import { useState, useTransition } from "react";
 import { authClient } from "@/lib/auth-client";
 import { TAGLINE } from "@/lib/tagline";
 
-export function SignInForm() {
+export function SignInForm({ nextPath = "/devices" }: { nextPath?: string }) {
   const router = useRouter();
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
@@ -38,7 +38,7 @@ export function SignInForm() {
                   );
                   return;
                 }
-                router.replace("/devices");
+                router.replace(nextPath);
                 router.refresh();
               });
             }}

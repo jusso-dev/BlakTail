@@ -109,6 +109,23 @@ struct RegisterRequest<'a> {
     endpoint: Option<&'a str>,
     allowed_ips: Vec<String>,
 }
+#[derive(Serialize)]
+struct DeviceAuthorizationRequest<'a> {
+    name: &'a str,
+    wg_public_key: &'a str,
+}
+#[derive(Debug, Deserialize)]
+pub struct DeviceAuthorization {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_url: String,
+    pub expires_at: i64,
+    pub interval_seconds: u64,
+}
+#[derive(Deserialize)]
+struct DeviceAuthorizationStatus {
+    status: String,
+}
 #[derive(Deserialize)]
 struct RegisterResponse {
     id: Uuid,
@@ -176,6 +193,65 @@ impl Coordinator {
             base,
             client: reqwest::Client::new(),
         })
+    }
+    pub async fn begin_device_authorization(
+        &self,
+        name: &str,
+        public_key: &str,
+    ) -> Result<DeviceAuthorization, Error> {
+        let response = self
+            .client
+            .post(format!("{}/v1/device-authorizations", self.base))
+            .json(&DeviceAuthorizationRequest {
+                name,
+                wg_public_key: public_key,
+            })
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response
+                .json::<ApiErrorResponse>()
+                .await
+                .map(|body| body.error)
+                .unwrap_or_else(|_| format!("coordinator returned {status}"));
+            return Err(Error::Message(format!(
+                "could not start browser enrollment: {message}"
+            )));
+        }
+        Ok(response.json().await?)
+    }
+    pub async fn device_authorization_approved(&self, device_code: &str) -> Result<bool, Error> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/v1/device-authorizations/{device_code}",
+                self.base
+            ))
+            .send()
+            .await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::GONE || status == reqwest::StatusCode::UNAUTHORIZED {
+            let message = response
+                .json::<ApiErrorResponse>()
+                .await
+                .map(|body| body.error)
+                .unwrap_or_else(|_| "device authorization expired or was rejected".into());
+            return Err(Error::Message(message));
+        }
+        if status != reqwest::StatusCode::OK && status != reqwest::StatusCode::ACCEPTED {
+            return Err(Error::Message(format!(
+                "device authorization polling failed ({status})"
+            )));
+        }
+        let body: DeviceAuthorizationStatus = response.json().await?;
+        match (status, body.status.as_str()) {
+            (reqwest::StatusCode::OK, "approved") => Ok(true),
+            (reqwest::StatusCode::ACCEPTED, "pending") => Ok(false),
+            _ => Err(Error::Message(
+                "coordinator returned an invalid device authorization state".into(),
+            )),
+        }
     }
     pub async fn register(
         &self,
