@@ -168,10 +168,11 @@ resource "aws_ecs_task_definition" "coord" {
       }
     },
     {
-      name      = "coord"
-      image     = var.coord_image
-      essential = true
-      dependsOn = [{ containerName = "certgen", condition = "SUCCESS" }]
+      name       = "coord"
+      image      = var.coord_image
+      essential  = true
+      entryPoint = ["/usr/local/bin/blaktail-coord"]
+      dependsOn  = [{ containerName = "certgen", condition = "SUCCESS" }]
       environment = [
         { name = "BLAKTAIL_REGION", value = var.region },
         { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
