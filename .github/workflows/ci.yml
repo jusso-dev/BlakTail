@@ -36,7 +36,7 @@ jobs:
       BETTER_AUTH_SECRET: ci-better-auth-secret-at-least-32-chars
       BETTER_AUTH_URL: http://localhost:3000
       COORD_BASE_URL: https://coord.example.internal
-      BLAKTAIL_CONSOLE_SYNC_SECRET: ci-console-sync-secret
+      BLAKTAIL_AUTH_HMAC_SECRET: ci-auth-hmac-secret-at-least-32-chars
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - name: Checkout

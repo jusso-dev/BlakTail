@@ -23,8 +23,3 @@ CREATE TABLE IF NOT EXISTS nodes (
  UNIQUE(org_id,name), UNIQUE(org_id,wg_public_key)
 );
 CREATE INDEX IF NOT EXISTS nodes_active_org_idx ON nodes(org_id, revoked_at);
-CREATE TABLE IF NOT EXISTS console_sessions (
- token_hash TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
- user_id TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('owner','admin','member')),
- expires_at INTEGER NOT NULL
-);

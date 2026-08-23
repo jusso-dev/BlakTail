@@ -21,6 +21,8 @@ struct Config {
     tls_cert: PathBuf,
     #[arg(long, env = "BLAKTAIL_TLS_KEY")]
     tls_key: PathBuf,
+    #[arg(long, env = "BLAKTAIL_AUTH_HMAC_SECRET")]
+    auth_hmac_secret: String,
 }
 
 #[tokio::main]
@@ -33,11 +35,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if region.is_empty() {
         return Err("region must not be empty; choose the Australian hosting region".into());
     }
+    if config.auth_hmac_secret.len() < 32 {
+        return Err("BLAKTAIL_AUTH_HMAC_SECRET must be at least 32 bytes".into());
+    }
     let store = Store::open(&config.database)?;
     let tls = RustlsConfig::from_pem_file(&config.tls_cert, &config.tls_key).await?;
     info!(region, bind = %config.bind, "starting BlakTail coordination server");
     axum_server::bind_rustls(config.bind, tls)
-        .serve(app(store, region.to_owned()).into_make_service())
+        .serve(
+            app(
+                store,
+                region.to_owned(),
+                config.auth_hmac_secret.into_bytes(),
+            )
+            .into_make_service(),
+        )
         .await?;
     Ok(())
 }
