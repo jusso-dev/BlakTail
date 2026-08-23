@@ -15,6 +15,13 @@
       "when": 1787443200000,
       "tag": "0001_auth_membership_constraints",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1787492000000,
+      "tag": "0002_account_issuer",
+      "breakpoints": true
     }
   ]
 }
