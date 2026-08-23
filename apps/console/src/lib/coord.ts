@@ -10,6 +10,8 @@ export type CoordNode = {
   wg_public_key: string;
   endpoint: string | null;
   allowed_ips: string[];
+  advertised_routes: string[];
+  approved_routes: string[];
   dns_name: string;
   user_id: string;
   user_role: string;
@@ -107,6 +109,27 @@ export async function revokeNode(
     method: "DELETE",
     sessionToken: ctx.coordAssertion,
   });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+}
+
+export async function approveNodeRoutes(
+  ctx: ConsoleContext,
+  nodeId: string,
+  approvedRoutes: string[],
+): Promise<void> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot approve subnet or exit-node routes.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/nodes/${nodeId}/routes`,
+    {
+      method: "PUT",
+      sessionToken: ctx.coordAssertion,
+      body: JSON.stringify({ approved_routes: approvedRoutes }),
+    },
+  );
   if (!res.ok) {
     throw new Error(await readError(res));
   }

@@ -1,6 +1,6 @@
 # Linux node agent
 
-`blaktaild` requires Linux, `iproute2`, `wireguard-tools`, and `CAP_NET_ADMIN` (normally run as root). It first creates a kernel WireGuard interface. If the kernel does not support WireGuard, it tries the Rust `boringtun` binary as a userspace fallback.
+`blaktaild` requires Linux, `iproute2`, `wireguard-tools`, `iptables`, `sysctl`, and `CAP_NET_ADMIN` (normally run as root). It first creates a kernel WireGuard interface. If the kernel does not support WireGuard, it tries the Rust `boringtun` binary as a userspace fallback.
 
 ```sh
 sudo install -d -m 0700 /var/lib/blaktail
@@ -25,6 +25,43 @@ nonce-confirmed UDP hole punch. Successful peer-to-peer traffic bypasses the rel
 stale direct handshakes fall back automatically. The relay socket's reflexive address
 is refreshed through the coordinator, so port forwarding is not required for the
 relay path.
+
+## Subnet routers and exit nodes
+
+Advertise one or more RFC1918 private IPv4 networks from the Linux router:
+
+```sh
+sudo blaktaild up --coord https://coord.example.org \
+  --advertise-routes 10.1.0.0/24,10.2.0.0/16
+```
+
+Or advertise a full IPv4 exit path with `--advertise-exit-node`. The request is
+inert until an owner or admin opens **Devices** in the console and explicitly
+checks each route. Removing an advertisement also removes any approval for it.
+Public, loopback, link-local, multicast, tailnet-overlapping, and ambiguous subnet
+advertisements are rejected. Overlapping approved subnets on different active
+routers are rejected.
+
+A Linux client opts into one approved exit node by name, MagicDNS name, or UUID:
+
+```sh
+sudo blaktaild up --coord https://coord.example.org --exit-node router-one
+```
+
+Rerunning `up` resumes the existing enrollment; no join key is needed. Use
+`--exit-node none` to stop using an exit node and `--advertise-routes none` to
+withdraw all advertisements. When changing routes, pass the complete desired
+list; the new list replaces the previous one.
+
+On a router, BlakTail enables `net.ipv4.ip_forward`, installs destination-limited
+`FORWARD` rules, and masquerades tailnet sources leaving non-BlakTail interfaces.
+`down` removes those exact rules and restores forwarding when BlakTail originally
+enabled it. On an exit client, policy routing preserves local/subnet routes and
+WireGuard's marked transport packets while sending the remaining IPv4 default
+through the selected peer. Existing conflicting kernel routes fail closed instead
+of being overwritten. macOS peers can consume approved private subnet routes, but
+route advertising and exit-node selection are Linux-only in this release; IPv6 is
+tracked separately.
 
 ## MagicDNS
 

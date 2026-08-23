@@ -244,6 +244,21 @@ h2 {
   margin: 0;
 }
 
+.route-approval {
+  display: grid;
+  gap: 0.45rem;
+  min-width: 10rem;
+}
+
+.route-option {
+  grid-template-columns: auto 1fr;
+  align-items: center;
+}
+
+.route-option input {
+  width: auto;
+}
+
 .sign-in {
   min-height: 100vh;
   display: grid;

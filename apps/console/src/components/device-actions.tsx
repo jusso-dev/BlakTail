@@ -1,7 +1,11 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { revokeDeviceAction } from "@/app/actions";
+import { useRouter } from "next/navigation";
+import {
+  approveNodeRoutesAction,
+  revokeDeviceAction,
+} from "@/app/actions";
 import type { CoordNode } from "@/lib/coord";
 
 export function DeviceActions({
@@ -11,7 +15,11 @@ export function DeviceActions({
   nodes: CoordNode[];
   canMutate: boolean;
 }) {
-  const [message, setMessage] = useState<string | null>(null);
+  const router = useRouter();
+  const [message, setMessage] = useState<{
+    text: string;
+    error: boolean;
+  } | null>(null);
   const [pending, startTransition] = useTransition();
 
   if (nodes.length === 0) {
@@ -30,6 +38,7 @@ export function DeviceActions({
             <th>Name</th>
             <th>DNS</th>
             <th>Addresses</th>
+            <th>Advertised routes</th>
             <th>Tags</th>
             <th>Credential expiry</th>
             <th>State</th>
@@ -42,6 +51,61 @@ export function DeviceActions({
               <td>{node.name}</td>
               <td className="mono">{node.dns_name || "—"}</td>
               <td className="mono">{node.allowed_ips.join(", ") || "—"}</td>
+              <td>
+                {node.advertised_routes.length === 0 ? (
+                  "—"
+                ) : (
+                  <form
+                    className="route-approval"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      const formData = new FormData(event.currentTarget);
+                      setMessage(null);
+                      startTransition(async () => {
+                        const result = await approveNodeRoutesAction(formData);
+                        setMessage({
+                          text: result.ok
+                            ? `${node.name} route approvals saved.`
+                            : result.error,
+                          error: !result.ok,
+                        });
+                        if (result.ok) router.refresh();
+                      });
+                    }}
+                  >
+                    <input type="hidden" name="nodeId" value={node.id} />
+                    {node.advertised_routes.map((route) => (
+                      <label key={route} className="route-option mono">
+                        <input
+                          type="checkbox"
+                          name="approvedRoutes"
+                          value={route}
+                          defaultChecked={node.approved_routes.includes(route)}
+                          disabled={
+                            !canMutate ||
+                            pending ||
+                            node.revoked ||
+                            (node.expired &&
+                              !node.approved_routes.includes(route))
+                          }
+                        />
+                        {route === "0.0.0.0/0" ? "Exit node" : route}
+                      </label>
+                    ))}
+                    {canMutate &&
+                    !node.revoked &&
+                    (!node.expired || node.approved_routes.length > 0) ? (
+                      <button
+                        type="submit"
+                        className="secondary"
+                        disabled={pending}
+                      >
+                        Save routes
+                      </button>
+                    ) : null}
+                  </form>
+                )}
+              </td>
               <td>
                 {node.tags.length > 0
                   ? node.tags.map((tag) => (
@@ -85,9 +149,11 @@ export function DeviceActions({
                       setMessage(null);
                       startTransition(async () => {
                         const result = await revokeDeviceAction(formData);
-                        setMessage(
-                          result.ok ? `${node.name} revoked.` : result.error,
-                        );
+                        setMessage({
+                          text: result.ok ? `${node.name} revoked.` : result.error,
+                          error: !result.ok,
+                        });
+                        if (result.ok) router.refresh();
                       });
                     }}
                   >
@@ -100,9 +166,7 @@ export function DeviceActions({
         </tbody>
       </table>
       {message ? (
-        <p className={message.endsWith("revoked.") ? "muted" : "error"}>
-          {message}
-        </p>
+        <p className={message.error ? "error" : "muted"}>{message.text}</p>
       ) : null}
     </div>
   );

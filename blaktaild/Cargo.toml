@@ -25,5 +25,8 @@ zeroize = "1"
 boringtun = { version = "0.7.1", features = ["device"] }
 tempfile = "3"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 blaktail-relay = { path = "../blaktail-relay" }

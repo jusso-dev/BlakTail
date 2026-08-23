@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS nodes (
  user_id TEXT NOT NULL DEFAULT '', user_role TEXT NOT NULL DEFAULT 'owner',
  tags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags_json)),
  dns_name TEXT NOT NULL DEFAULT '',
+ advertised_routes_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(advertised_routes_json)),
+ approved_routes_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(approved_routes_json)),
  credential_expires_at INTEGER NOT NULL DEFAULT 0,
  relay_endpoint TEXT,
  relay_endpoint_updated_at INTEGER,

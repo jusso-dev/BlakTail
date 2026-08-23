@@ -26,6 +26,10 @@ and WireGuard-key fingerprint, and requires an explicit approval. Any signed-in
 organisation member can enroll their own untagged device; only owners and admins
 can attach privileged device tags. The browser code is not the join secret.
 
+The Devices page also shows each node's requested subnet and exit routes. Owners
+and admins approve routes individually; members can see them but cannot change
+approval. An unchecked request is never included in peer WireGuard configuration.
+
 ## Local development
 
 ```sh

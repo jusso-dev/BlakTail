@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 import {
   approveDeviceAuthorization,
+  approveNodeRoutes,
   getAcl,
   mintJoinKey,
   putAcl,
@@ -93,6 +94,37 @@ export async function revokeDeviceAction(
     return {
       ok: false,
       error: error instanceof Error ? error.message : "Could not revoke device.",
+    };
+  }
+}
+
+export async function approveNodeRoutesAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (!canMutateTailnet(ctx.role)) {
+      return {
+        ok: false,
+        error: "Only owners and admins can approve subnet or exit-node routes.",
+      };
+    }
+    const nodeId = String(formData.get("nodeId") ?? "");
+    if (!nodeId) {
+      return { ok: false, error: "Choose a device." };
+    }
+    const approvedRoutes = formData
+      .getAll("approvedRoutes")
+      .map(String)
+      .filter(Boolean);
+    await approveNodeRoutes(ctx, nodeId, approvedRoutes);
+    revalidatePath("/devices");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error ? error.message : "Could not approve routes.",
     };
   }
 }

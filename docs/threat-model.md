@@ -87,6 +87,11 @@ These are not optional hardening. They are the v1 bar.
 3. **Revoke path.** Owners and admins can revoke from the console, the node can self-revoke with `blaktaild down`, and the coordinator API plus SQLite remain available when the UI is not. Copy-paste steps are below. Members cannot mint keys, edit ACLs, or revoke devices.
 4. **No payload logs on the relay.** The relay forwards bytes. It must not log WireGuard payloads, plaintext, or packet bodies. Startup may log region and bind address only. Coordinator logs may include node ids and org ids; they must not include join keys, node tokens, or private keys.
 5. **MagicDNS is authoritative-only.** Each agent answers its current private peer map locally. Unknown `*.blaktail` names return `NXDOMAIN`; public names are refused rather than forwarded, so a tailnet label is never leaked by the BlakTail stub to an upstream resolver.
+6. **Routes require two decisions.** A Linux node may request a subnet or exit
+   route, but the coordinator distributes it only after owner/admin approval.
+   Default routes remain opt-in per client. The agent limits forwarding to the
+   advertised destinations, and the coordinator accepts only RFC1918 private
+   subnets while rejecting tailnet overlap and ambiguous approved routes.
 
 ## Honest limits
 

@@ -29,11 +29,13 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 - `GET /v1/device-authorizations/{device_code}` — agent poll; reveals only pending/approved state
 - `GET|POST /v1/orgs/{org_id}/device-authorizations/{user_code}` — signed-in console preview and approval
 - `GET /v1/orgs/{org_id}/nodes` — any org user session; list devices
+- `PUT /v1/orgs/{org_id}/nodes/{node_id}/routes` — owner/admin approval of an exact subset of advertised routes
 - `GET /v1/orgs/{org_id}/security` — any org user session; read node-key lifetime policy
 - `PUT /v1/orgs/{org_id}/security` — owner/admin session; set node-key lifetime from 1 to 365 days
 - `DELETE /v1/orgs/{org_id}/nodes/{node_id}` — owner/admin session; revoke a device
 - `POST /v1/nodes/register` — join key, name, WG public key, and optional public endpoint; the server allocates a tailnet IP
 - `GET /v1/nodes/{node_id}/peers` — bearer node token; active peers only
+- `PUT /v1/nodes/{node_id}/routes` — bearer node token; replace route advertisements and drop stale approvals
 - `POST /v1/nodes/{node_id}/reauth` — node token plus a fresh join key; rotate credentials without changing the tailnet IP
 - `PUT /v1/nodes/{node_id}/relay-endpoint` — bearer node token; refresh this node's reflexive UDP candidate
 - `DELETE /v1/nodes/{node_id}` — bearer node token; self-revocation
@@ -59,6 +61,14 @@ ACL JSON uses `rules` with `action` (`allow` or `deny`) and optional `src_roles`
 deny wins over allow. Without a matching rule, tagged nodes can see only peers sharing
 a tag (default deny across tags); legacy untagged nodes can see other untagged nodes.
 Peer results include a stable MagicDNS name in the form `<node>.<org-prefix>.blaktail`.
+They include approved subnet CIDRs in that router peer's `allowed_ips`. An approved
+`0.0.0.0/0` is returned only when the requesting node supplies a matching
+`exit_node` query value; merely approving an exit node never changes every client's
+default route. Non-default advertisements must be canonical, network-aligned RFC1918
+private IPv4 subnets. A node may advertise at most 32 routes; routes cannot overlap
+the tailnet pool or another active node's approved subnet. Approving a replacement
+router removes overlapping approval from expired routers, preventing stale approval
+from reviving after credential renewal.
 They also include a node-reported relay-socket candidate only while its coordinator
 timestamp is less than 180 seconds old. Agents use that candidate for a bounded,
 nonce-confirmed UDP hole punch while keeping relayed WireGuard traffic available.
@@ -82,6 +92,7 @@ CREATE TABLE device_authorizations (id TEXT PRIMARY KEY,
 CREATE TABLE nodes (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, name TEXT NOT NULL,
   wg_public_key TEXT NOT NULL, endpoint TEXT, allowed_ips_json TEXT NOT NULL,
   token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT,
+  advertised_routes_json TEXT NOT NULL, approved_routes_json TEXT NOT NULL,
   credential_expires_at INTEGER NOT NULL, relay_endpoint TEXT,
   relay_endpoint_updated_at INTEGER);
 ```

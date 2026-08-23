@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path as UrlPath, State},
+    extract::{Path as UrlPath, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -13,7 +13,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -50,6 +50,18 @@ impl Store {
         ensure_column(&db, "nodes", "user_role", "TEXT NOT NULL DEFAULT 'owner'")?;
         ensure_column(&db, "nodes", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
         ensure_column(&db, "nodes", "dns_name", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(
+            &db,
+            "nodes",
+            "advertised_routes_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
+        ensure_column(
+            &db,
+            "nodes",
+            "approved_routes_json",
+            "TEXT NOT NULL DEFAULT '[]'",
+        )?;
         ensure_column(&db, "nodes", "relay_endpoint", "TEXT")?;
         ensure_column(&db, "nodes", "relay_endpoint_updated_at", "INTEGER")?;
         ensure_column(
@@ -204,6 +216,10 @@ pub fn app_with_relays_and_console(
         )
         .route("/v1/orgs/:org_id/nodes", get(list_nodes))
         .route("/v1/orgs/:org_id/nodes/:node_id", delete(admin_revoke_node))
+        .route(
+            "/v1/orgs/:org_id/nodes/:node_id/routes",
+            put(approve_node_routes),
+        )
         .route("/v1/orgs/:org_id/acl", get(get_acl))
         .route("/v1/orgs/:org_id/acl", put(put_acl))
         .route("/v1/orgs/:org_id/security", get(get_security_policy))
@@ -211,6 +227,7 @@ pub fn app_with_relays_and_console(
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/:node_id/reauth", post(reauth_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
+        .route("/v1/nodes/:node_id/routes", put(update_advertised_routes))
         .route(
             "/v1/nodes/:node_id/relay-endpoint",
             put(update_relay_endpoint),
@@ -694,6 +711,7 @@ async fn mint_join_key(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RegisterNode {
     join_key: String,
     name: String,
@@ -702,6 +720,8 @@ struct RegisterNode {
     endpoint: Option<String>,
     #[serde(default)]
     allowed_ips: Vec<String>,
+    #[serde(default)]
+    advertised_routes: Vec<String>,
 }
 
 struct RegistrationGrant {
@@ -776,14 +796,17 @@ async fn register_node(
     State(s): State<AppState>,
     Json(input): Json<RegisterNode>,
 ) -> Result<(StatusCode, Json<RegisterResponse>), ApiError> {
-    if input.name.trim().is_empty()
-        || input.wg_public_key.trim().is_empty()
-        || input.allowed_ips.iter().any(|x| x.trim().is_empty())
-    {
+    if input.name.trim().is_empty() || input.wg_public_key.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "name and wg_public_key are required".into(),
         ));
     }
+    if !input.allowed_ips.is_empty() {
+        return Err(ApiError::BadRequest(
+            "allowed_ips are assigned by the coordinator".into(),
+        ));
+    }
+    let advertised_routes = validate_advertised_routes(input.advertised_routes)?;
     let mut db = s.store.0.lock().unwrap();
     let tx = db.transaction()?;
     let input_key_hash = hash(&input.join_key);
@@ -808,16 +831,12 @@ async fn register_node(
     }
     let id = Uuid::new_v4();
     let token = secret("btn");
-    let allowed_ips = if input.allowed_ips.is_empty() {
-        vec![allocate_ip(&tx, &grant.org_id)?]
-    } else {
-        input.allowed_ips
-    };
+    let allowed_ips = vec![allocate_ip(&tx, &grant.org_id)?];
     let assigned_ip = allowed_ips[0].clone();
     let dns_name = magic_dns_name(input.name.trim(), &grant.org_id);
     let registered_at = now();
     let credential_expires_at = registered_at + grant.node_key_ttl;
-    tx.execute("INSERT INTO nodes(id,org_id,name,wg_public_key,endpoint,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,credential_expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",params![id.to_string(),grant.org_id,input.name.trim(),input.wg_public_key.trim(),input.endpoint,serde_json::to_string(&allowed_ips).unwrap(),hash(&token),registered_at,grant.user_id,grant.user_role,grant.tags_json,dns_name,credential_expires_at]).map_err(conflict("node name, DNS name, public key, or address already exists in org"))?;
+    tx.execute("INSERT INTO nodes(id,org_id,name,wg_public_key,endpoint,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,advertised_routes_json,approved_routes_json,credential_expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'[]',?14)",params![id.to_string(),grant.org_id,input.name.trim(),input.wg_public_key.trim(),input.endpoint,serde_json::to_string(&allowed_ips).unwrap(),hash(&token),registered_at,grant.user_id,grant.user_role,grant.tags_json,dns_name,serde_json::to_string(&advertised_routes).unwrap(),credential_expires_at]).map_err(conflict("node name, DNS name, public key, or address already exists in org"))?;
     if grant.single_use {
         tx.execute(
             "UPDATE join_keys SET used_at=?1 WHERE id=?2",
@@ -845,6 +864,160 @@ async fn register_node(
             relay_expires_at,
         }),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdvertisedRoutesUpdate {
+    advertised_routes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApprovedRoutesUpdate {
+    approved_routes: Vec<String>,
+}
+
+async fn update_advertised_routes(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<AdvertisedRoutesUpdate>,
+) -> Result<StatusCode, ApiError> {
+    let routes = validate_advertised_routes(input.advertised_routes)?;
+    let token = bearer(&headers)?;
+    let db = s.store.0.lock().unwrap();
+    let row: Option<(i64, String)> = db
+        .query_row(
+            "SELECT credential_expires_at,approved_routes_json FROM nodes WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL",
+            params![node_id.to_string(), token],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (credential_expires_at, approved_json) = row.ok_or(ApiError::Unauthorized)?;
+    if credential_expires_at <= now() {
+        return Err(ApiError::CredentialExpired);
+    }
+    let approved: Vec<String> = serde_json::from_str(&approved_json).unwrap_or_default();
+    let retained_approvals: Vec<_> = approved
+        .into_iter()
+        .filter(|route| routes.contains(route))
+        .collect();
+    db.execute(
+        "UPDATE nodes SET advertised_routes_json=?1,approved_routes_json=?2 WHERE id=?3",
+        params![
+            serde_json::to_string(&routes).unwrap(),
+            serde_json::to_string(&retained_approvals).unwrap(),
+            node_id.to_string(),
+        ],
+    )?;
+    info!(%node_id, routes = routes.len(), "node route advertisements updated");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn approve_node_routes(
+    State(s): State<AppState>,
+    UrlPath((org_id, node_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(input): Json<ApprovedRoutesUpdate>,
+) -> Result<StatusCode, ApiError> {
+    let session = console_session(&s, &headers, org_id)?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    let approved = validate_advertised_routes(input.approved_routes)?;
+    let approval_time = now();
+    let mut db = s.store.0.lock().unwrap();
+    let tx = db.transaction()?;
+    let advertised_row: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT advertised_routes_json,approved_routes_json,credential_expires_at FROM nodes WHERE id=?1 AND org_id=?2 AND revoked_at IS NULL",
+            params![node_id.to_string(), org_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let (advertised_json, current_approved_json, credential_expires_at) =
+        advertised_row.ok_or(ApiError::NotFound)?;
+    let current_approved: Vec<String> =
+        serde_json::from_str(&current_approved_json).unwrap_or_default();
+    if credential_expires_at <= approval_time
+        && approved
+            .iter()
+            .any(|route| !current_approved.contains(route))
+    {
+        return Err(ApiError::Conflict(
+            "cannot add route approvals to an expired node; renew it first".into(),
+        ));
+    }
+    let advertised: Vec<String> = serde_json::from_str(&advertised_json).unwrap_or_default();
+    if approved.iter().any(|route| !advertised.contains(route)) {
+        return Err(ApiError::BadRequest(
+            "approved routes must be a subset of the node's advertisements".into(),
+        ));
+    }
+    let mut query = tx.prepare(
+        "SELECT id,credential_expires_at,approved_routes_json FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL",
+    )?;
+    let other_nodes = query
+        .query_map(params![org_id.to_string(), node_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let other_routes = other_nodes
+        .iter()
+        .filter(|(_, expires_at, _)| *expires_at > approval_time)
+        .flat_map(|(_, _, json)| serde_json::from_str::<Vec<String>>(json).unwrap_or_default())
+        .filter(|route| route != "0.0.0.0/0")
+        .collect::<Vec<_>>();
+    if let Some(route) = approved.iter().find(|route| {
+        route.as_str() != "0.0.0.0/0"
+            && other_routes
+                .iter()
+                .any(|other| ipv4_routes_overlap(route, other))
+    }) {
+        return Err(ApiError::Conflict(format!(
+            "route {route} overlaps another approved subnet router"
+        )));
+    }
+    drop(query);
+    let approved_subnets: Vec<_> = approved
+        .iter()
+        .filter(|route| route.as_str() != "0.0.0.0/0")
+        .collect();
+    for (other_id, expires_at, routes_json) in other_nodes {
+        if expires_at > approval_time {
+            continue;
+        }
+        let mut routes: Vec<String> = serde_json::from_str(&routes_json).unwrap_or_default();
+        let original_len = routes.len();
+        routes.retain(|route| {
+            route == "0.0.0.0/0"
+                || !approved_subnets
+                    .iter()
+                    .any(|approved| ipv4_routes_overlap(route, approved))
+        });
+        if routes.len() != original_len {
+            tx.execute(
+                "UPDATE nodes SET approved_routes_json=?1 WHERE id=?2",
+                params![serde_json::to_string(&routes).unwrap(), other_id],
+            )?;
+        }
+    }
+    tx.execute(
+        "UPDATE nodes SET approved_routes_json=?1 WHERE id=?2 AND org_id=?3",
+        params![
+            serde_json::to_string(&approved).unwrap(),
+            node_id.to_string(),
+            org_id.to_string(),
+        ],
+    )?;
+    tx.commit()?;
+    info!(%node_id, %org_id, routes = approved.len(), "node routes approved");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -924,6 +1097,8 @@ struct PeersResponse {
     peers: Vec<Peer>,
     dns_name: String,
     credential_expires_at: i64,
+    #[serde(default)]
+    exit_node_active: bool,
     /// Advertised relay endpoints plus a refreshed capability token.
     #[serde(default)]
     relays: Vec<String>,
@@ -932,9 +1107,17 @@ struct PeersResponse {
     #[serde(default)]
     relay_expires_at: u64,
 }
+
+#[derive(Default, Deserialize)]
+struct PeerSelection {
+    #[serde(default)]
+    exit_node: Option<String>,
+}
+
 async fn list_peers(
     State(s): State<AppState>,
     UrlPath(node_id): UrlPath<Uuid>,
+    Query(selection): Query<PeerSelection>,
     headers: HeaderMap,
 ) -> Result<Json<PeersResponse>, ApiError> {
     let token = bearer(&headers)?;
@@ -958,8 +1141,13 @@ async fn list_peers(
     };
     let acl: Acl = serde_json::from_str(&acl_json)
         .map_err(|_| ApiError::Database(rusqlite::Error::InvalidQuery))?;
-    let mut q=db.prepare("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>?3 THEN relay_endpoint ELSE NULL END FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL AND credential_expires_at>?4 ORDER BY name")?;
-    let peers = q
+    let requested_exit = selection
+        .exit_node
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut q=db.prepare("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>?3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL AND credential_expires_at>?4 ORDER BY name")?;
+    let candidates = q
         .query_map(
             params![
                 org,
@@ -972,6 +1160,8 @@ async fn list_peers(
                 let ips: String = r.get(4)?;
                 let tags: Vec<DeviceTag> =
                     serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default();
+                let approved: Vec<String> =
+                    serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default();
                 Ok((
                     Peer {
                         id: Uuid::parse_str(&id).unwrap(),
@@ -987,18 +1177,42 @@ async fn list_peers(
                         role: r.get::<_, String>(6)?.parse().unwrap(),
                         tags,
                     },
+                    approved,
                 ))
             },
         )?
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut exit_node_active = false;
+    let peers = candidates
         .into_iter()
-        .filter_map(|(p, d)| acl.allows(&source, &d).then_some(p))
+        .filter_map(|(mut peer, destination, approved)| {
+            if !acl.allows(&source, &destination) {
+                return None;
+            }
+            let exit_matches = requested_exit.is_some_and(|requested| {
+                requested == peer.id.to_string()
+                    || requested == peer.name
+                    || requested == peer.dns_name
+            });
+            for route in approved {
+                if route == "0.0.0.0/0" {
+                    if exit_matches {
+                        peer.allowed_ips.push(route);
+                        exit_node_active = true;
+                    }
+                } else {
+                    peer.allowed_ips.push(route);
+                }
+            }
+            Some(peer)
+        })
         .collect();
     let (relay_token, relay_expires_at) = relay_credentials(&s, node_id);
     Ok(Json(PeersResponse {
         peers,
         dns_name,
         credential_expires_at,
+        exit_node_active,
         relays: s.relays.as_ref().clone(),
         relay_token,
         relay_expires_at,
@@ -1085,6 +1299,115 @@ fn allocate_ip(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<String, A
         .find(|ip| !used.contains(ip))
         .ok_or_else(|| ApiError::Conflict("tailnet address pool exhausted".into()))
 }
+
+fn validate_advertised_routes(routes: Vec<String>) -> Result<Vec<String>, ApiError> {
+    if routes.len() > 32 {
+        return Err(ApiError::BadRequest(
+            "a node may advertise at most 32 routes".into(),
+        ));
+    }
+    let mut canonical = routes
+        .into_iter()
+        .map(|route| canonical_ipv4_route(&route))
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical.sort();
+    canonical.dedup();
+    for (index, route) in canonical.iter().enumerate() {
+        if route != "0.0.0.0/0"
+            && !["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+                .iter()
+                .any(|private| ipv4_route_is_within(route, private))
+        {
+            return Err(ApiError::BadRequest(format!(
+                "route {route} must be an RFC1918 private subnet or 0.0.0.0/0"
+            )));
+        }
+        if route != "0.0.0.0/0" && ipv4_routes_overlap(route, "100.64.0.0/10") {
+            return Err(ApiError::BadRequest(format!(
+                "route {route} overlaps the BlakTail address pool"
+            )));
+        }
+        if route != "0.0.0.0/0"
+            && canonical[index + 1..]
+                .iter()
+                .any(|other| other != "0.0.0.0/0" && ipv4_routes_overlap(route, other))
+        {
+            return Err(ApiError::BadRequest(format!(
+                "advertised route {route} overlaps another advertised route"
+            )));
+        }
+    }
+    Ok(canonical)
+}
+
+fn canonical_ipv4_route(route: &str) -> Result<String, ApiError> {
+    let route = route.trim();
+    let (address, prefix) = route
+        .split_once('/')
+        .ok_or_else(|| ApiError::BadRequest(format!("route {route} must use CIDR notation")))?;
+    let address: Ipv4Addr = address
+        .parse()
+        .map_err(|_| ApiError::BadRequest(format!("route {route} must be IPv4 CIDR")))?;
+    let prefix: u8 = prefix
+        .parse()
+        .ok()
+        .filter(|prefix| *prefix <= 32)
+        .ok_or_else(|| ApiError::BadRequest(format!("route {route} has an invalid prefix")))?;
+    let mask = ipv4_mask(prefix);
+    let raw = u32::from(address);
+    if raw & !mask != 0 {
+        return Err(ApiError::BadRequest(format!(
+            "route {route} is not a network address"
+        )));
+    }
+    if prefix != 0
+        && (address.is_loopback()
+            || address.is_link_local()
+            || address.is_multicast()
+            || address.is_broadcast())
+    {
+        return Err(ApiError::BadRequest(format!(
+            "route {route} is not a routable network"
+        )));
+    }
+    Ok(format!("{address}/{prefix}"))
+}
+
+fn ipv4_routes_overlap(left: &str, right: &str) -> bool {
+    let parse = |route: &str| {
+        let (address, prefix) = route.split_once('/').expect("validated CIDR");
+        (
+            u32::from(address.parse::<Ipv4Addr>().expect("validated IPv4")),
+            prefix.parse::<u8>().expect("validated prefix"),
+        )
+    };
+    let (left_address, left_prefix) = parse(left);
+    let (right_address, right_prefix) = parse(right);
+    let mask = ipv4_mask(left_prefix.min(right_prefix));
+    left_address & mask == right_address & mask
+}
+
+fn ipv4_route_is_within(route: &str, container: &str) -> bool {
+    let parse = |cidr: &str| {
+        let (address, prefix) = cidr.split_once('/').expect("validated CIDR");
+        (
+            u32::from(address.parse::<Ipv4Addr>().expect("validated IPv4")),
+            prefix.parse::<u8>().expect("validated prefix"),
+        )
+    };
+    let (address, prefix) = parse(route);
+    let (container_address, container_prefix) = parse(container);
+    prefix >= container_prefix
+        && address & ipv4_mask(container_prefix) == container_address & ipv4_mask(container_prefix)
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
 async fn revoke_node(
     State(s): State<AppState>,
     UrlPath(node_id): UrlPath<Uuid>,
@@ -1108,6 +1431,8 @@ struct NodeRow {
     wg_public_key: String,
     endpoint: Option<String>,
     allowed_ips: Vec<String>,
+    advertised_routes: Vec<String>,
+    approved_routes: Vec<String>,
     dns_name: String,
     user_id: String,
     user_role: String,
@@ -1127,7 +1452,7 @@ async fn list_nodes(
     console_session(&s, &headers, org_id)?;
     let db = s.store.0.lock().unwrap();
     let mut query = db.prepare(
-        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,credential_expires_at,credential_expires_at<=?2,credential_expires_at<=?3,revoked_at IS NOT NULL FROM nodes WHERE org_id=?1 ORDER BY name",
+        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,credential_expires_at,credential_expires_at<=?2,credential_expires_at<=?3,revoked_at IS NOT NULL,advertised_routes_json,approved_routes_json FROM nodes WHERE org_id=?1 ORDER BY name",
     )?;
     let rows = query
         .query_map(
@@ -1140,6 +1465,10 @@ async fn list_nodes(
                     wg_public_key: r.get(2)?,
                     endpoint: r.get(3)?,
                     allowed_ips: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+                    advertised_routes: serde_json::from_str(&r.get::<_, String>(14)?)
+                        .unwrap_or_default(),
+                    approved_routes: serde_json::from_str(&r.get::<_, String>(15)?)
+                        .unwrap_or_default(),
                     dns_name: r.get(5)?,
                     user_id: r.get(6)?,
                     user_role: r.get(7)?,
@@ -1470,6 +1799,30 @@ mod tests {
             ))
         );
     }
+    #[test]
+    fn route_validation_rejects_host_bits_tailnet_and_overlap() {
+        assert_eq!(
+            validate_advertised_routes(vec![
+                "10.2.0.0/16".into(),
+                "0.0.0.0/0".into(),
+                "10.2.0.0/16".into(),
+            ])
+            .unwrap(),
+            vec!["0.0.0.0/0", "10.2.0.0/16"]
+        );
+        for invalid in [
+            "10.2.0.1/16",
+            "100.64.2.0/24",
+            "128.0.0.0/1",
+            "192.0.2.0/24",
+            "224.0.0.0/4",
+        ] {
+            assert!(validate_advertised_routes(vec![invalid.into()]).is_err());
+        }
+        assert!(
+            validate_advertised_routes(vec!["10.2.0.0/16".into(), "10.2.3.0/24".into(),]).is_err()
+        );
+    }
     fn signed_session(org_id: Uuid, user_id: &str, role: Role, exp: i64) -> String {
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&Session {
@@ -1508,6 +1861,340 @@ mod tests {
     }
     async fn body<T: serde::de::DeserializeOwned>(r: Response) -> T {
         serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    async fn register_test_node(
+        router: &Router,
+        org_id: Uuid,
+        session: &str,
+        name: &str,
+        public_key: &str,
+        advertised_routes: &[&str],
+    ) -> RegisterResponse {
+        let key: JoinKeyResponse = body(
+            call(
+                router,
+                Method::POST,
+                &format!("/v1/orgs/{org_id}/join-keys"),
+                serde_json::json!({"expires_in_seconds":60}),
+                Some(session),
+            )
+            .await,
+        )
+        .await;
+        let response = call(
+            router,
+            Method::POST,
+            "/v1/nodes/register",
+            serde_json::json!({
+                "join_key":key.key,
+                "name":name,
+                "wg_public_key":public_key,
+                "advertised_routes":advertised_routes,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        body(response).await
+    }
+
+    #[tokio::test]
+    async fn only_approved_routes_are_distributed_and_exit_nodes_are_opt_in() {
+        let store = Store::memory().unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org: OrgResponse = body(
+            call(
+                &router,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name":"routing-org"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let injection_key: JoinKeyResponse = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", org.id),
+                serde_json::json!({"expires_in_seconds":60}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                "/v1/nodes/register",
+                serde_json::json!({
+                    "join_key":injection_key.key,
+                    "name":"address-injector",
+                    "wg_public_key":"address-injector-key",
+                    "allowed_ips":["10.0.0.1/32"],
+                }),
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let subnet_router = register_test_node(
+            &router,
+            org.id,
+            &owner,
+            "router-one",
+            "router-key",
+            &["10.1.0.0/24", "0.0.0.0/0"],
+        )
+        .await;
+        let client =
+            register_test_node(&router, org.id, &owner, "client-one", "client-key", &[]).await;
+
+        let before: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", client.id),
+                serde_json::Value::Null,
+                Some(&client.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(before.peers[0].allowed_ips, vec!["100.64.0.1/32"]);
+        assert!(!before.exit_node_active);
+
+        let nodes: Vec<NodeRow> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let listed_router = nodes
+            .iter()
+            .find(|node| node.id == subnet_router.id)
+            .unwrap();
+        assert_eq!(
+            listed_router.advertised_routes,
+            vec!["0.0.0.0/0", "10.1.0.0/24"]
+        );
+        assert!(listed_router.approved_routes.is_empty());
+
+        let approval_path = format!("/v1/orgs/{}/nodes/{}/routes", org.id, subnet_router.id);
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &approval_path,
+                serde_json::json!({"approved_routes":["10.1.0.0/24"]}),
+                Some(&member),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &approval_path,
+                serde_json::json!({"approved_routes":["10.1.0.0/24","0.0.0.0/0"]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let routed: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", client.id),
+                serde_json::Value::Null,
+                Some(&client.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            routed.peers[0].allowed_ips,
+            vec!["100.64.0.1/32", "10.1.0.0/24"]
+        );
+        assert!(!routed.exit_node_active);
+
+        let exited: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers?exit_node=router-one", client.id),
+                serde_json::Value::Null,
+                Some(&client.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            exited.peers[0].allowed_ips,
+            vec!["100.64.0.1/32", "0.0.0.0/0", "10.1.0.0/24"]
+        );
+        assert!(exited.exit_node_active);
+        let missing_exit: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers?exit_node=missing", client.id),
+                serde_json::Value::Null,
+                Some(&client.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert!(!missing_exit.exit_node_active);
+        assert!(!missing_exit.peers[0]
+            .allowed_ips
+            .contains(&"0.0.0.0/0".into()));
+
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &approval_path,
+                serde_json::json!({"approved_routes":["10.2.0.0/24"]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let overlapping = register_test_node(
+            &router,
+            org.id,
+            &owner,
+            "router-two",
+            "router-key-two",
+            &["10.1.0.0/25"],
+        )
+        .await;
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/nodes/{}/routes", org.id, overlapping.id),
+                serde_json::json!({"approved_routes":["10.1.0.0/25"]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &approval_path,
+                serde_json::json!({"approved_routes":["10.1.0.0/24"]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE nodes SET credential_expires_at=?1 WHERE id=?2",
+                params![now() - 1, subnet_router.id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &approval_path,
+                serde_json::json!({"approved_routes":["10.1.0.0/24","0.0.0.0/0"]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/nodes/{}/routes", org.id, overlapping.id),
+                serde_json::json!({"approved_routes":["10.1.0.0/25"]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let expired_approvals: String = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT approved_routes_json FROM nodes WHERE id=?1",
+                [subnet_router.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expired_approvals, "[]");
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE nodes SET credential_expires_at=?1 WHERE id=?2",
+                params![now() + 60, subnet_router.id.to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/nodes/{}/routes", subnet_router.id),
+                serde_json::json!({"advertised_routes":["10.2.0.0/24"]}),
+                Some(&subnet_router.node_token),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let after_update: Vec<NodeRow> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let listed_router = after_update
+            .iter()
+            .find(|node| node.id == subnet_router.id)
+            .unwrap();
+        assert_eq!(listed_router.advertised_routes, vec!["10.2.0.0/24"]);
+        assert!(listed_router.approved_routes.is_empty());
     }
 
     #[tokio::test]

@@ -522,6 +522,10 @@ mod tests {
             assigned_ip: "100.64.0.1/32".into(),
             dns_name: "self.12345678.blaktail".into(),
             credential_expires_at: 1,
+            advertised_routes: vec![],
+            exit_node: None,
+            exit_node_active: false,
+            router_previous_ipv4_forward: None,
             peers: vec![Peer {
                 id: Uuid::from_u128(2),
                 name: "peer".into(),

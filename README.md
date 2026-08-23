@@ -14,6 +14,7 @@ https://github.com/jusso-dev/BlakTail
 - Desktop apps for Mac, then Windows and Linux, that drive the local agent
 - Coordination server and AU relay the org runs
 - MagicDNS-style names and tag ACLs (office, ranger, store)
+- Owner-approved Linux subnet routers and opt-in IPv4 exit nodes
 
 ## What v1 does not do
 

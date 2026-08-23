@@ -1,8 +1,8 @@
 use blaktaild::{
     configure_system_dns, dns_domain, ensure_private_key, peer_key_hex, read_state,
-    remove_system_dns, restore_peers, sync_once, validate_interface, write_state, Coordinator,
-    MagicDns, Network, RelayMesh, DEFAULT_INTERFACE, DEFAULT_STATE_DIR, DIRECT_GRACE_SECS,
-    DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
+    remove_system_dns, restore_peers, sync_once, validate_advertised_routes, validate_interface,
+    write_state, Coordinator, MagicDns, Network, Registration, RelayMesh, DEFAULT_INTERFACE,
+    DEFAULT_STATE_DIR, DIRECT_GRACE_SECS, DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
 };
 use clap::{Parser, Subcommand};
 use std::{
@@ -45,6 +45,15 @@ enum Command {
         /// Public UDP endpoint advertised to peers, for example 203.0.113.5:51820.
         #[arg(long)]
         endpoint: Option<String>,
+        /// IPv4 CIDRs routed through this Linux node, comma separated. Use `none` to clear.
+        #[arg(long, value_delimiter = ',')]
+        advertise_routes: Vec<String>,
+        /// Advertise this Linux node as an IPv4 exit node (owner approval is still required).
+        #[arg(long)]
+        advertise_exit_node: bool,
+        /// Approved exit node name, DNS name, or UUID. Use `none` to disable.
+        #[arg(long)]
+        exit_node: Option<String>,
         #[arg(long, default_value_t = 30)]
         poll_seconds: u64,
         /// Exit after the first successful peer sync; launchd or systemd keeps syncing via `run`.
@@ -169,7 +178,7 @@ fn make_network() -> Box<dyn Network> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Box::new(blaktaild::LinuxNetwork)
+        Box::new(blaktaild::LinuxNetwork::default())
     }
 }
 
@@ -408,6 +417,7 @@ async fn manage_paths(
             state.node_id,
             &state.relay_token,
             state.relay_expires_at,
+            state.exit_node.as_ref().map(|_| 51_820),
         ) {
             Ok(created) => *mesh = Some(created),
             Err(error) => warn!(%error, "could not start relay client; direct paths only"),
@@ -685,16 +695,65 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             interface,
             name,
             endpoint,
+            advertise_routes,
+            advertise_exit_node,
+            exit_node,
             poll_seconds,
             exit_after_join,
         } => {
             validate_interface(&interface)?;
+            let routes_were_supplied = !advertise_routes.is_empty() || advertise_exit_node;
+            let clear_routes =
+                advertise_routes.len() == 1 && advertise_routes[0].eq_ignore_ascii_case("none");
+            if advertise_routes
+                .iter()
+                .any(|route| route.eq_ignore_ascii_case("none"))
+                && (!clear_routes || advertise_exit_node)
+            {
+                return Err(blaktaild::Error::Message(
+                    "--advertise-routes none cannot be combined with other routes".into(),
+                ));
+            }
+            let mut requested_routes = if clear_routes {
+                Vec::new()
+            } else {
+                advertise_routes
+            };
+            if advertise_exit_node {
+                requested_routes.push("0.0.0.0/0".into());
+            }
+            let requested_routes = validate_advertised_routes(&requested_routes)?;
+            let exit_node_was_supplied = exit_node.is_some();
+            let requested_exit_node = exit_node.and_then(|value| {
+                let value = value.trim();
+                (!value.is_empty() && !value.eq_ignore_ascii_case("none")).then(|| value.to_owned())
+            });
+            #[cfg(target_os = "macos")]
+            if !requested_routes.is_empty() || requested_exit_node.is_some() {
+                return Err(blaktaild::Error::Message(
+                    "subnet and exit-node routing is currently supported on Linux only".into(),
+                ));
+            }
             let (key_path, public_key) = ensure_private_key(&cli.state_dir)?;
             let coordinator = Coordinator::new(&coord)?;
             let name = name.unwrap_or_else(detect_hostname);
             let resumed = cli.state_dir.join("state.json").exists();
+            let mut previous_routes = Vec::new();
+            let mut routes_changed = false;
             let mut state = match read_state(&cli.state_dir) {
-                Ok(existing) if existing.coord == coord && existing.interface == interface => {
+                Ok(mut existing) if existing.coord == coord && existing.interface == interface => {
+                    previous_routes = existing.advertised_routes.clone();
+                    if routes_were_supplied && requested_routes != existing.advertised_routes {
+                        existing.advertised_routes = requested_routes.clone();
+                        routes_changed = true;
+                    }
+                    if exit_node_was_supplied {
+                        existing.exit_node = requested_exit_node.clone();
+                        existing.exit_node_active = false;
+                        for peer in &mut existing.peers {
+                            peer.allowed_ips.retain(|route| route != "0.0.0.0/0");
+                        }
+                    }
                     existing
                 }
                 Ok(_) => return Err(blaktaild::Error::Message(
@@ -709,13 +768,15 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                         None => browser_join_key(&coordinator, &name, &public_key).await?,
                     };
                     let registration = coordinator
-                        .register(
-                            &join_key,
-                            &name,
-                            &public_key,
-                            endpoint.as_deref(),
-                            &interface,
-                        )
+                        .register(Registration {
+                            join_key: &join_key,
+                            name: &name,
+                            public_key: &public_key,
+                            endpoint: endpoint.as_deref(),
+                            interface: &interface,
+                            advertised_routes: &requested_routes,
+                            exit_node: requested_exit_node.clone(),
+                        })
                         .await;
                     join_key.zeroize();
                     registration?
@@ -729,11 +790,42 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                 }
                 return Err(error);
             }
+            let previous_ipv4_forward = state.router_previous_ipv4_forward;
+            match network.configure_router(
+                &interface,
+                &previous_routes,
+                &state.advertised_routes,
+                state.router_previous_ipv4_forward,
+            ) {
+                Ok(original) => state.router_previous_ipv4_forward = original,
+                Err(error) => {
+                    if !resumed {
+                        let _ = coordinator.revoke(&state).await;
+                    }
+                    let _ = network.down(&interface);
+                    return Err(error);
+                }
+            }
+            if routes_changed {
+                if let Err(error) = coordinator
+                    .update_advertised_routes(&state, &state.advertised_routes)
+                    .await
+                {
+                    let _ = network.configure_router(
+                        &interface,
+                        &state.advertised_routes,
+                        &previous_routes,
+                        previous_ipv4_forward,
+                    );
+                    let _ = network.down(&interface);
+                    return Err(error);
+                }
+            }
+            write_state(&cli.state_dir, &state)?;
             let restored = restore_peers(network.as_mut(), &state)?;
             if restored > 0 {
                 info!(restored, "restored persisted WireGuard peers");
             }
-            write_state(&cli.state_dir, &state)?;
             info!(node_id = %state.node_id, address = %state.assigned_ip, interface, "tailnet joined");
             println!(
                 "joined\nnode: {}\ninterface: {}\naddress: {}\ncoordinator: {}",
@@ -756,11 +848,17 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             let coordinator = Coordinator::new(&state.coord)?;
             let mut network = make_network();
             network.setup(&state.interface, &key_path, &state.assigned_ip)?;
+            state.router_previous_ipv4_forward = network.configure_router(
+                &state.interface,
+                &state.advertised_routes,
+                &state.advertised_routes,
+                state.router_previous_ipv4_forward,
+            )?;
+            write_state(&cli.state_dir, &state)?;
             let restored = restore_peers(network.as_mut(), &state)?;
             if restored > 0 {
                 info!(restored, "restored persisted WireGuard peers");
             }
-            write_state(&cli.state_dir, &state)?;
             info!(node_id = %state.node_id, interface = %state.interface, "resuming enrollment");
             sync_loop(
                 &coordinator,
@@ -788,13 +886,25 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
         Command::Status => {
             let state = read_state(&cli.state_dir)?;
             println!(
-                "joined\nnode: {}\ninterface: {}\naddress: {}\ndns: {}\ncoordinator: {}\ncredential: {}\npeers: {}",
+                "joined\nnode: {}\ninterface: {}\naddress: {}\ndns: {}\ncoordinator: {}\ncredential: {}\nadvertised routes: {}\nexit node: {}\npeers: {}",
                 state.node_id,
                 state.interface,
                 state.assigned_ip,
                 if state.dns_name.is_empty() { "unknown" } else { &state.dns_name },
                 state.coord,
                 credential_status(state.credential_expires_at, blaktaild_now() as i64),
+                if state.advertised_routes.is_empty() {
+                    "none".into()
+                } else {
+                    state.advertised_routes.join(",")
+                },
+                state.exit_node.as_deref().map_or_else(
+                    || "none".to_owned(),
+                    |exit| format!(
+                        "{exit} ({})",
+                        if state.exit_node_active { "active" } else { "pending approval or unavailable" }
+                    )
+                ),
                 state.peers.len()
             );
             for peer in state.peers {
@@ -817,8 +927,15 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                 )?;
             }
             let coordinator = Coordinator::new(&state.coord)?;
+            let mut network = make_network();
+            network.configure_router(
+                &state.interface,
+                &state.advertised_routes,
+                &[],
+                state.router_previous_ipv4_forward,
+            )?;
             coordinator.revoke(&state).await?;
-            make_network().down(&state.interface)?;
+            network.down(&state.interface)?;
             fs::remove_file(cli.state_dir.join("state.json"))?;
             println!("node revoked and {} removed", state.interface);
         }

@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -86,6 +86,14 @@ pub struct NodeState {
     #[serde(default)]
     pub credential_expires_at: i64,
     #[serde(default)]
+    pub advertised_routes: Vec<String>,
+    #[serde(default)]
+    pub exit_node: Option<String>,
+    #[serde(default)]
+    pub exit_node_active: bool,
+    #[serde(default)]
+    pub router_previous_ipv4_forward: Option<bool>,
+    #[serde(default)]
     pub peers: Vec<Peer>,
     /// Advertised relay endpoints (host:port UDP) and our capability token.
     #[serde(default)]
@@ -108,6 +116,16 @@ struct RegisterRequest<'a> {
     wg_public_key: &'a str,
     endpoint: Option<&'a str>,
     allowed_ips: Vec<String>,
+    advertised_routes: &'a [String],
+}
+pub struct Registration<'a> {
+    pub join_key: &'a str,
+    pub name: &'a str,
+    pub public_key: &'a str,
+    pub endpoint: Option<&'a str>,
+    pub interface: &'a str,
+    pub advertised_routes: &'a [String],
+    pub exit_node: Option<String>,
 }
 #[derive(Serialize)]
 struct DeviceAuthorizationRequest<'a> {
@@ -150,6 +168,8 @@ struct PeersResponse {
     #[serde(default)]
     credential_expires_at: i64,
     #[serde(default)]
+    exit_node_active: bool,
+    #[serde(default)]
     relays: Vec<String>,
     #[serde(default)]
     relay_token: String,
@@ -160,6 +180,11 @@ struct PeersResponse {
 #[derive(Serialize)]
 struct ReauthRequest<'a> {
     join_key: &'a str,
+}
+
+#[derive(Serialize)]
+struct AdvertisedRoutesRequest<'a> {
+    advertised_routes: &'a [String],
 }
 
 #[derive(Deserialize)]
@@ -253,23 +278,17 @@ impl Coordinator {
             )),
         }
     }
-    pub async fn register(
-        &self,
-        key: &str,
-        name: &str,
-        public_key: &str,
-        endpoint: Option<&str>,
-        interface: &str,
-    ) -> Result<NodeState, Error> {
+    pub async fn register(&self, registration: Registration<'_>) -> Result<NodeState, Error> {
         let response = self
             .client
             .post(format!("{}/v1/nodes/register", self.base))
             .json(&RegisterRequest {
-                join_key: key,
-                name,
-                wg_public_key: public_key,
-                endpoint,
+                join_key: registration.join_key,
+                name: registration.name,
+                wg_public_key: registration.public_key,
+                endpoint: registration.endpoint,
                 allowed_ips: vec![],
+                advertised_routes: registration.advertised_routes,
             })
             .send()
             .await?;
@@ -284,10 +303,14 @@ impl Coordinator {
             node_id: r.id,
             node_token: r.node_token,
             coord: self.base.clone(),
-            interface: interface.into(),
+            interface: registration.interface.into(),
             assigned_ip: r.assigned_ip,
             dns_name: r.dns_name,
             credential_expires_at: r.credential_expires_at,
+            advertised_routes: registration.advertised_routes.to_vec(),
+            exit_node: registration.exit_node,
+            exit_node_active: false,
+            router_previous_ipv4_forward: None,
             peers: vec![],
             relays: r.relays,
             relay_token: r.relay_token,
@@ -298,12 +321,14 @@ impl Coordinator {
         })
     }
     pub async fn peers(&self, state: &mut NodeState) -> Result<Vec<Peer>, Error> {
-        let response = self
+        let mut request = self
             .client
             .get(format!("{}/v1/nodes/{}/peers", self.base, state.node_id))
-            .bearer_auth(&state.node_token)
-            .send()
-            .await?;
+            .bearer_auth(&state.node_token);
+        if let Some(exit_node) = state.exit_node.as_deref() {
+            request = request.query(&[("exit_node", exit_node)]);
+        }
+        let response = request.send().await?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             let message = response
                 .json::<ApiErrorResponse>()
@@ -315,10 +340,38 @@ impl Coordinator {
         let body: PeersResponse = response.error_for_status()?.json().await?;
         state.dns_name = body.dns_name;
         state.credential_expires_at = body.credential_expires_at;
+        state.exit_node_active = body.exit_node_active;
         state.relays = body.relays;
         state.relay_token = body.relay_token;
         state.relay_expires_at = body.relay_expires_at;
         Ok(body.peers)
+    }
+    pub async fn update_advertised_routes(
+        &self,
+        state: &NodeState,
+        routes: &[String],
+    ) -> Result<(), Error> {
+        let response = self
+            .client
+            .put(format!("{}/v1/nodes/{}/routes", self.base, state.node_id))
+            .bearer_auth(&state.node_token)
+            .json(&AdvertisedRoutesRequest {
+                advertised_routes: routes,
+            })
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response
+                .json::<ApiErrorResponse>()
+                .await
+                .map(|body| body.error)
+                .unwrap_or_else(|_| format!("coordinator returned {status}"));
+            return Err(Error::Message(format!(
+                "route advertisement rejected: {message}"
+            )));
+        }
+        Ok(())
     }
     pub async fn reauth(&self, state: &mut NodeState, join_key: &str) -> Result<(), Error> {
         let response = self
@@ -432,6 +485,23 @@ pub trait Network {
     fn latest_handshakes(&mut self, interface: &str) -> Result<HashMap<String, u64>, Error>;
     /// The WireGuard listen endpoint on this machine (loopback IP + port).
     fn listen_endpoint(&mut self, interface: &str) -> Result<Option<std::net::SocketAddr>, Error>;
+    /// Reconciles forwarding/NAT for a subnet or exit-node advertisement and
+    /// returns the original IPv4-forwarding setting for safe restoration.
+    fn configure_router(
+        &mut self,
+        _interface: &str,
+        _previous_routes: &[String],
+        desired_routes: &[String],
+        _original_ipv4_forward: Option<bool>,
+    ) -> Result<Option<bool>, Error> {
+        if desired_routes.is_empty() {
+            Ok(None)
+        } else {
+            Err(Error::Message(
+                "subnet and exit-node advertisement is supported on Linux only".into(),
+            ))
+        }
+    }
 }
 /// Normalises a base64 WireGuard public key to the hex form used by the
 /// userspace UAPI, so path-management bookkeeping is uniform per platform.
@@ -444,8 +514,16 @@ pub fn peer_key_hex(peer_key_b64: &str) -> Option<String> {
 pub const DIRECT_GRACE_SECS: u64 = 30;
 pub const HANDSHAKE_FRESH_SECS: u64 = 180;
 pub const DIRECT_RETRY_SECS: u64 = 300;
+const EXIT_ROUTE_TABLE: &str = "51820";
+const EXIT_MAIN_RULE_PRIORITY: &str = "13000";
+const EXIT_TUNNEL_RULE_PRIORITY: &str = "13001";
+
 #[derive(Default)]
-pub struct LinuxNetwork;
+pub struct LinuxNetwork {
+    peer_routes: HashMap<String, Vec<String>>,
+    installed_routes: HashSet<String>,
+    exit_routing: bool,
+}
 impl LinuxNetwork {
     fn run(program: &str, args: &[&str]) -> Result<(), Error> {
         let out = Command::new(program)
@@ -462,9 +540,241 @@ impl LinuxNetwork {
             )))
         }
     }
+
+    fn run_ignore(program: &str, args: &[&str]) {
+        let _ = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+
+    fn reconcile_routes(&mut self, interface: &str) -> Result<(), Error> {
+        let desired: HashSet<String> = self
+            .peer_routes
+            .values()
+            .flatten()
+            .filter(|route| route.as_str() != "0.0.0.0/0")
+            .cloned()
+            .collect();
+        let additions: Vec<_> = desired
+            .difference(&self.installed_routes)
+            .cloned()
+            .collect();
+        for route in additions {
+            Self::run("ip", &["-4", "route", "add", &route, "dev", interface])?;
+            self.installed_routes.insert(route);
+        }
+        let removals: Vec<_> = self
+            .installed_routes
+            .difference(&desired)
+            .cloned()
+            .collect();
+        for route in removals {
+            Self::run("ip", &["-4", "route", "del", &route, "dev", interface])?;
+            self.installed_routes.remove(&route);
+        }
+
+        let wants_exit = self
+            .peer_routes
+            .values()
+            .flatten()
+            .any(|route| route == "0.0.0.0/0");
+        if wants_exit && !self.exit_routing {
+            self.enable_exit_routing(interface)?;
+        } else if !wants_exit && self.exit_routing {
+            self.disable_exit_routing(interface);
+        }
+        Ok(())
+    }
+
+    fn clear_exit_rules() {
+        Self::run_ignore(
+            "ip",
+            &[
+                "-4",
+                "rule",
+                "del",
+                "priority",
+                EXIT_MAIN_RULE_PRIORITY,
+                "table",
+                "main",
+                "suppress_prefixlength",
+                "0",
+            ],
+        );
+        Self::run_ignore(
+            "ip",
+            &[
+                "-4",
+                "rule",
+                "del",
+                "priority",
+                EXIT_TUNNEL_RULE_PRIORITY,
+                "not",
+                "fwmark",
+                EXIT_ROUTE_TABLE,
+                "table",
+                EXIT_ROUTE_TABLE,
+            ],
+        );
+        Self::run_ignore(
+            "ip",
+            &["-4", "route", "del", "default", "table", EXIT_ROUTE_TABLE],
+        );
+    }
+
+    fn enable_exit_routing(&mut self, interface: &str) -> Result<(), Error> {
+        Self::clear_exit_rules();
+        Self::run("wg", &["set", interface, "fwmark", EXIT_ROUTE_TABLE])?;
+        let configured = (|| {
+            Self::run(
+                "ip",
+                &[
+                    "-4",
+                    "route",
+                    "add",
+                    "default",
+                    "dev",
+                    interface,
+                    "table",
+                    EXIT_ROUTE_TABLE,
+                ],
+            )?;
+            Self::run(
+                "ip",
+                &[
+                    "-4",
+                    "rule",
+                    "add",
+                    "priority",
+                    EXIT_MAIN_RULE_PRIORITY,
+                    "table",
+                    "main",
+                    "suppress_prefixlength",
+                    "0",
+                ],
+            )?;
+            Self::run(
+                "ip",
+                &[
+                    "-4",
+                    "rule",
+                    "add",
+                    "priority",
+                    EXIT_TUNNEL_RULE_PRIORITY,
+                    "not",
+                    "fwmark",
+                    EXIT_ROUTE_TABLE,
+                    "table",
+                    EXIT_ROUTE_TABLE,
+                ],
+            )
+        })();
+        if let Err(error) = configured {
+            Self::clear_exit_rules();
+            Self::run_ignore("wg", &["set", interface, "fwmark", "off"]);
+            return Err(error);
+        }
+        self.exit_routing = true;
+        Ok(())
+    }
+
+    fn disable_exit_routing(&mut self, interface: &str) {
+        Self::clear_exit_rules();
+        Self::run_ignore("wg", &["set", interface, "fwmark", "off"]);
+        self.exit_routing = false;
+    }
+
+    fn ipv4_forwarding() -> Result<bool, Error> {
+        let output = Command::new("sysctl")
+            .args(["-n", "net.ipv4.ip_forward"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| Error::Message(format!("could not execute sysctl: {error}")))?;
+        if !output.status.success() {
+            return Err(Error::Message(format!(
+                "could not read net.ipv4.ip_forward: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        match String::from_utf8_lossy(&output.stdout).trim() {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            value => Err(Error::Message(format!(
+                "unexpected net.ipv4.ip_forward value {value}"
+            ))),
+        }
+    }
+
+    fn remove_router_rules(interface: &str, routes: &[String]) {
+        for route in routes {
+            Self::run_ignore(
+                "iptables",
+                &[
+                    "-D",
+                    "FORWARD",
+                    "-i",
+                    interface,
+                    "-d",
+                    route,
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "blaktail-router",
+                    "-j",
+                    "ACCEPT",
+                ],
+            );
+        }
+        Self::run_ignore(
+            "iptables",
+            &[
+                "-D",
+                "FORWARD",
+                "-o",
+                interface,
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "RELATED,ESTABLISHED",
+                "-m",
+                "comment",
+                "--comment",
+                "blaktail-router",
+                "-j",
+                "ACCEPT",
+            ],
+        );
+        Self::run_ignore(
+            "iptables",
+            &[
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                "100.64.0.0/10",
+                "!",
+                "-o",
+                interface,
+                "-m",
+                "comment",
+                "--comment",
+                "blaktail-router",
+                "-j",
+                "MASQUERADE",
+            ],
+        );
+    }
 }
 impl Network for LinuxNetwork {
     fn setup(&mut self, interface: &str, key: &Path, address: &str) -> Result<(), Error> {
+        Self::clear_exit_rules();
+        self.peer_routes.clear();
+        self.installed_routes.clear();
+        self.exit_routing = false;
         let _ = Command::new("ip")
             .args(["link", "delete", "dev", interface])
             .output();
@@ -492,7 +802,8 @@ impl Network for LinuxNetwork {
         for change in changes {
             match change {
                 PeerChange::Remove(key) => {
-                    Self::run("wg", &["set", interface, "peer", key, "remove"])?
+                    Self::run("wg", &["set", interface, "peer", key, "remove"])?;
+                    self.peer_routes.remove(key);
                 }
                 PeerChange::Upsert(peer) => {
                     let ips = peer.allowed_ips.join(",");
@@ -508,12 +819,15 @@ impl Network for LinuxNetwork {
                         args.extend(["endpoint", endpoint.as_str(), "persistent-keepalive", "25"]);
                     }
                     Self::run("wg", &args)?;
+                    self.peer_routes
+                        .insert(peer.wg_public_key.clone(), peer.allowed_ips.clone());
                 }
             }
         }
-        Ok(())
+        self.reconcile_routes(interface)
     }
     fn down(&mut self, interface: &str) -> Result<(), Error> {
+        self.disable_exit_routing(interface);
         Self::run("ip", &["link", "delete", "dev", interface])
     }
     fn set_peer_endpoint(
@@ -569,6 +883,108 @@ impl Network for LinuxNetwork {
             .map_err(|_| Error::Message("wg listen-port is not numeric".into()))?;
         Ok((port != 0).then(|| std::net::SocketAddr::from(([127, 0, 0, 1], port))))
     }
+    fn configure_router(
+        &mut self,
+        interface: &str,
+        previous_routes: &[String],
+        desired_routes: &[String],
+        original_ipv4_forward: Option<bool>,
+    ) -> Result<Option<bool>, Error> {
+        let known_routes: HashSet<_> = previous_routes
+            .iter()
+            .chain(desired_routes)
+            .cloned()
+            .collect();
+        Self::remove_router_rules(interface, &known_routes.into_iter().collect::<Vec<_>>());
+        if desired_routes.is_empty() {
+            if original_ipv4_forward == Some(false) && Self::ipv4_forwarding()? {
+                Self::run("sysctl", &["-w", "net.ipv4.ip_forward=0"])?;
+            }
+            return Ok(None);
+        }
+
+        let installed = (|| {
+            for route in desired_routes {
+                Self::run(
+                    "iptables",
+                    &[
+                        "-I",
+                        "FORWARD",
+                        "1",
+                        "-i",
+                        interface,
+                        "-d",
+                        route,
+                        "-m",
+                        "comment",
+                        "--comment",
+                        "blaktail-router",
+                        "-j",
+                        "ACCEPT",
+                    ],
+                )?;
+            }
+            Self::run(
+                "iptables",
+                &[
+                    "-I",
+                    "FORWARD",
+                    "1",
+                    "-o",
+                    interface,
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "RELATED,ESTABLISHED",
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "blaktail-router",
+                    "-j",
+                    "ACCEPT",
+                ],
+            )?;
+            Self::run(
+                "iptables",
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-s",
+                    "100.64.0.0/10",
+                    "!",
+                    "-o",
+                    interface,
+                    "-m",
+                    "comment",
+                    "--comment",
+                    "blaktail-router",
+                    "-j",
+                    "MASQUERADE",
+                ],
+            )
+        })();
+        if let Err(error) = installed {
+            Self::remove_router_rules(interface, desired_routes);
+            return Err(error);
+        }
+        let current = match Self::ipv4_forwarding() {
+            Ok(current) => current,
+            Err(error) => {
+                Self::remove_router_rules(interface, desired_routes);
+                return Err(error);
+            }
+        };
+        let original = original_ipv4_forward.unwrap_or(current);
+        if !current {
+            if let Err(error) = Self::run("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
+                Self::remove_router_rules(interface, desired_routes);
+                return Err(error);
+            }
+        }
+        Ok(Some(original))
+    }
 }
 
 /// Userspace WireGuard backend for macOS. Opens a kernel `utun` device through
@@ -580,6 +996,7 @@ pub struct MacOsNetwork {
     name: Option<String>,
     private_hex: String,
     peers: Vec<Peer>,
+    installed_routes: HashSet<String>,
 }
 
 #[cfg(target_os = "macos")]
@@ -590,6 +1007,7 @@ impl MacOsNetwork {
             name: None,
             private_hex: String::new(),
             peers: vec![],
+            installed_routes: HashSet::new(),
         }
     }
 
@@ -643,9 +1061,36 @@ impl MacOsNetwork {
         }
     }
 
-    /// Applies the full desired peer set with `replace_peers=true`, then pins a
-    /// host route per allowed IP so tailnet traffic rides the utun device.
-    fn push_config_and_routes(&self) -> Result<(), Error> {
+    fn route_target(route: &str) -> (&'static str, &str) {
+        if route.ends_with("/32") {
+            ("-host", route.split('/').next().unwrap_or(route))
+        } else {
+            ("-net", route)
+        }
+    }
+
+    fn remove_route(name: &str, route: &str) -> Result<(), Error> {
+        let (kind, target) = Self::route_target(route);
+        Self::run(
+            "/sbin/route",
+            &["-n", "delete", kind, target, "-interface", name],
+        )
+    }
+
+    /// Applies the full desired peer set with `replace_peers=true`, then pins
+    /// each host or subnet route to the utun device.
+    fn push_config_and_routes(&mut self) -> Result<(), Error> {
+        let desired: HashSet<String> = self
+            .peers
+            .iter()
+            .flat_map(|peer| peer.allowed_ips.iter())
+            .cloned()
+            .collect();
+        if desired.contains("0.0.0.0/0") {
+            return Err(Error::Message(
+                "exit-node routing is supported on Linux only".into(),
+            ));
+        }
         let mut request = format!(
             "set=1\nprivate_key={}\nreplace_peers=true\n",
             self.private_hex
@@ -665,23 +1110,26 @@ impl MacOsNetwork {
         request.push('\n');
         self.uapi(&request)?;
         let name = self.utun_name()?.to_owned();
-        for peer in &self.peers {
-            for ip in &peer.allowed_ips {
-                let host = ip.split('/').next().unwrap_or(ip);
-                if host.is_empty() {
-                    continue;
-                }
-                Self::run(
-                    "/sbin/route",
-                    &["-n", "add", "-host", host, "-interface", &name],
-                )
-                .or_else(|_| {
-                    Self::run(
-                        "/sbin/route",
-                        &["-n", "change", "-host", host, "-interface", &name],
-                    )
-                })?;
-            }
+        let additions: Vec<_> = desired
+            .difference(&self.installed_routes)
+            .cloned()
+            .collect();
+        for route in additions {
+            let (kind, target) = Self::route_target(&route);
+            Self::run(
+                "/sbin/route",
+                &["-n", "add", kind, target, "-interface", &name],
+            )?;
+            self.installed_routes.insert(route);
+        }
+        let removals: Vec<_> = self
+            .installed_routes
+            .difference(&desired)
+            .cloned()
+            .collect();
+        for route in removals {
+            Self::remove_route(&name, &route)?;
+            self.installed_routes.remove(&route);
         }
         Ok(())
     }
@@ -733,6 +1181,7 @@ impl Network for MacOsNetwork {
         self.device = Some(device);
         self.name = Some(name);
         self.peers.clear();
+        self.installed_routes.clear();
         Ok(())
     }
     fn apply(&mut self, _interface: &str, changes: &[PeerChange]) -> Result<(), Error> {
@@ -757,9 +1206,15 @@ impl Network for MacOsNetwork {
         self.push_config_and_routes()
     }
     fn down(&mut self, _interface: &str) -> Result<(), Error> {
+        if let Some(name) = &self.name {
+            for route in &self.installed_routes {
+                let _ = Self::remove_route(name, route);
+            }
+        }
         self.device = None;
         self.name = None;
         self.peers.clear();
+        self.installed_routes.clear();
         Ok(())
     }
     fn set_peer_endpoint(
@@ -857,6 +1312,121 @@ pub fn restore_peers(network: &mut dyn Network, state: &NodeState) -> Result<usi
     Ok(changes.len())
 }
 
+pub fn validate_advertised_routes(routes: &[String]) -> Result<Vec<String>, Error> {
+    if routes.len() > 32 {
+        return Err(Error::Message("at most 32 routes may be advertised".into()));
+    }
+    let mut canonical = routes
+        .iter()
+        .map(|route| canonical_ipv4_route(route))
+        .collect::<Result<Vec<_>, _>>()?;
+    canonical.sort();
+    canonical.dedup();
+    for (index, route) in canonical.iter().enumerate() {
+        if route != "0.0.0.0/0"
+            && !["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+                .iter()
+                .any(|private| ipv4_route_is_within(route, private))
+        {
+            return Err(Error::Message(format!(
+                "route {route} must be an RFC1918 private subnet or 0.0.0.0/0"
+            )));
+        }
+        if route != "0.0.0.0/0" && ipv4_routes_overlap(route, "100.64.0.0/10") {
+            return Err(Error::Message(format!(
+                "route {route} overlaps the BlakTail address pool"
+            )));
+        }
+        if route != "0.0.0.0/0"
+            && canonical[index + 1..]
+                .iter()
+                .any(|other| other != "0.0.0.0/0" && ipv4_routes_overlap(route, other))
+        {
+            return Err(Error::Message(format!(
+                "route {route} overlaps another advertised route"
+            )));
+        }
+    }
+    Ok(canonical)
+}
+
+fn canonical_ipv4_route(route: &str) -> Result<String, Error> {
+    let route = route.trim();
+    let (address, prefix) = route
+        .split_once('/')
+        .ok_or_else(|| Error::Message(format!("route {route} must use CIDR notation")))?;
+    let address: std::net::Ipv4Addr = address
+        .parse()
+        .map_err(|_| Error::Message(format!("route {route} must be IPv4 CIDR")))?;
+    let prefix: u8 = prefix
+        .parse()
+        .ok()
+        .filter(|prefix| *prefix <= 32)
+        .ok_or_else(|| Error::Message(format!("route {route} has an invalid prefix")))?;
+    let mask = ipv4_mask(prefix);
+    let raw = u32::from(address);
+    if raw & !mask != 0 {
+        return Err(Error::Message(format!(
+            "route {route} is not a network address"
+        )));
+    }
+    if prefix != 0
+        && (address.is_loopback()
+            || address.is_link_local()
+            || address.is_multicast()
+            || address.is_broadcast())
+    {
+        return Err(Error::Message(format!(
+            "route {route} is not a routable network"
+        )));
+    }
+    Ok(format!("{address}/{prefix}"))
+}
+
+fn ipv4_routes_overlap(left: &str, right: &str) -> bool {
+    let parse = |route: &str| {
+        let (address, prefix) = route.split_once('/').expect("validated CIDR");
+        (
+            u32::from(
+                address
+                    .parse::<std::net::Ipv4Addr>()
+                    .expect("validated IPv4"),
+            ),
+            prefix.parse::<u8>().expect("validated prefix"),
+        )
+    };
+    let (left_address, left_prefix) = parse(left);
+    let (right_address, right_prefix) = parse(right);
+    let mask = ipv4_mask(left_prefix.min(right_prefix));
+    left_address & mask == right_address & mask
+}
+
+fn ipv4_route_is_within(route: &str, container: &str) -> bool {
+    let parse = |cidr: &str| {
+        let (address, prefix) = cidr.split_once('/').expect("validated CIDR");
+        (
+            u32::from(
+                address
+                    .parse::<std::net::Ipv4Addr>()
+                    .expect("validated IPv4"),
+            ),
+            prefix.parse::<u8>().expect("validated prefix"),
+        )
+    };
+    let (address, prefix) = parse(route);
+    let (container_address, container_prefix) = parse(container);
+    prefix >= container_prefix
+        && address & ipv4_mask(container_prefix) == container_address & ipv4_mask(container_prefix)
+}
+
+fn ipv4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
 pub fn validate_interface(name: &str) -> Result<(), Error> {
     if name.is_empty()
         || name.len() > 15
@@ -938,6 +1508,34 @@ mod tests {
     }
 
     #[test]
+    fn advertised_routes_are_canonical_and_non_overlapping() {
+        assert_eq!(
+            validate_advertised_routes(&[
+                "10.20.0.0/16".into(),
+                "0.0.0.0/0".into(),
+                "10.20.0.0/16".into(),
+            ])
+            .unwrap(),
+            vec!["0.0.0.0/0", "10.20.0.0/16"]
+        );
+        for invalid in [
+            "10.20.0.1/16",
+            "10.20.0.0/33",
+            "100.64.1.0/24",
+            "128.0.0.0/1",
+            "192.0.2.0/24",
+            "127.0.0.0/8",
+            "10.20.0.0",
+            "fd00::/8",
+        ] {
+            assert!(validate_advertised_routes(&[invalid.into()]).is_err());
+        }
+        assert!(
+            validate_advertised_routes(&["10.20.0.0/16".into(), "10.20.1.0/24".into(),]).is_err()
+        );
+    }
+
+    #[test]
     fn persisted_peers_are_reinstalled_after_interface_recreation() {
         let expected = peer("restored", Some("192.0.2.1:51820"));
         let state = NodeState {
@@ -948,6 +1546,10 @@ mod tests {
             assigned_ip: "100.64.0.1/32".into(),
             dns_name: "self.12345678.blaktail".into(),
             credential_expires_at: 1,
+            advertised_routes: vec![],
+            exit_node: None,
+            exit_node_active: false,
+            router_previous_ipv4_forward: None,
             peers: vec![expected.clone()],
             relays: vec![],
             relay_token: String::new(),

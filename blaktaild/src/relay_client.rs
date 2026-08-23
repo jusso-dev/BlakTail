@@ -94,6 +94,7 @@ impl RelayMesh {
         self_id: Uuid,
         relay_token_hex: &str,
         relay_expires_at_unix: u64,
+        fwmark: Option<u32>,
     ) -> io::Result<Self> {
         let token_raw = hex_decode(relay_token_hex)
             .ok_or_else(|| io::Error::other("relay token is not valid hex"))?;
@@ -106,6 +107,7 @@ impl RelayMesh {
             "[::]:0"
         };
         let std_socket = std::net::UdpSocket::bind(bind_addr)?;
+        set_fwmark(&std_socket, fwmark)?;
         std_socket.set_nonblocking(true)?;
         let relay_socket = Arc::new(UdpSocket::from_std(std_socket)?);
         let shared = Arc::new(Shared {
@@ -490,6 +492,35 @@ impl RelayMesh {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn set_fwmark(socket: &std::net::UdpSocket, fwmark: Option<u32>) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let Some(fwmark) = fwmark else {
+        return Ok(());
+    };
+    // SAFETY: `socket` owns a valid UDP descriptor, and the pointer/length
+    // describe a live `u32` for the duration of this `setsockopt` call.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            (&fwmark as *const u32).cast(),
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_fwmark(_socket: &std::net::UdpSocket, _fwmark: Option<u32>) -> io::Result<()> {
+    Ok(())
+}
+
 pub fn hex_decode(input: &str) -> Option<Vec<u8>> {
     if !input.len().is_multiple_of(2) {
         return None;
@@ -554,6 +585,7 @@ mod tests {
             node_a,
             &capability(node_a, expires, &secret()),
             expires,
+            None,
         )
         .unwrap();
         let mesh_b = RelayMesh::spawn(
@@ -562,6 +594,7 @@ mod tests {
             node_b,
             &capability(node_b, expires, &secret()),
             expires,
+            None,
         )
         .unwrap();
 
@@ -636,6 +669,7 @@ mod tests {
             node_a,
             &capability(node_a, expires, &secret()),
             expires,
+            None,
         )
         .unwrap();
         let mesh_b = RelayMesh::spawn(
@@ -644,6 +678,7 @@ mod tests {
             node_b,
             &capability(node_b, expires, &secret()),
             expires,
+            None,
         )
         .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
