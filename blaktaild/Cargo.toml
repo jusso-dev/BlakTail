@@ -1,0 +1,27 @@
+[package]
+name = "blaktaild"
+description = "BlakTail WireGuard node agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "blaktaild"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+boringtun = { version = "0.7.1", features = ["device"] }
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+libc = "0.2"
+rand_core = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["serde"] }

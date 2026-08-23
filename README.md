@@ -35,3 +35,23 @@ https://github.com/jusso-dev/BlakTail
 ## Tagline (do not rewrite)
 
 Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.
+
+## Build
+
+Requires [rustup](https://rustup.rs/) on Linux. The pinned toolchain is in `rust-toolchain.toml`.
+
+```bash
+cargo build --release
+```
+
+Binaries land in `target/release/`: `blaktaild`, `blaktail-coord`, `blaktail-relay`.
+
+```bash
+cargo test
+```
+
+## Manual Mac validation
+
+Follow the [two-device ping and sleep/wake test](docs/macos-agent.md#manual-two-device-test) on two Macs or a Mac plus a compatible Linux WireGuard node.
+
+CI runs `cargo fmt --check`, `clippy -D warnings`, and `cargo test` on self-hosted runners only (`runs-on: [self-hosted]`). The macOS agent build uses `[self-hosted, macOS]`; see [`docs/macos-agent.md`](docs/macos-agent.md) for installation and the manual two-device test. Licence: Apache-2.0.

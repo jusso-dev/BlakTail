@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: blaktail-self-hosted
+  cancel-in-progress: false
+
+jobs:
+
+  macos-agent:
+    name: macOS userspace agent
+    runs-on: [self-hosted, macOS]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check macOS agent
+        run: cargo check -p blaktaild --all-targets
+      - name: Test macOS agent
+        run: cargo test -p blaktaild
+  check:
+    name: fmt, clippy, test
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
