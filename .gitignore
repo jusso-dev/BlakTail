@@ -1,3 +1,10 @@
+# macOS / Xcode
+apps/macos/.build/
+apps/macos/*.xcodeproj/
+apps/macos/*.xcworkspace/
+**/DerivedData/
+*.xcuserstate
+
 # Rust build artefacts
 /target/
 **/target/
