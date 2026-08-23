@@ -23,6 +23,8 @@ Notes:
 * Coordinator and relay are intentionally pinned at one task. SQLite keeps coordinator single-writer; relay registrations currently live in one process.
 * Secrets (`DATABASE_URL`, `BETTER_AUTH_SECRET`, `BLAKTAIL_AUTH_HMAC_SECRET`, dedicated `BLAKTAIL_RELAY_AUTH_SECRET`, coord TLS material) live in Secrets Manager and are injected by ECS; nothing lands in the image or task definition.
 * Logs go to CloudWatch (`/ecs/blaktail/{console,coord,relay}`, 30-day retention).
+* ECS Container Insights is enabled by Terraform for task-level CPU, memory,
+  network, storage, and restart visibility.
 
 ## Path 1: single EC2 host
 
@@ -45,7 +47,7 @@ EOF
 docker compose up -d --build
 ```
 
-Open `http://<ec2-ip>:3000` (put a TLS proxy such as Caddy/nginx in front for production). Security group needs inbound 3000/tcp, 8443/tcp, 3478/udp. Coord state lives in the `coorddata` volume; Postgres in `pgdata`.
+Open `http://<ec2-ip>:3000` (put a TLS proxy such as Caddy/nginx in front for production). Security group needs inbound 3000/tcp, 8443/tcp, 3478/udp. Coord state lives in the `coorddata` volume; Postgres in `pgdata`. Compose binds coordinator and relay metrics to host loopback at `127.0.0.1:9701` and `127.0.0.1:9702`; scrape them from the host or a host-networked collector. See [observability.md](observability.md).
 
 ## Path 2: ECS via Terraform
 

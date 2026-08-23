@@ -15,6 +15,7 @@ https://github.com/jusso-dev/BlakTail
 - Coordination server and AU relay the org runs
 - MagicDNS-style names and tag ACLs (office, ranger, store)
 - Owner-approved Linux subnet routers and opt-in IPv4 exit nodes
+- Prometheus coordinator/relay metrics and an actor-attributed admin audit log
 
 ## What v1 does not do
 
@@ -28,6 +29,8 @@ https://github.com/jusso-dev/BlakTail
 
 Operator UI lives in `apps/console` (Next.js 16.3, Better Auth, Drizzle, onshore Postgres).
 See [docs/console.md](docs/console.md).
+
+Metrics, audit coverage, and alert examples: [docs/observability.md](docs/observability.md).
 
 ## Deployment
 

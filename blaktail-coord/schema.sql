@@ -46,3 +46,18 @@ CREATE TABLE IF NOT EXISTS nodes (
 CREATE INDEX IF NOT EXISTS nodes_active_org_idx ON nodes(org_id, revoked_at);
 CREATE INDEX IF NOT EXISTS device_authorizations_expiry_idx
  ON device_authorizations(expires_at);
+CREATE TABLE IF NOT EXISTS audit_events (
+ id TEXT PRIMARY KEY,
+ org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+ actor_user_id TEXT NOT NULL,
+ actor_name TEXT NOT NULL DEFAULT '',
+ actor_email TEXT NOT NULL DEFAULT '',
+ actor_role TEXT NOT NULL,
+ action TEXT NOT NULL,
+ target_type TEXT NOT NULL,
+ target_id TEXT,
+ details_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(details_json)),
+ created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_events_org_created_idx
+ ON audit_events(org_id, created_at DESC, id DESC);

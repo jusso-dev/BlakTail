@@ -6,6 +6,7 @@ const links = [
   { href: "/devices", label: "Devices" },
   { href: "/join-keys", label: "Join keys" },
   { href: "/acls", label: "ACL rules" },
+  { href: "/audit", label: "Audit log" },
   { href: "/status", label: "Status" },
   { href: "/settings", label: "Settings" },
 ] as const;

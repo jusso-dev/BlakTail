@@ -1,7 +1,7 @@
 use axum_server::tls_rustls::RustlsConfig;
-use blaktail_coord::Store;
+use blaktail_coord::{CoordMetrics, Store};
 use clap::Parser;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -11,6 +11,13 @@ struct Config {
     region: String,
     #[arg(long, env = "BLAKTAIL_BIND", default_value = "0.0.0.0:8443")]
     bind: SocketAddr,
+    /// Host-local Prometheus endpoint unless explicitly exposed by the operator.
+    #[arg(
+        long,
+        env = "BLAKTAIL_COORD_METRICS_BIND",
+        default_value = "127.0.0.1:9701"
+    )]
+    metrics_bind: SocketAddr,
     #[arg(
         long,
         env = "BLAKTAIL_DATABASE",
@@ -67,19 +74,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    info!(region, bind = %config.bind, relays = relays.len(), "starting BlakTail coordination server");
-    axum_server::bind_rustls(config.bind, tls)
-        .serve(
-            blaktail_coord::app_with_relays_and_console(
-                store,
-                region.to_owned(),
-                config.auth_hmac_secret.into_bytes(),
-                relay_auth_secret.into_bytes(),
-                relays,
-                console_url,
-            )
-            .into_make_service(),
-        )
-        .await?;
+    let metrics = Arc::new(CoordMetrics::default());
+    let metrics_listener = tokio::net::TcpListener::bind(config.metrics_bind).await?;
+    let metrics_router = blaktail_coord::metrics_app(store.clone(), metrics.clone());
+    let api_router = blaktail_coord::app_with_relays_console_and_metrics(
+        store,
+        region.to_owned(),
+        config.auth_hmac_secret.into_bytes(),
+        relay_auth_secret.into_bytes(),
+        relays,
+        console_url,
+        metrics,
+    );
+    info!(region, bind = %config.bind, metrics = %config.metrics_bind, "starting BlakTail coordination server");
+    tokio::select! {
+        result = axum_server::bind_rustls(config.bind, tls).serve(api_router.into_make_service()) => result?,
+        result = axum::serve(metrics_listener, metrics_router.into_make_service()) => result?,
+    }
     Ok(())
 }

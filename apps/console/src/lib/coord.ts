@@ -42,6 +42,19 @@ export type CoordHealth = {
   region: string;
 };
 
+export type AuditEvent = {
+  id: string;
+  actor_user_id: string;
+  actor_name: string;
+  actor_email: string;
+  actor_role: string;
+  action: string;
+  target_type: string;
+  target_id: string | null;
+  details: unknown;
+  created_at: number;
+};
+
 function coordBaseUrl(): string {
   const url = process.env.COORD_BASE_URL;
   if (!url) {
@@ -96,6 +109,19 @@ export async function listNodes(ctx: ConsoleContext): Promise<CoordNode[]> {
     throw new Error(await readError(res));
   }
   return res.json() as Promise<CoordNode[]>;
+}
+
+export async function listAuditEvents(
+  ctx: ConsoleContext,
+): Promise<AuditEvent[]> {
+  const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/audit?limit=100`, {
+    method: "GET",
+    sessionToken: ctx.coordAssertion,
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<AuditEvent[]>;
 }
 
 export async function revokeNode(

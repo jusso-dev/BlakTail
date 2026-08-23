@@ -1,6 +1,6 @@
 # Coordination server
 
-`blaktail-coord` is the organisation-hosted control plane. It stores only coordination metadata: organisations, ACL JSON, hashed join keys and node tokens, credential expiries, nodes, WireGuard public keys, and allowed IPs. There is no file-content or general blob table.
+`blaktail-coord` is the organisation-hosted control plane. It stores only coordination metadata: organisations, ACL JSON, hashed join keys and node tokens, credential expiries, nodes, WireGuard public keys, allowed IPs, and actor-attributed administration audit events. There is no file-content or general blob table.
 
 ## Run on an Australian host
 
@@ -11,6 +11,7 @@ browser-enrollment link. Use HTTPS for every non-local deployment.
 ```sh
 BLAKTAIL_REGION=ap-southeast-2 \
 BLAKTAIL_BIND=0.0.0.0:443 \
+BLAKTAIL_COORD_METRICS_BIND=127.0.0.1:9701 \
 BLAKTAIL_DATABASE=/var/lib/blaktail/coord.sqlite3 \
 BLAKTAIL_CONSOLE_URL=https://console.example.org.au \
 BLAKTAIL_AUTH_HMAC_SECRET=<shared-random-secret-at-least-32-bytes> \
@@ -32,6 +33,7 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 - `PUT /v1/orgs/{org_id}/nodes/{node_id}/routes` — owner/admin approval of an exact subset of advertised routes
 - `GET /v1/orgs/{org_id}/security` — any org user session; read node-key lifetime policy
 - `PUT /v1/orgs/{org_id}/security` — owner/admin session; set node-key lifetime from 1 to 365 days
+- `GET /v1/orgs/{org_id}/audit` — any org user session; latest audit events (`limit=1..200`)
 - `DELETE /v1/orgs/{org_id}/nodes/{node_id}` — owner/admin session; revoke a device
 - `POST /v1/nodes/register` — join key, name, WG public key, and optional public endpoint; the server allocates a tailnet IP
 - `GET /v1/nodes/{node_id}/peers` — bearer node token; active peers only
@@ -42,6 +44,12 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 - `GET /v1/orgs/{org_id}/acl` — any org user session
 - `PUT /v1/orgs/{org_id}/acl` — owner/admin only
 - `GET /health`
+
+Prometheus metrics are served as plain HTTP on the separate
+`BLAKTAIL_COORD_METRICS_BIND` listener. It defaults to `127.0.0.1:9701`; do not
+publish it through the public coordinator TLS listener. See
+[observability.md](observability.md) for metric names, Compose scraping, audit
+coverage, and alerts.
 
 Join and node credentials are returned once; only SHA-256 hashes are stored. Join keys expire after at most 30 days and default to single-use. Node credentials default to 90 days, with a per-organisation policy between 1 and 365 days. An expired node receives an actionable `401`, disappears from other nodes' peer responses, and can run `blaktaild reauth` with its old node secret plus a fresh join key. Re-authentication rotates the node token and expiry while preserving the node id, WireGuard key, DNS name, and tailnet IP. Peer polling has no cache, so revocation or expiry is visible on the next request (within 60 seconds).
 
@@ -95,6 +103,11 @@ CREATE TABLE nodes (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, name TEXT NOT NUL
   advertised_routes_json TEXT NOT NULL, approved_routes_json TEXT NOT NULL,
   credential_expires_at INTEGER NOT NULL, relay_endpoint TEXT,
   relay_endpoint_updated_at INTEGER);
+CREATE TABLE audit_events (id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
+  actor_user_id TEXT NOT NULL, actor_name TEXT NOT NULL,
+  actor_email TEXT NOT NULL, actor_role TEXT NOT NULL, action TEXT NOT NULL,
+  target_type TEXT NOT NULL, target_id TEXT, details_json TEXT NOT NULL,
+  created_at INTEGER NOT NULL);
 ```
 
 The full schema includes foreign keys, JSON checks, uniqueness constraints, and indexes.

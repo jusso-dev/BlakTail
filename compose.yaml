@@ -25,12 +25,14 @@ services:
       - postgres
     ports:
       - "8443:8443"
+      - "127.0.0.1:9701:9701"
     volumes:
       - coorddata:/data
       - ./certs:/certs:ro
     environment:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
       BLAKTAIL_BIND: 0.0.0.0:8443
+      BLAKTAIL_COORD_METRICS_BIND: 0.0.0.0:9701
       BLAKTAIL_DATABASE: /data/blaktail-coord.sqlite3
       BLAKTAIL_TLS_CERT: /certs/coord.crt
       BLAKTAIL_TLS_KEY: /certs/coord.key
@@ -46,9 +48,11 @@ services:
     restart: unless-stopped
     ports:
       - "3478:3478/udp"
+      - "127.0.0.1:9702:9702"
     environment:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
       BLAKTAIL_RELAY_AUTH_SECRET: ${BLAKTAIL_RELAY_AUTH_SECRET:?set BLAKTAIL_RELAY_AUTH_SECRET in .env}
+      BLAKTAIL_RELAY_METRICS_BIND: 0.0.0.0:9702
 
   console:
     build:

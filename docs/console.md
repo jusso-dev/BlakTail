@@ -10,6 +10,7 @@ tailnet authorisation.
 - `/devices` — list and revoke nodes
 - `/join-keys` — mint join keys (owner/admin)
 - `/acls` — read and edit ACL JSON (owner/admin write)
+- `/audit` — latest actor-attributed security and administration changes
 - `/status` — coordinator health and region
 - `/settings` — account details and the locked tagline
 
@@ -17,7 +18,7 @@ tailnet authorisation.
 
 1. Operators sign in with Better Auth. Sessions live in onshore Postgres.
 2. For each coordinator call, the console revalidates the database session and loads the user's organisation membership.
-3. The console signs a short-lived (at most 60 seconds) org/user/role assertion with `BLAKTAIL_AUTH_HMAC_SECRET`; the assertion never contains the Better Auth cookie or session token.
+3. The console signs a short-lived (at most 60 seconds) org/user/role/name/email assertion with `BLAKTAIL_AUTH_HMAC_SECRET`; the assertion never contains the Better Auth cookie or session token.
 4. Rust verifies the HMAC, expiry, organisation, and role on every protected route. Missing, expired, cross-org, or forged assertions receive 401.
 
 For headless Linux enrollment, `blaktaild up` prints `/enroll?code=...`. The
@@ -29,6 +30,11 @@ can attach privileged device tags. The browser code is not the join secret.
 The Devices page also shows each node's requested subnet and exit routes. Owners
 and admins approve routes individually; members can see them but cannot change
 approval. An unchecked request is never included in peer WireGuard configuration.
+
+The Audit log is readable by every organisation member. Join-key minting, browser
+enrollment approval, route approval, ACL updates, node-key lifetime updates, and
+console revocation are written in the same SQLite transaction as the change. Raw
+join keys, node tokens, and browser device codes are never included.
 
 ## Local development
 

@@ -1,6 +1,11 @@
+mod metrics;
+
+pub use metrics::CoordMetrics;
+
 use axum::{
-    extract::{Path as UrlPath, Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    extract::{MatchedPath, Path as UrlPath, Query, Request, State},
+    http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -16,6 +21,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 use thiserror::Error;
 use tracing::info;
@@ -157,6 +163,7 @@ fn ensure_column(
 #[derive(Clone)]
 struct AppState {
     store: Store,
+    metrics: Arc<CoordMetrics>,
     region: String,
     auth_hmac_secret: Arc<[u8]>,
     relay_auth_secret: Arc<[u8]>,
@@ -198,6 +205,35 @@ pub fn app_with_relays_and_console(
     relays: Vec<String>,
     console_url: String,
 ) -> Router {
+    app_with_relays_console_and_metrics(
+        store,
+        region,
+        auth_hmac_secret,
+        relay_auth_secret,
+        relays,
+        console_url,
+        Arc::new(CoordMetrics::default()),
+    )
+}
+
+pub fn app_with_relays_console_and_metrics(
+    store: Store,
+    region: String,
+    auth_hmac_secret: impl Into<Vec<u8>>,
+    relay_auth_secret: impl Into<Vec<u8>>,
+    relays: Vec<String>,
+    console_url: String,
+    metrics: Arc<CoordMetrics>,
+) -> Router {
+    let state = AppState {
+        store,
+        metrics,
+        region,
+        auth_hmac_secret: auth_hmac_secret.into().into(),
+        relay_auth_secret: relay_auth_secret.into().into(),
+        relays: Arc::new(relays),
+        console_url: Arc::new(console_url.trim_end_matches('/').to_owned()),
+    };
     Router::new()
         .route("/health", get(health))
         .route(
@@ -224,6 +260,7 @@ pub fn app_with_relays_and_console(
         .route("/v1/orgs/:org_id/acl", put(put_acl))
         .route("/v1/orgs/:org_id/security", get(get_security_policy))
         .route("/v1/orgs/:org_id/security", put(put_security_policy))
+        .route("/v1/orgs/:org_id/audit", get(list_audit_events))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/:node_id/reauth", post(reauth_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
@@ -233,14 +270,59 @@ pub fn app_with_relays_and_console(
             put(update_relay_endpoint),
         )
         .route("/v1/nodes/:node_id", delete(revoke_node))
-        .with_state(AppState {
-            store,
-            region,
-            auth_hmac_secret: auth_hmac_secret.into().into(),
-            relay_auth_secret: relay_auth_secret.into().into(),
-            relays: Arc::new(relays),
-            console_url: Arc::new(console_url.trim_end_matches('/').to_owned()),
-        })
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            record_metrics,
+        ))
+        .with_state(state)
+}
+
+#[derive(Clone)]
+struct MetricsState {
+    store: Store,
+    metrics: Arc<CoordMetrics>,
+}
+
+pub fn metrics_app(store: Store, metrics: Arc<CoordMetrics>) -> Router {
+    Router::new()
+        .route("/metrics", get(prometheus_metrics))
+        .with_state(MetricsState { store, metrics })
+}
+
+async fn prometheus_metrics(
+    State(state): State<MetricsState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let active_nodes: i64 = state.store.0.lock().unwrap().query_row(
+        "SELECT COUNT(*) FROM nodes WHERE revoked_at IS NULL AND credential_expires_at>?1",
+        params![now()],
+        |row| row.get(0),
+    )?;
+    Ok((
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        state.metrics.render(active_nodes.max(0) as u64),
+    ))
+}
+
+async fn record_metrics(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let operation = request.extensions().get::<MatchedPath>().and_then(|path| {
+        match (request.method(), path.as_str()) {
+            (&Method::POST, "/v1/nodes/register") => Some(metrics::Operation::Register),
+            (&Method::GET, "/v1/nodes/:node_id/peers") => Some(metrics::Operation::Peers),
+            (&Method::DELETE, "/v1/nodes/:node_id")
+            | (&Method::DELETE, "/v1/orgs/:org_id/nodes/:node_id") => {
+                Some(metrics::Operation::Revoke)
+            }
+            _ => None,
+        }
+    });
+    let started = Instant::now();
+    let response = next.run(request).await;
+    if let Some(operation) = operation {
+        state
+            .metrics
+            .record(operation, response.status().as_u16(), started.elapsed());
+    }
+    response
 }
 #[derive(Debug, Error)]
 enum ApiError {
@@ -343,6 +425,7 @@ struct DeviceAuthorizationApproval {
 }
 
 struct DeviceAuthorizationApprovalRow {
+    id: String,
     device_code_hash: String,
     expires_at: i64,
     approved_at: Option<i64>,
@@ -506,15 +589,16 @@ async fn approve_device_authorization(
     let tx = db.transaction()?;
     let row: Option<DeviceAuthorizationApprovalRow> = tx
         .query_row(
-            "SELECT device_code_hash,expires_at,approved_at,org_id,user_id FROM device_authorizations WHERE user_code_hash=?1",
+            "SELECT id,device_code_hash,expires_at,approved_at,org_id,user_id FROM device_authorizations WHERE user_code_hash=?1",
             params![hash(&code)],
             |row| {
                 Ok(DeviceAuthorizationApprovalRow {
-                    device_code_hash: row.get(0)?,
-                    expires_at: row.get(1)?,
-                    approved_at: row.get(2)?,
-                    approved_org: row.get(3)?,
-                    approved_user: row.get(4)?,
+                    id: row.get(0)?,
+                    device_code_hash: row.get(1)?,
+                    expires_at: row.get(2)?,
+                    approved_at: row.get(3)?,
+                    approved_org: row.get(4)?,
+                    approved_user: row.get(5)?,
                 })
             },
         )
@@ -572,6 +656,29 @@ async fn approve_device_authorization(
             "device authorization was already approved".into(),
         ));
     }
+    append_audit(
+        &tx,
+        org_id,
+        &session,
+        "join_key.minted",
+        "join_key",
+        Some(&join_key_id.to_string()),
+        &serde_json::json!({
+            "expires_at": row.expires_at,
+            "single_use": true,
+            "source": "browser_enrollment",
+            "tags": tags,
+        }),
+    )?;
+    append_audit(
+        &tx,
+        org_id,
+        &session,
+        "device_authorization.approved",
+        "device_authorization",
+        Some(&row.id),
+        &serde_json::json!({"join_key_id": join_key_id}),
+    )?;
     tx.commit()?;
     info!(%org_id, user_id = %session.user_id, "device authorization approved");
     Ok(Json(DeviceAuthorizationApproval {
@@ -695,10 +802,27 @@ async fn mint_join_key(
     let id = Uuid::new_v4();
     let expires_at = now() + input.expires_in_seconds;
     let tags = canonical_tags(input.tags);
-    let changed=s.store.0.lock().unwrap().execute("INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT ?1,id,?2,?3,?4,?5,?6,?7,?8 FROM orgs WHERE id=?9",params![id.to_string(),hash(&key),expires_at,input.single_use,now(),session.user_id,session.role.as_str(),serde_json::to_string(&tags).unwrap(),org_id.to_string()])?;
+    let mut db = s.store.0.lock().unwrap();
+    let tx = db.transaction()?;
+    let changed=tx.execute("INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT ?1,id,?2,?3,?4,?5,?6,?7,?8 FROM orgs WHERE id=?9",params![id.to_string(),hash(&key),expires_at,input.single_use,now(),session.user_id,session.role.as_str(),serde_json::to_string(&tags).unwrap(),org_id.to_string()])?;
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    append_audit(
+        &tx,
+        org_id,
+        &session,
+        "join_key.minted",
+        "join_key",
+        Some(&id.to_string()),
+        &serde_json::json!({
+            "expires_at": expires_at,
+            "single_use": input.single_use,
+            "source": "console",
+            "tags": tags,
+        }),
+    )?;
+    tx.commit()?;
     Ok((
         StatusCode::CREATED,
         Json(JoinKeyResponse {
@@ -1014,6 +1138,15 @@ async fn approve_node_routes(
             node_id.to_string(),
             org_id.to_string(),
         ],
+    )?;
+    append_audit(
+        &tx,
+        org_id,
+        &session,
+        "node.routes_updated",
+        "node",
+        Some(&node_id.to_string()),
+        &serde_json::json!({"approved_routes": approved}),
     )?;
     tx.commit()?;
     info!(%node_id, %org_id, routes = approved.len(), "node routes approved");
@@ -1494,13 +1627,25 @@ async fn admin_revoke_node(
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
-    let changed = s.store.0.lock().unwrap().execute(
+    let mut db = s.store.0.lock().unwrap();
+    let tx = db.transaction()?;
+    let changed = tx.execute(
         "UPDATE nodes SET revoked_at=?1 WHERE id=?2 AND org_id=?3 AND revoked_at IS NULL",
         params![now(), node_id.to_string(), org_id.to_string()],
     )?;
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    append_audit(
+        &tx,
+        org_id,
+        &session,
+        "node.revoked",
+        "node",
+        Some(&node_id.to_string()),
+        &serde_json::json!({}),
+    )?;
+    tx.commit()?;
     info!(%node_id, %org_id, "node revoked by console");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1538,13 +1683,28 @@ async fn put_acl(
     let acl: Acl = serde_json::from_value(value.clone())
         .map_err(|e| ApiError::BadRequest(format!("invalid ACL: {e}")))?;
     acl.validate()?;
-    let changed = s.store.0.lock().unwrap().execute(
+    let mut db = s.store.0.lock().unwrap();
+    let tx = db.transaction()?;
+    let changed = tx.execute(
         "UPDATE orgs SET acl_json=?1 WHERE id=?2",
         params![value.to_string(), org_id.to_string()],
     )?;
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    append_audit(
+        &tx,
+        org_id,
+        &session,
+        "acl.updated",
+        "acl",
+        Some(&org_id.to_string()),
+        &serde_json::json!({
+            "rule_count": acl.rules.len(),
+            "sha256": hash(&value.to_string()),
+        }),
+    )?;
+    tx.commit()?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1582,14 +1742,116 @@ async fn put_security_policy(
         return Err(ApiError::Forbidden);
     }
     validate_node_key_ttl(policy.node_key_ttl_seconds)?;
-    let changed = s.store.0.lock().unwrap().execute(
+    let mut db = s.store.0.lock().unwrap();
+    let tx = db.transaction()?;
+    let previous: Option<i64> = tx
+        .query_row(
+            "SELECT node_key_ttl_seconds FROM orgs WHERE id=?1",
+            params![org_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let previous = previous.ok_or(ApiError::NotFound)?;
+    let changed = tx.execute(
         "UPDATE orgs SET node_key_ttl_seconds=?1 WHERE id=?2",
         params![policy.node_key_ttl_seconds, org_id.to_string()],
     )?;
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    append_audit(
+        &tx,
+        org_id,
+        &session,
+        "security.updated",
+        "security_policy",
+        Some(&org_id.to_string()),
+        &serde_json::json!({
+            "node_key_ttl_seconds": policy.node_key_ttl_seconds,
+            "previous_node_key_ttl_seconds": previous,
+        }),
+    )?;
+    tx.commit()?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    limit: Option<u16>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct AuditEvent {
+    id: String,
+    actor_user_id: String,
+    actor_name: String,
+    actor_email: String,
+    actor_role: String,
+    action: String,
+    target_type: String,
+    target_id: Option<String>,
+    details: serde_json::Value,
+    created_at: i64,
+}
+
+async fn list_audit_events(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Query(query): Query<AuditQuery>,
+) -> Result<Json<Vec<AuditEvent>>, ApiError> {
+    console_session(&s, &headers, org_id)?;
+    let limit = i64::from(query.limit.unwrap_or(100).clamp(1, 200));
+    let db = s.store.0.lock().unwrap();
+    let mut statement = db.prepare(
+        "SELECT id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at FROM audit_events WHERE org_id=?1 ORDER BY created_at DESC,id DESC LIMIT ?2",
+    )?;
+    let events = statement
+        .query_map(params![org_id.to_string(), limit], |row| {
+            let details_json: String = row.get(8)?;
+            Ok(AuditEvent {
+                id: row.get(0)?,
+                actor_user_id: row.get(1)?,
+                actor_name: row.get(2)?,
+                actor_email: row.get(3)?,
+                actor_role: row.get(4)?,
+                action: row.get(5)?,
+                target_type: row.get(6)?,
+                target_id: row.get(7)?,
+                details: serde_json::from_str(&details_json).unwrap_or_default(),
+                created_at: row.get(9)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(events))
+}
+
+fn append_audit(
+    db: &Connection,
+    org_id: Uuid,
+    session: &Session,
+    action: &str,
+    target_type: &str,
+    target_id: Option<&str>,
+    details: &serde_json::Value,
+) -> Result<(), ApiError> {
+    db.execute(
+        "INSERT INTO audit_events(id,org_id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            Uuid::new_v4().to_string(),
+            org_id.to_string(),
+            session.user_id,
+            session.name,
+            session.email,
+            session.role.as_str(),
+            action,
+            target_type,
+            target_id,
+            details.to_string(),
+            now(),
+        ],
+    )?;
+    Ok(())
 }
 
 #[derive(Deserialize, Serialize)]
@@ -1599,6 +1861,10 @@ struct Session {
     user_id: String,
     org_id: Uuid,
     role: Role,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    email: String,
     exp: i64,
 }
 fn console_session(
@@ -1829,6 +2095,8 @@ mod tests {
                 user_id: user_id.into(),
                 org_id,
                 role,
+                name: user_id.into(),
+                email: format!("{user_id}@example.com"),
                 exp,
             })
             .unwrap(),
@@ -1897,6 +2165,158 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::CREATED);
         body(response).await
+    }
+
+    #[tokio::test]
+    async fn metrics_and_audit_cover_security_mutations() {
+        let store = Store::memory().unwrap();
+        let metrics = Arc::new(CoordMetrics::default());
+        let router = app_with_relays_console_and_metrics(
+            store.clone(),
+            "ap-southeast-2".into(),
+            TEST_SECRET,
+            TEST_RELAY_SECRET,
+            vec![],
+            DEFAULT_CONSOLE_URL.into(),
+            metrics.clone(),
+        );
+        let org: OrgResponse = body(
+            call(
+                &router,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name":"observable-org"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let node = register_test_node(
+            &router,
+            org.id,
+            &owner,
+            "router-one",
+            "router-key",
+            &["10.4.0.0/24"],
+        )
+        .await;
+
+        assert_eq!(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/nodes/{}/routes", org.id, node.id),
+                serde_json::json!({"approved_routes":["10.4.0.0/24"]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/acl", org.id),
+                serde_json::json!({"rules":[{"action":"allow","src_roles":["owner"]}]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/security", org.id),
+                serde_json::json!({"node_key_ttl_seconds":86400}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/nodes/{}", org.id, node.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let audit: Vec<AuditEvent> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/audit", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let actions = audit
+            .iter()
+            .map(|event| event.action.as_str())
+            .collect::<Vec<_>>();
+        for action in [
+            "join_key.minted",
+            "node.routes_updated",
+            "acl.updated",
+            "security.updated",
+            "node.revoked",
+        ] {
+            assert!(actions.contains(&action), "missing audit action {action}");
+        }
+        assert!(audit
+            .iter()
+            .all(|event| event.actor_email == "owner-1@example.com"));
+        assert!(!serde_json::to_string(&audit).unwrap().contains("btk_"));
+
+        let metrics_response = metrics_app(store, metrics)
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+        let metrics_text = String::from_utf8(
+            to_bytes(metrics_response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(metrics_text.contains(
+            "blaktail_coord_requests_total{operation=\"register\",result=\"success\"} 1"
+        ));
+        assert!(metrics_text
+            .contains("blaktail_coord_requests_total{operation=\"peers\",result=\"success\"} 1"));
+        assert!(metrics_text
+            .contains("blaktail_coord_requests_total{operation=\"revoke\",result=\"success\"} 1"));
+        assert!(metrics_text.contains("blaktail_coord_active_nodes 0"));
     }
 
     #[tokio::test]
@@ -2408,6 +2828,15 @@ mod tests {
             .unwrap();
         assert_eq!(role, "member");
         assert_eq!(tags, "[]");
+        let browser_audit = db
+            .prepare("SELECT action FROM audit_events WHERE org_id=?1 ORDER BY action")
+            .unwrap()
+            .query_map(params![org.id.to_string()], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(browser_audit.contains(&"device_authorization.approved".into()));
+        assert!(browser_audit.contains(&"join_key.minted".into()));
         let raw_secrets: i64 = db
             .query_row(
                 "SELECT COUNT(*) FROM device_authorizations d JOIN join_keys k ON k.key_hash=d.device_code_hash WHERE d.device_code_hash=?1 OR k.key_hash=?1",

@@ -199,6 +199,17 @@ h2 {
   font-weight: 600;
 }
 
+.table-wrap {
+  overflow-x: auto;
+}
+
+.audit-details {
+  display: block;
+  min-width: 14rem;
+  max-width: 30rem;
+  white-space: pre-wrap;
+}
+
 .badge {
   display: inline-block;
   border: 1px solid var(--line);

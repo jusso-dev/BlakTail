@@ -70,6 +70,8 @@ export async function requireConsoleContext(): Promise<ConsoleContext> {
       sub: session.user.id,
       org_id: row.coordOrgId,
       role: row.role,
+      name: session.user.name,
+      email: session.user.email,
       exp: expiresAt,
     }),
   ).toString("base64url");

@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
     time::interval,
 };
@@ -171,18 +171,70 @@ impl Metrics {
 /// Serves Prometheus text metrics over HTTP for dashboards and scrapes.
 pub async fn serve_metrics(bind: SocketAddr, metrics: std::sync::Arc<Metrics>) -> io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
+    serve_metrics_listener(listener, metrics).await
+}
+
+async fn serve_metrics_listener(
+    listener: TcpListener,
+    metrics: std::sync::Arc<Metrics>,
+) -> io::Result<()> {
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let body = metrics.render();
-        let response = format!(
-            "HTTP/1.0 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        if stream.write_all(response.as_bytes()).await.is_err() {
-            continue;
-        }
-        let _ = stream.shutdown().await;
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let mut request = Vec::with_capacity(1_024);
+            let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(2), async {
+                let mut chunk = [0_u8; 512];
+                loop {
+                    let read = stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        return Ok::<(), io::Error>(());
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(2).any(|window| window == b"\r\n") {
+                        return Ok(());
+                    }
+                    if request.len() >= 8_192 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "metrics request line is too long",
+                        ));
+                    }
+                }
+            })
+            .await
+            else {
+                return;
+            };
+            let request_line = request
+                .split(|byte| *byte == b'\r')
+                .next()
+                .unwrap_or_default();
+            let valid = matches!(
+                request_line,
+                b"GET /metrics HTTP/1.0" | b"GET /metrics HTTP/1.1"
+            );
+            let (status, content_type, body) = if valid {
+                (
+                    "200 OK",
+                    "text/plain; version=0.0.4; charset=utf-8",
+                    metrics.render(),
+                )
+            } else {
+                (
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    "not found\n".into(),
+                )
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            if stream.write_all(response.as_bytes()).await.is_ok() {
+                let _ = stream.shutdown().await;
+            }
+        });
     }
 }
 
@@ -775,6 +827,41 @@ mod tests {
         let text = metrics.render();
         assert!(text.contains("blaktail_relay_forwards_total 0"));
         assert!(text.contains("blaktail_relay_dropped_total{reason=\"oversized\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn metrics_server_only_serves_prometheus_path() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_metrics_listener(
+            listener,
+            Arc::new(Metrics::default()),
+        ));
+
+        let mut valid = tokio::net::TcpStream::connect(address).await.unwrap();
+        valid.write_all(b"GET /met").await.unwrap();
+        tokio::task::yield_now().await;
+        valid
+            .write_all(b"rics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        valid.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("blaktail_relay_bytes_total"));
+
+        let mut invalid = tokio::net::TcpStream::connect(address).await.unwrap();
+        invalid
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        invalid.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8(response)
+            .unwrap()
+            .starts_with("HTTP/1.1 404 Not Found"));
+        task.abort();
     }
 
     #[tokio::test]
