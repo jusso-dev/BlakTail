@@ -2,7 +2,9 @@
 FROM rust:1.95-slim AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY blaktail-coord ./blaktail-coord
 COPY blaktail-relay ./blaktail-relay
+COPY blaktaild ./blaktaild
 RUN cargo build --release -p blaktail-relay
 
 FROM debian:12-slim

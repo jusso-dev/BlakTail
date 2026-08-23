@@ -1,0 +1,129 @@
+name: AWS E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_aws_account:
+        description: Twelve-digit disposable AWS account ID
+        required: true
+        type: string
+      aws_region:
+        description: Fixed Australian AWS region
+        required: true
+        default: ap-southeast-2
+        type: string
+      run_id:
+        description: Unique 6-20 character lowercase alphanumeric run ID
+        required: true
+        type: string
+      expires_at:
+        description: UTC RFC3339 expiry within 24 hours
+        required: true
+        type: string
+      owner_email:
+        description: Email used for browser signup and one-shot owner linking
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-e2e-${{ inputs.expected_aws_account }}-${{ inputs.aws_region }}
+  cancel-in-progress: false
+
+jobs:
+  end-to-end:
+    name: Deploy, manually enrol, prove, destroy
+    runs-on: [self-hosted, linux]
+    environment: aws-e2e
+    timeout-minutes: 120
+    env:
+      EXPECTED_AWS_ACCOUNT: ${{ inputs.expected_aws_account }}
+      AWS_REGION: ${{ inputs.aws_region }}
+      RUN_ID: ${{ inputs.run_id }}
+      EXPIRES_AT: ${{ inputs.expires_at }}
+      OWNER_EMAIL: ${{ inputs.owner_email }}
+      DOCKER_CONTEXT: m3-max
+      TF_DIR: deploy/aws/e2e
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure short-lived AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_E2E_ROLE_ARN }}
+          role-session-name: blaktail-e2e-${{ inputs.run_id }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Set private run workspace
+        run: printf 'WORK_DIR=%s/blaktail-e2e-%s\n' "$RUNNER_TEMP" "$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Preflight
+        run: scripts/aws-e2e/preflight.sh
+
+      - name: Bootstrap private artifact stores
+        run: scripts/aws-e2e/terraform-bootstrap.sh
+
+      - name: Build and pin ARM64 control-plane images
+        run: scripts/aws-e2e/build-images.sh
+
+      - name: Build ARM64 agent packages
+        run: scripts/aws-e2e/build-agent-packages.sh
+
+      - name: Upload agent packages
+        run: scripts/aws-e2e/upload-agent-packages.sh
+
+      - name: Prepare stopped control plane and private agents
+        run: scripts/aws-e2e/terraform-apply.sh prepare
+
+      - name: Run explicit console migration
+        run: scripts/aws-e2e/migrate-console.sh
+
+      - name: Activate control plane
+        run: scripts/aws-e2e/terraform-apply.sh activate
+
+      - name: Wait for browser signup and link owner
+        run: |
+          public_url=$(terraform -chdir="$TF_DIR" output -state="$WORK_DIR/terraform.tfstate" -raw public_url)
+          printf 'Create the configured owner through the supported Better Auth sign-up API at %s, then sign out.\n' "$public_url"
+          scripts/aws-e2e/bootstrap-owner.sh
+
+      - name: Install agents through SSM
+        run: scripts/aws-e2e/ssm-install-agents.sh
+
+      - name: Start browser enrollment
+        run: scripts/aws-e2e/ssm-start-enrolment.sh
+
+      - name: Wait for manual portal approvals
+        run: |
+          echo "Run scripts/aws-e2e/ssm-show-enrolment.sh from an authenticated operator terminal."
+          echo "Sign in through public portal and approve both matching device fingerprints."
+          scripts/aws-e2e/ssm-wait-enrolment.sh
+
+      - name: Prove private agent connectivity and remote SSH
+        run: scripts/aws-e2e/prove-network.sh
+
+      - name: Collect credential-free evidence
+        run: scripts/aws-e2e/collect-evidence.sh
+
+      - name: Guarded teardown
+        if: always()
+        env:
+          CONFIRM_DESTROY: destroy-${{ inputs.run_id }}-${{ inputs.expected_aws_account }}
+        run: |
+          if [ -f "$WORK_DIR/terraform.tfstate" ]; then
+            scripts/aws-e2e/destroy.sh
+          fi
+
+      - name: Upload proof and teardown evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blaktail-aws-e2e-${{ inputs.run_id }}
+          path: ${{ runner.temp }}/blaktail-e2e-${{ inputs.run_id }}/evidence
+          if-no-files-found: warn
+          retention-days: 7
