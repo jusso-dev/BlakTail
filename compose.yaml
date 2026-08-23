@@ -1,0 +1,73 @@
+# Single-host BlakTail stack (EC2 or any Docker host).
+# Production/scalable deployment: see deploy/aws and docs/deploy-aws.md.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: blaktail
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: blaktail
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blaktail -d blaktail"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  coord:
+    build:
+      context: .
+      dockerfile: deploy/docker/coord.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "8443:8443"
+    volumes:
+      - coorddata:/data
+      - ./certs:/certs:ro
+    environment:
+      BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
+      BLAKTAIL_BIND: 0.0.0.0:8443
+      BLAKTAIL_DATABASE: /data/blaktail-coord.sqlite3
+      BLAKTAIL_TLS_CERT: /certs/coord.crt
+      BLAKTAIL_TLS_KEY: /certs/coord.key
+      BLAKTAIL_AUTH_HMAC_SECRET: ${BLAKTAIL_AUTH_HMAC_SECRET:?set BLAKTAIL_AUTH_HMAC_SECRET in .env}
+
+  relay:
+    build:
+      context: .
+      dockerfile: deploy/docker/relay.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3478:3478/udp"
+    environment:
+      BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
+
+  console:
+    build:
+      context: .
+      dockerfile: apps/console/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      coord:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      DATABASE_URL: postgres://blaktail:${POSTGRES_PASSWORD}@postgres:5432/blaktail
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      COORD_BASE_URL: https://coord:8443
+      BLAKTAIL_AUTH_HMAC_SECRET: ${BLAKTAIL_AUTH_HMAC_SECRET}
+      NODE_EXTRA_CA_CERTS: /certs/ca.crt
+
+volumes:
+  pgdata:
+  coorddata:

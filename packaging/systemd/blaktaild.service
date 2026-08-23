@@ -1,0 +1,21 @@
+[Unit]
+Description=BlakTail WireGuard node agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/blaktail/blaktaild.env
+ExecStart=/usr/local/bin/blaktaild up --coord ${BLAKTAIL_COORD} --join-key ${BLAKTAIL_JOIN_KEY} --endpoint ${BLAKTAIL_ENDPOINT}
+Restart=on-failure
+RestartSec=5
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/blaktail
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.blaktail.agent</string>
+  <key>ProgramArguments</key><array><string>/usr/local/bin/blaktaild</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>NetworkState</key><true/></dict>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>/var/log/blaktaild.log</string>
+  <key>StandardErrorPath</key><string>/var/log/blaktaild.log</string>
+</dict></plist>

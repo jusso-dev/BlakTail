@@ -1,0 +1,30 @@
+# Secret scanning for the public BlakTail tree.
+# Run on self-hosted runners only. Do not send the repo to a scanning SaaS.
+
+title = "BlakTail"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "blaktail-join-key"
+description = "BlakTail join key"
+regex = '''btk_[A-Za-z0-9_-]{40,52}'''
+keywords = ["btk_"]
+tags = ["blaktail", "join-key"]
+
+[[rules]]
+id = "blaktail-node-token"
+description = "BlakTail node token"
+regex = '''btn_[A-Za-z0-9_-]{40,52}'''
+keywords = ["btn_"]
+tags = ["blaktail", "node-token"]
+
+[allowlist]
+description = "Lockfiles and scanner policy; not live credentials"
+paths = [
+    '''(^|/)Cargo\.lock$''',
+    '''(^|/)package-lock\.json$''',
+    '''(^|/)deny\.toml$''',
+    '''(^|/)\.gitleaks\.toml$''',
+]

@@ -1,0 +1,7 @@
+.git
+target
+node_modules
+apps/console/.next
+apps/console/node_modules
+**/*.sqlite3*
+certs

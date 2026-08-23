@@ -1,0 +1,45 @@
+# macOS / Xcode
+apps/macos/.build/
+apps/macos/*.xcodeproj/
+apps/macos/*.xcworkspace/
+**/DerivedData/
+*.xcuserstate
+
+# Rust build artefacts
+/target/
+**/target/
+
+# Private keys and WireGuard material
+*.key
+*.pem
+*.psk
+*.priv
+*.private
+wg*.conf
+*.wg.conf
+**/wg/configs/
+**/keys/
+.env
+.env.*
+!*.env.example
+
+# Coordinator databases
+*.sqlite
+*.sqlite3
+*.db
+
+# Local scanner installs
+.tools/
+
+# Node / Next.js
+node_modules/
+**/node_modules/
+apps/console/.next/
+**/.next/
+npm-debug.log*
+.turbo/
+
+# Terraform local state
+.terraform/
+*.tfstate
+*.tfstate.*

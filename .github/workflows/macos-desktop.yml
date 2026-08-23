@@ -1,0 +1,30 @@
+name: macOS desktop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: structure and tagline
+    runs-on: [self-hosted]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Validate macOS desktop tree
+        run: bash scripts/validate-macos-desktop.sh
+
+  swift-test:
+    name: swift test
+    runs-on: [self-hosted, macOS]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Test
+        working-directory: apps/macos
+        run: swift test

@@ -1,0 +1,90 @@
+variable "name" {
+  description = "Resource name prefix."
+  type        = string
+  default     = "blaktail"
+}
+
+# The relay refuses non-Australian regions; keep the whole stack onshore.
+variable "region" {
+  description = "AWS region. Must be an approved Australian region (ap-southeast-2 for AWS)."
+  type        = string
+  default     = "ap-southeast-2"
+
+  validation {
+    condition     = contains(["ap-southeast-2"], var.region)
+    error_message = "BlakTail is pinned to ap-southeast-2 (Sydney)."
+  }
+}
+
+variable "coord_image" {
+  description = "blaktail-coord container image (ECR URI). Empty = build repos below and push yourself."
+  type        = string
+  default     = ""
+}
+
+variable "relay_image" {
+  description = "blaktail-relay container image (ECR URI)."
+  type        = string
+  default     = ""
+}
+
+variable "console_image" {
+  description = "Console container image (ECR URI)."
+  type        = string
+  default     = ""
+}
+
+variable "coord_tls_cert_pem" {
+  description = "Coord TLS certificate PEM (public cert chain presented to clients)."
+  type        = string
+  sensitive   = true
+}
+
+variable "coord_tls_key_pem" {
+  description = "Coord TLS private key PEM."
+  type        = string
+  sensitive   = true
+}
+
+variable "console_acm_certificate_arn" {
+  description = "ACM certificate for the console ALB HTTPS listener. Empty = HTTP-only listener (dev)."
+  type        = string
+  default     = ""
+}
+
+variable "better_auth_url" {
+  description = "Public console base URL. Empty = http://<ALB DNS name>."
+  type        = string
+  default     = ""
+}
+
+variable "db_instance_class" {
+  type    = string
+  default = "db.t4g.medium"
+}
+
+variable "db_multi_az" {
+  description = "Multi-AZ RDS for production."
+  type        = bool
+  default     = false
+}
+
+variable "console_min_tasks" {
+  type    = number
+  default = 2
+}
+
+variable "console_max_tasks" {
+  type    = number
+  default = 6
+}
+
+variable "relay_min_tasks" {
+  type    = number
+  default = 1
+}
+
+variable "relay_max_tasks" {
+  type    = number
+  default = 4
+}

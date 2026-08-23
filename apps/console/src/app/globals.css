@@ -1,0 +1,260 @@
+:root {
+  --ink: #1c1917;
+  --paper: #f4efe6;
+  --panel: #fffdf8;
+  --line: #d6cbb8;
+  --accent: #0f5c4c;
+  --accent-ink: #f4efe6;
+  --warn: #8a3b12;
+  --muted: #5c5346;
+  --focus: #1d4f91;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family:
+    "Iowan Old Style",
+    "Palatino Linotype",
+    Palatino,
+    "Book Antiqua",
+    Georgia,
+    serif;
+  background:
+    radial-gradient(circle at top left, #efe4d2 0%, transparent 40%),
+    linear-gradient(160deg, #f7f1e6 0%, #ebe1d0 48%, #f4efe6 100%);
+  color: var(--ink);
+  line-height: 1.5;
+}
+
+a {
+  color: var(--accent);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.15em;
+}
+
+a:hover {
+  color: var(--ink);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+.button {
+  appearance: none;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+  padding: 0.55rem 0.95rem;
+  border-radius: 0.35rem;
+  cursor: pointer;
+}
+
+button.secondary,
+.button.secondary {
+  background: transparent;
+  color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  border-radius: 0.35rem;
+  padding: 0.55rem 0.7rem;
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.95rem;
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 15rem 1fr;
+  min-height: 100vh;
+}
+
+.nav {
+  border-right: 1px solid var(--line);
+  background: rgba(255, 253, 248, 0.72);
+  padding: 1.5rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.brand {
+  font-size: 1.35rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.nav nav {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0.35rem 0.45rem;
+  border-radius: 0.3rem;
+}
+
+.nav a:hover,
+.nav a[aria-current="page"] {
+  background: rgba(15, 92, 76, 0.1);
+  color: var(--ink);
+}
+
+.main {
+  padding: 2rem clamp(1rem, 3vw, 2.5rem) 3rem;
+}
+
+.panel {
+  background: rgba(255, 253, 248, 0.88);
+  border: 1px solid var(--line);
+  border-radius: 0.6rem;
+  padding: 1.25rem;
+}
+
+.stack {
+  display: grid;
+  gap: 1rem;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+h1 {
+  font-size: clamp(1.6rem, 2.5vw, 2.1rem);
+  margin: 0 0 0.35rem;
+  font-weight: 700;
+}
+
+h2 {
+  font-size: 1.15rem;
+  margin: 0;
+}
+
+.lead,
+.muted,
+.tagline {
+  color: var(--muted);
+}
+
+.tagline {
+  max-width: 42rem;
+  font-size: 1.02rem;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.65rem 0.4rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.table th {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.badge {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.badge.warn {
+  border-color: color-mix(in srgb, var(--warn) 40%, var(--line));
+  color: var(--warn);
+}
+
+.error {
+  color: var(--warn);
+}
+
+.mono {
+  font-family:
+    ui-monospace, "Cascadia Code", "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  word-break: break-all;
+}
+
+.sign-in {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+}
+
+.sign-in-card {
+  width: min(28rem, 100%);
+  display: grid;
+  gap: 1.25rem;
+}
+
+.sign-in-card form {
+  display: grid;
+  gap: 0.9rem;
+}
+
+@media (max-width: 800px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  .nav {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .nav nav {
+    grid-auto-flow: column;
+    grid-auto-columns: max-content;
+    overflow-x: auto;
+  }
+}

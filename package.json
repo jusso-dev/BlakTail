@@ -1,0 +1,13 @@
+{
+  "name": "blaktail",
+  "private": true,
+  "workspaces": [
+    "apps/console"
+  ],
+  "scripts": {
+    "lint": "npm run lint -w @blaktail/console",
+    "typecheck": "npm run typecheck -w @blaktail/console",
+    "build": "npm run build -w @blaktail/console",
+    "dev:console": "npm run dev -w @blaktail/console"
+  }
+}
