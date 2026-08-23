@@ -33,7 +33,7 @@ See [docs/console.md](docs/console.md).
 Host it yourself, on one box or scaled out on AWS:
 
 - **Single EC2 / any Docker host:** `compose.yaml` quickstart in [docs/deploy-aws.md](docs/deploy-aws.md).
-- **AWS (Fargate + RDS + EFS + ALB/NLB):** Terraform in `deploy/aws`, autoscaling console and relay; coordinator pinned to one task until the SQLite store moves to Postgres. Region is pinned to Sydney (`ap-southeast-2`) — the relay refuses anything else.
+- **AWS (Fargate + RDS + EFS + ALB/NLB):** Terraform in `deploy/aws`; console autoscales, while coordinator and relay are pinned to one task until SQLite and relay registration state are sharded. Region is pinned to Sydney (`ap-southeast-2`) — the relay refuses anything else.
 - Images: `deploy/docker/*.Dockerfile` and `apps/console/Dockerfile`; push with `scripts/publish-images.sh`.
 
 ## Stack (locked for first cut)

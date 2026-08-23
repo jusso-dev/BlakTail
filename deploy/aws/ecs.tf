@@ -143,9 +143,11 @@ resource "aws_ecs_task_definition" "coord" {
       { name = "BLAKTAIL_REGION", value = var.region },
       { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
       { name = "BLAKTAIL_DATABASE", value = "/data/blaktail-coord.sqlite3" },
+      { name = "BLAKTAIL_RELAYS", value = "${aws_lb.relay.dns_name}:3478" },
     ]
     secrets = [
       { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
+      { name = "BLAKTAIL_RELAY_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_RELAY_AUTH_SECRET::" },
       { name = "BLAKTAIL_TLS_CERT_PEM", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_TLS_CERT_PEM::" },
       { name = "BLAKTAIL_TLS_KEY_PEM", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_TLS_KEY_PEM::" },
     ]
@@ -210,6 +212,9 @@ resource "aws_ecs_task_definition" "relay" {
     environment = [
       { name = "BLAKTAIL_REGION", value = var.region },
       { name = "BLAKTAIL_RELAY_BIND", value = "0.0.0.0:3478" },
+    ]
+    secrets = [
+      { name = "BLAKTAIL_RELAY_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_RELAY_AUTH_SECRET::" },
     ]
     logConfiguration = {
       logDriver = "awslogs"

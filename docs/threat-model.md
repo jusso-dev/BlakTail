@@ -16,8 +16,9 @@ BlakTail is a WireGuard mesh. Devices join an organisation tailnet, talk peer to
 | Coordinator database | Org host (`blaktail-coord.sqlite3` or `BLAKTAIL_DATABASE`) | Peer graph, public keys, endpoints, ACL, hashed join keys and tokens, MagicDNS names |
 | ACL | Coordinator DB; edited in the console | Who may reach whom. Default is deny across device tags |
 | Relay mapping | In-memory on the AU relay | Node id to UDP address, timing, and packet sizes |
+| Relay capability secret | Coordinator and relay env only | Attacker can register or hijack relay identities; it is separate from console-session signing |
 | Console sessions and `BETTER_AUTH_SECRET` | Onshore Postgres and console env | Account takeover of the operator UI |
-| `BLAKTAIL_CONSOLE_SYNC_SECRET` | Console and coordinator env | Forgery of console sessions into the coordinator |
+| `BLAKTAIL_AUTH_HMAC_SECRET` | Console and coordinator env | Forgery of console sessions into the coordinator |
 | TLS private key | Coordinator host | Intercept of control-plane HTTP |
 
 The coordinator stores hashes of join keys and node tokens, not the secrets themselves. It never stores user file contents. WireGuard payload ciphertext is not a coordinator asset.
@@ -57,7 +58,7 @@ Treat a leaked unused key as: revoke that key (or every unused key for the org),
 
 ### Curious relay operator
 
-The relay does not decrypt WireGuard payloads and must not log them. It still sees UDP 5-tuples, 16-byte node ids, packet sizes, and timing. A person with shell on the relay host can watch who talks to whom. v1 registration is not mutually authenticated: treat the relay as trusted org kit on an Australian network, not as an untrusted public DERP.
+The relay does not decrypt WireGuard payloads and must not log them. It still sees UDP 5-tuples, 16-byte node ids, packet sizes, and timing. A person with shell on the relay host can watch who talks to whom. Registration requires a coordinator-minted, expiring HMAC capability; treat the relay as trusted org kit on an Australian network, not as an anonymity service.
 
 ### Offshore SaaS mistake
 

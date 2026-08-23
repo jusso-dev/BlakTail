@@ -80,11 +80,23 @@ variable "console_max_tasks" {
 }
 
 variable "relay_min_tasks" {
-  type    = number
-  default = 1
+  description = "Relay task floor. Current in-memory registration map requires one task."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.relay_min_tasks == 1
+    error_message = "blaktail-relay currently requires exactly one task; sharded relay discovery is not implemented."
+  }
 }
 
 variable "relay_max_tasks" {
-  type    = number
-  default = 4
+  description = "Relay task ceiling. Current in-memory registration map requires one task."
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.relay_max_tasks == 1
+    error_message = "blaktail-relay currently requires exactly one task; sharded relay discovery is not implemented."
+  }
 }

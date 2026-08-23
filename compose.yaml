@@ -35,6 +35,8 @@ services:
       BLAKTAIL_TLS_CERT: /certs/coord.crt
       BLAKTAIL_TLS_KEY: /certs/coord.key
       BLAKTAIL_AUTH_HMAC_SECRET: ${BLAKTAIL_AUTH_HMAC_SECRET:?set BLAKTAIL_AUTH_HMAC_SECRET in .env}
+      BLAKTAIL_RELAY_AUTH_SECRET: ${BLAKTAIL_RELAY_AUTH_SECRET:?set BLAKTAIL_RELAY_AUTH_SECRET in .env}
+      BLAKTAIL_RELAYS: ${BLAKTAIL_RELAY_ENDPOINT:?set BLAKTAIL_RELAY_ENDPOINT in .env}
 
   relay:
     build:
@@ -45,6 +47,7 @@ services:
       - "3478:3478/udp"
     environment:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
+      BLAKTAIL_RELAY_AUTH_SECRET: ${BLAKTAIL_RELAY_AUTH_SECRET:?set BLAKTAIL_RELAY_AUTH_SECRET in .env}
 
   console:
     build:

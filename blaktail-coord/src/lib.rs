@@ -70,8 +70,26 @@ struct AppState {
     store: Store,
     region: String,
     auth_hmac_secret: Arc<[u8]>,
+    relay_auth_secret: Arc<[u8]>,
+    /// Advertised relay endpoints (host:port, UDP) handed to nodes.
+    relays: Arc<Vec<String>>,
 }
 pub fn app(store: Store, region: String, auth_hmac_secret: impl Into<Vec<u8>>) -> Router {
+    app_with_relays(
+        store,
+        region,
+        auth_hmac_secret,
+        Vec::<u8>::new(),
+        Vec::new(),
+    )
+}
+pub fn app_with_relays(
+    store: Store,
+    region: String,
+    auth_hmac_secret: impl Into<Vec<u8>>,
+    relay_auth_secret: impl Into<Vec<u8>>,
+    relays: Vec<String>,
+) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/orgs", post(create_org))
@@ -87,6 +105,8 @@ pub fn app(store: Store, region: String, auth_hmac_secret: impl Into<Vec<u8>>) -
             store,
             region,
             auth_hmac_secret: auth_hmac_secret.into().into(),
+            relay_auth_secret: relay_auth_secret.into().into(),
+            relays: Arc::new(relays),
         })
 }
 #[derive(Debug, Error)]
@@ -293,6 +313,13 @@ struct RegisterResponse {
     org_id: Uuid,
     node_token: String,
     assigned_ip: String,
+    /// Advertised relay endpoints plus a capability token for them.
+    #[serde(default)]
+    relays: Vec<String>,
+    #[serde(default)]
+    relay_token: String,
+    #[serde(default)]
+    relay_expires_at: u64,
 }
 async fn register_node(
     State(s): State<AppState>,
@@ -332,6 +359,7 @@ async fn register_node(
     }
     tx.commit()?;
     info!(node_id=%id,org_id,"node registered");
+    let (relay_token, relay_expires_at) = relay_credentials(&s, id);
     Ok((
         StatusCode::CREATED,
         Json(RegisterResponse {
@@ -339,6 +367,9 @@ async fn register_node(
             org_id: Uuid::parse_str(&org_id).unwrap(),
             node_token: token,
             assigned_ip,
+            relays: s.relays.as_ref().clone(),
+            relay_token,
+            relay_expires_at,
         }),
     ))
 }
@@ -356,6 +387,13 @@ struct Peer {
 #[derive(Serialize, Deserialize)]
 struct PeersResponse {
     peers: Vec<Peer>,
+    /// Advertised relay endpoints plus a refreshed capability token.
+    #[serde(default)]
+    relays: Vec<String>,
+    #[serde(default)]
+    relay_token: String,
+    #[serde(default)]
+    relay_expires_at: u64,
 }
 async fn list_peers(
     State(s): State<AppState>,
@@ -407,7 +445,36 @@ async fn list_peers(
         .into_iter()
         .filter_map(|(p, d)| acl.allows(&source, &d).then_some(p))
         .collect();
-    Ok(Json(PeersResponse { peers }))
+    let (relay_token, relay_expires_at) = relay_credentials(&s, node_id);
+    Ok(Json(PeersResponse {
+        peers,
+        relays: s.relays.as_ref().clone(),
+        relay_token,
+        relay_expires_at,
+    }))
+}
+/// Capability token TTL for relay registration (7 days, refreshed each poll).
+const RELAY_TOKEN_TTL_SECS: u64 = 604_800;
+fn relay_credentials(state: &AppState, node_id: Uuid) -> (String, u64) {
+    if state.relays.is_empty() || state.relay_auth_secret.is_empty() {
+        return (String::new(), 0);
+    }
+    let expires_at = (now() as u64) + RELAY_TOKEN_TTL_SECS;
+    (
+        relay_capability(&state.relay_auth_secret, node_id, expires_at),
+        expires_at,
+    )
+}
+/// HMAC-SHA256 capability binding a node id to an expiry, hex-encoded. Must
+/// match blaktail-relay's REGISTER verification (id || expiry_be, big-endian).
+fn relay_capability(secret: &[u8], node_id: Uuid, expires_at_unix: u64) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
+    mac.update(node_id.as_bytes());
+    mac.update(&expires_at_unix.to_be_bytes());
+    hex_encode(&mac.finalize().into_bytes())
+}
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 fn allocate_ip(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<String, ApiError> {
     let mut used = std::collections::HashSet::new();
@@ -709,6 +776,21 @@ mod tests {
     };
     use tower::ServiceExt;
     const TEST_SECRET: &[u8] = b"test-only-hmac-secret-at-least-32-bytes";
+    const TEST_RELAY_SECRET: &[u8] = b"separate-test-relay-secret-32-bytes";
+
+    #[test]
+    fn relay_capability_matches_relay_protocol() {
+        let node_id = Uuid::from_u128(0x00112233445566778899aabbccddeeff);
+        let expires_at = 2_000_000_000;
+        assert_eq!(
+            relay_capability(TEST_RELAY_SECRET, node_id, expires_at),
+            hex_encode(&blaktail_relay::mint_token(
+                TEST_RELAY_SECRET,
+                node_id.as_bytes(),
+                expires_at,
+            ))
+        );
+    }
     fn signed_session(org_id: Uuid, user_id: &str, role: Role, exp: i64) -> String {
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&Session {
@@ -751,7 +833,13 @@ mod tests {
     #[tokio::test]
     async fn two_nodes_and_revocation() {
         let store = Store::memory().unwrap();
-        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let r = app_with_relays(
+            store.clone(),
+            "ap-southeast-2".into(),
+            TEST_SECRET,
+            TEST_RELAY_SECRET,
+            vec!["relay.example.org:3478".into()],
+        );
         let o: OrgResponse = body(
             call(
                 &r,
@@ -781,6 +869,17 @@ mod tests {
             assert_eq!(x.status(), StatusCode::CREATED);
             ns.push(body::<RegisterResponse>(x).await)
         }
+        for node in &ns {
+            assert_eq!(node.relays, vec!["relay.example.org:3478"]);
+            assert_eq!(
+                node.relay_token,
+                relay_capability(TEST_RELAY_SECRET, node.id, node.relay_expires_at)
+            );
+            assert_ne!(
+                node.relay_token,
+                relay_capability(TEST_SECRET, node.id, node.relay_expires_at)
+            );
+        }
         for (i, n) in ns.iter().enumerate() {
             let p: PeersResponse = body(
                 call(
@@ -797,7 +896,12 @@ mod tests {
             assert_eq!(
                 p.peers[0].allowed_ips,
                 vec![format!("100.64.0.{}/32", 2 - i)]
-            )
+            );
+            assert_eq!(p.relays, vec!["relay.example.org:3478"]);
+            assert_eq!(
+                p.relay_token,
+                relay_capability(TEST_RELAY_SECRET, n.id, p.relay_expires_at)
+            );
         }
         let n = &ns[1];
         assert_eq!(

@@ -252,6 +252,7 @@ dependencies = [
  "axum",
  "axum-server",
  "base64",
+ "blaktail-relay",
  "chrono",
  "clap",
  "hmac",
@@ -273,6 +274,8 @@ name = "blaktail-relay"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "hmac",
+ "sha2",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -283,6 +286,7 @@ name = "blaktaild"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "blaktail-relay",
  "boringtun",
  "clap",
  "rand 0.8.7",

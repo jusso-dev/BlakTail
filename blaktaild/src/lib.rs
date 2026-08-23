@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, OpenOptions},
     io::{self, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -14,8 +14,12 @@ use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
+pub mod relay_client;
+pub use relay_client::RelayMesh;
+
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/blaktail";
 pub const DEFAULT_INTERFACE: &str = "blaktail0";
+pub const TUNNEL_MTU: &str = "1280";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -73,6 +77,13 @@ pub struct NodeState {
     pub assigned_ip: String,
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /// Advertised relay endpoints (host:port UDP) and our capability token.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    #[serde(default)]
+    pub relay_token: String,
+    #[serde(default)]
+    pub relay_expires_at: u64,
 }
 #[derive(Serialize)]
 struct RegisterRequest<'a> {
@@ -87,10 +98,22 @@ struct RegisterResponse {
     id: Uuid,
     node_token: String,
     assigned_ip: String,
+    #[serde(default)]
+    relays: Vec<String>,
+    #[serde(default)]
+    relay_token: String,
+    #[serde(default)]
+    relay_expires_at: u64,
 }
 #[derive(Deserialize)]
 struct PeersResponse {
     peers: Vec<Peer>,
+    #[serde(default)]
+    relays: Vec<String>,
+    #[serde(default)]
+    relay_token: String,
+    #[serde(default)]
+    relay_expires_at: u64,
 }
 
 #[derive(Clone)]
@@ -148,9 +171,12 @@ impl Coordinator {
             interface: interface.into(),
             assigned_ip: r.assigned_ip,
             peers: vec![],
+            relays: r.relays,
+            relay_token: r.relay_token,
+            relay_expires_at: r.relay_expires_at,
         })
     }
-    pub async fn peers(&self, state: &NodeState) -> Result<Vec<Peer>, Error> {
+    pub async fn peers(&self, state: &mut NodeState) -> Result<Vec<Peer>, Error> {
         let r = self
             .client
             .get(format!("{}/v1/nodes/{}/peers", self.base, state.node_id))
@@ -158,7 +184,11 @@ impl Coordinator {
             .send()
             .await?
             .error_for_status()?;
-        Ok(r.json::<PeersResponse>().await?.peers)
+        let body: PeersResponse = r.json().await?;
+        state.relays = body.relays;
+        state.relay_token = body.relay_token;
+        state.relay_expires_at = body.relay_expires_at;
+        Ok(body.peers)
     }
     pub async fn revoke(&self, state: &NodeState) -> Result<(), Error> {
         self.client
@@ -224,7 +254,30 @@ pub trait Network {
     fn setup(&mut self, interface: &str, key: &Path, address: &str) -> Result<(), Error>;
     fn apply(&mut self, interface: &str, changes: &[PeerChange]) -> Result<(), Error>;
     fn down(&mut self, interface: &str) -> Result<(), Error>;
+    /// Repoints one peer's transport endpoint without touching its other
+    /// settings. Used to switch a peer between direct and relay paths.
+    fn set_peer_endpoint(
+        &mut self,
+        interface: &str,
+        peer_key_b64: &str,
+        endpoint: &str,
+    ) -> Result<(), Error>;
+    /// Unix timestamps of the latest handshake per peer key (base64), if known.
+    fn latest_handshakes(&mut self, interface: &str) -> Result<HashMap<String, u64>, Error>;
+    /// The WireGuard listen endpoint on this machine (loopback IP + port).
+    fn listen_endpoint(&mut self, interface: &str) -> Result<Option<std::net::SocketAddr>, Error>;
 }
+/// Normalises a base64 WireGuard public key to the hex form used by the
+/// userspace UAPI, so path-management bookkeeping is uniform per platform.
+pub fn peer_key_hex(peer_key_b64: &str) -> Option<String> {
+    let raw = STANDARD.decode(peer_key_b64.trim()).ok()?;
+    Some(raw.iter().map(|b| format!("{b:02x}")).collect())
+}
+/// Decides when a peer's direct path is considered dead (no handshake within
+/// this window after first observation) and how long we keep re-trying it.
+pub const DIRECT_GRACE_SECS: u64 = 90;
+pub const HANDSHAKE_FRESH_SECS: u64 = 180;
+pub const DIRECT_RETRY_SECS: u64 = 300;
 #[derive(Default)]
 pub struct LinuxNetwork;
 impl LinuxNetwork {
@@ -266,6 +319,7 @@ impl Network for LinuxNetwork {
             .ok_or_else(|| Error::Message("private key path is not UTF-8".into()))?;
         Self::run("wg", &["set", interface, "private-key", key])?;
         Self::run("ip", &["address", "replace", address, "dev", interface])?;
+        Self::run("ip", &["link", "set", "dev", interface, "mtu", TUNNEL_MTU])?;
         Self::run("ip", &["link", "set", "up", "dev", interface])
     }
     fn apply(&mut self, interface: &str, changes: &[PeerChange]) -> Result<(), Error> {
@@ -295,6 +349,59 @@ impl Network for LinuxNetwork {
     }
     fn down(&mut self, interface: &str) -> Result<(), Error> {
         Self::run("ip", &["link", "delete", "dev", interface])
+    }
+    fn set_peer_endpoint(
+        &mut self,
+        interface: &str,
+        peer_key_b64: &str,
+        endpoint: &str,
+    ) -> Result<(), Error> {
+        Self::run(
+            "wg",
+            &[
+                "set",
+                interface,
+                "peer",
+                peer_key_b64.trim(),
+                "endpoint",
+                endpoint,
+            ],
+        )
+    }
+    fn latest_handshakes(&mut self, interface: &str) -> Result<HashMap<String, u64>, Error> {
+        let out = Command::new("wg")
+            .args(["show", interface, "latest-handshakes"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| Error::Message(format!("could not execute wg: {e}")))?;
+        if !out.status.success() {
+            return Err(Error::Message("wg latest-handshakes failed".into()));
+        }
+        let mut map = HashMap::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some((key, stamp)) = line.split_once('\t') else {
+                continue;
+            };
+            if let (Some(hex), Ok(secs)) = (peer_key_hex(key), stamp.trim().parse::<u64>()) {
+                map.insert(hex, secs);
+            }
+        }
+        Ok(map)
+    }
+    fn listen_endpoint(&mut self, interface: &str) -> Result<Option<std::net::SocketAddr>, Error> {
+        let out = Command::new("wg")
+            .args(["show", interface, "listen-port"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| Error::Message(format!("could not execute wg: {e}")))?;
+        if !out.status.success() {
+            return Ok(None);
+        }
+        let port: u16 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .map_err(|_| Error::Message("wg listen-port is not numeric".into()))?;
+        Ok((port != 0).then(|| std::net::SocketAddr::from(([127, 0, 0, 1], port))))
     }
 }
 
@@ -455,6 +562,7 @@ impl Network for MacOsNetwork {
         if name.is_empty() {
             return Err(Error::Message("utun name was not reported".into()));
         }
+        Self::run("/sbin/ifconfig", &[&name, "mtu", TUNNEL_MTU])?;
         Self::run("/sbin/ifconfig", &[&name, "inet", &ip, &ip, "up"])?;
         self.device = Some(device);
         self.name = Some(name);
@@ -487,6 +595,71 @@ impl Network for MacOsNetwork {
         self.name = None;
         self.peers.clear();
         Ok(())
+    }
+    fn set_peer_endpoint(
+        &mut self,
+        _interface: &str,
+        peer_key_b64: &str,
+        endpoint: &str,
+    ) -> Result<(), Error> {
+        let Some(hex) = peer_key_hex(peer_key_b64) else {
+            return Err(Error::Message("peer key is not valid base64".into()));
+        };
+        let request = format!("set=1\npublic_key={hex}\nendpoint={endpoint}\n\n");
+        self.uapi(&request)
+    }
+    fn latest_handshakes(&mut self, _interface: &str) -> Result<HashMap<String, u64>, Error> {
+        let mut map = HashMap::new();
+        let mut current_key: Option<String> = None;
+        for (key, value) in self.uapi_pairs()? {
+            match key.as_str() {
+                "public_key" => current_key = Some(value.trim().to_owned()),
+                "last_handshake_time_sec" => {
+                    if let Some(hex_key) = &current_key {
+                        map.insert(hex_key.clone(), value.trim().parse::<u64>().unwrap_or(0));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(map)
+    }
+    fn listen_endpoint(&mut self, _interface: &str) -> Result<Option<std::net::SocketAddr>, Error> {
+        let port = self
+            .uapi_pairs()?
+            .into_iter()
+            .find(|(k, _)| k == "listen_port")
+            .and_then(|(_, v)| v.parse::<u16>().ok());
+        match port {
+            Some(port) if port != 0 => Ok(Some(std::net::SocketAddr::from(([127, 0, 0, 1], port)))),
+            _ => Ok(None),
+        }
+    }
+}
+
+impl MacOsNetwork {
+    /// UAPI `get=1` dump as ordered key/value pairs: per-peer blocks carry
+    /// `public_key=<hex>` followed by `last_handshake_time_sec=<n>` (absent or
+    /// zero when never handshaken). Keys repeat across peer blocks.
+    fn uapi_pairs(&self) -> Result<Vec<(String, String)>, Error> {
+        let name = self.utun_name()?;
+        let path = format!("/var/run/wireguard/{name}.sock");
+        let mut stream = std::os::unix::net::UnixStream::connect(path.clone())
+            .map_err(|e| Error::Message(format!("connect WireGuard UAPI {path}: {e}")))?;
+        use std::io::{Read as _, Write as _};
+        stream
+            .write_all(b"get=1\n\n")
+            .and_then(|_| stream.shutdown(std::net::Shutdown::Write))
+            .map_err(|e| Error::Message(format!("write WireGuard UAPI {path}: {e}")))?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        if !response.contains("errno=0") {
+            return Err(Error::Message("WireGuard UAPI get failed".into()));
+        }
+        Ok(response
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, v)| (k.to_owned(), v.to_owned())))
+            .collect())
     }
 }
 pub async fn sync_once(

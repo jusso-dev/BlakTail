@@ -15,13 +15,13 @@ Everything is pinned to Sydney (`ap-southeast-2`); the relay binary refuses othe
 | --- | --- | --- | --- |
 | Console (Next.js + Better Auth) | Fargate service behind an ALB | 2–6 tasks, CPU target tracking | RDS Postgres (`db.t4g.medium`, Multi-AZ optional) |
 | Coordinator (`blaktail-coord`) | Fargate service behind a TCP pass-through NLB :443 | **1 task** (SQLite single-writer) | SQLite on EFS access point |
-| Relay (`blaktail-relay`) | Fargate service behind a UDP NLB :3478 | 1–4 tasks, CPU target tracking | Stateless |
+| Relay (`blaktail-relay`) | Fargate service behind a UDP NLB :3478 | **1 task** until relay sharding lands | In-memory registration map |
 
 Notes:
 
 * The coord NLB is pass-through, so the Rust binary keeps terminating TLS itself; its certificate and key travel through Secrets Manager into env vars and are materialised at `/tmp` by the container entrypoint.
-* The coordinator is intentionally pinned at one task until its SQLite store is ported to Postgres. The console and relay scale independently today.
-* Secrets (`DATABASE_URL`, `BETTER_AUTH_SECRET`, `BLAKTAIL_AUTH_HMAC_SECRET`, coord TLS material) live in Secrets Manager and are injected by ECS; nothing lands in the image or task definition.
+* Coordinator and relay are intentionally pinned at one task. SQLite keeps coordinator single-writer; relay registrations currently live in one process.
+* Secrets (`DATABASE_URL`, `BETTER_AUTH_SECRET`, `BLAKTAIL_AUTH_HMAC_SECRET`, dedicated `BLAKTAIL_RELAY_AUTH_SECRET`, coord TLS material) live in Secrets Manager and are injected by ECS; nothing lands in the image or task definition.
 * Logs go to CloudWatch (`/ecs/blaktail/{console,coord,relay}`, 30-day retention).
 
 ## Path 1: single EC2 host
@@ -30,10 +30,16 @@ Notes:
 # Ubuntu/Amazon Linux 2023 with Docker + Compose plugin installed
 git clone https://github.com/jusso-dev/BlakTail && cd BlakTail
 scripts/dev-certs.sh                      # throwaway local CA + coord cert
-cat > .env <<'EOF'
-POSTGRES_PASSWORD=$(openssl rand -hex 24)
-BETTER_AUTH_SECRET=$(openssl rand -hex 32)
-BLAKTAIL_AUTH_HMAC_SECRET=$(openssl rand -hex 32)
+POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+BETTER_AUTH_SECRET="$(openssl rand -hex 32)"
+BLAKTAIL_AUTH_HMAC_SECRET="$(openssl rand -hex 32)"
+BLAKTAIL_RELAY_AUTH_SECRET="$(openssl rand -hex 32)"
+cat > .env <<EOF
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+BETTER_AUTH_SECRET=$BETTER_AUTH_SECRET
+BLAKTAIL_AUTH_HMAC_SECRET=$BLAKTAIL_AUTH_HMAC_SECRET
+BLAKTAIL_RELAY_AUTH_SECRET=$BLAKTAIL_RELAY_AUTH_SECRET
+BLAKTAIL_RELAY_ENDPOINT=relay.example.org.au:3478
 BETTER_AUTH_URL=https://console.example.org.au
 EOF
 docker compose up -d --build
@@ -74,5 +80,5 @@ Production additions:
 ## Scaling limits and next steps
 
 * Coordinator: SQLite is single-writer. Porting `blaktail-coord` to Postgres unlocks multi-task coord behind the existing NLB target group — tracked separately.
-* Relay: stateless; raise `relay_max_tasks` freely. Peers discover one endpoint (the NLB DNS name).
+* Relay: one task per advertised endpoint. Horizontal scale needs explicit relay sharding/discovery so communicating nodes select the same registration map.
 * Console: stateless; scale-out is bounded only by RDS capacity.

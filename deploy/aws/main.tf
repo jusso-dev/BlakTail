@@ -48,6 +48,13 @@ resource "random_password" "auth_hmac_secret" {
   special = true
 }
 
+# Separate trust domain: compromise of a relay must not permit console-session
+# forgery against the coordinator.
+resource "random_password" "relay_auth_secret" {
+  length  = 48
+  special = true
+}
+
 resource "aws_secretsmanager_secret" "console_env" {
   name                    = "${var.name}/console-env"
   recovery_window_in_days = 0
@@ -72,9 +79,10 @@ resource "aws_secretsmanager_secret" "coord_env" {
 resource "aws_secretsmanager_secret_version" "coord_env" {
   secret_id = aws_secretsmanager_secret.coord_env.id
   secret_string = jsonencode({
-    BLAKTAIL_AUTH_HMAC_SECRET = random_password.auth_hmac_secret.result
-    BLAKTAIL_TLS_CERT_PEM     = var.coord_tls_cert_pem
-    BLAKTAIL_TLS_KEY_PEM      = var.coord_tls_key_pem
+    BLAKTAIL_AUTH_HMAC_SECRET  = random_password.auth_hmac_secret.result
+    BLAKTAIL_RELAY_AUTH_SECRET = random_password.relay_auth_secret.result
+    BLAKTAIL_TLS_CERT_PEM      = var.coord_tls_cert_pem
+    BLAKTAIL_TLS_KEY_PEM       = var.coord_tls_key_pem
   })
 }
 
