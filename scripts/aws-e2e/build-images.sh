@@ -9,7 +9,10 @@ for command_name in aws docker git jq tar terraform; do
 done
 assert_aws_identity
 assert_stack_identity
-[ "$(cat "$STAGE_FILE" 2>/dev/null || true)" = bootstrap ] || die "bootstrap stage required"
+case "$(cat "$STAGE_FILE" 2>/dev/null || true)" in
+  bootstrap | prepare) ;;
+  *) die "bootstrap or prepare stage required" ;;
+esac
 
 docker_arch=$(docker --context "$DOCKER_CONTEXT" info --format '{{.Architecture}}')
 case "$docker_arch" in
@@ -19,6 +22,10 @@ esac
 
 repositories=$(tf_output_json ecr_repository_urls)
 registry=$(printf '%s' "$repositories" | jq -er '.console | split("/")[0]')
+build_revision=$(git rev-parse --short=12 HEAD)
+case "$build_revision" in
+  '' | *[!0-9a-f]*) die "invalid Git build revision" ;;
+esac
 aws_cli ecr get-login-password | \
   docker --context "$DOCKER_CONTEXT" login --username AWS --password-stdin "$registry" >/dev/null
 
@@ -38,7 +45,7 @@ build_one() {
   repository_url=$(printf '%s' "$repositories" | jq -er --arg key "$build_name" '.[$key]') || \
     die "missing ECR repository output: $build_name"
   repository_name=${repository_url#*/}
-  build_tag=e2e-$RUN_ID
+  build_tag=e2e-$RUN_ID-$build_revision
   docker --context "$DOCKER_CONTEXT" buildx build \
     --platform linux/arm64 --provenance=false --sbom=false --push \
     --file "$build_context/$build_dockerfile" \
