@@ -5,7 +5,7 @@ on:
   pull_request:
 
 concurrency:
-  group: blaktail-self-hosted
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
