@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check:
+  rust:
     name: fmt, clippy, test
     runs-on: [self-hosted]
     steps:
@@ -24,3 +24,33 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  console:
+    name: lint, typecheck, build
+    runs-on: [self-hosted]
+    defaults:
+      run:
+        working-directory: apps/console
+    env:
+      DATABASE_URL: postgres://blaktail:blaktail@127.0.0.1:5432/blaktail
+      BETTER_AUTH_SECRET: ci-better-auth-secret-at-least-32-chars
+      BETTER_AUTH_URL: http://localhost:3000
+      COORD_BASE_URL: https://coord.example.internal
+      BLAKTAIL_CONSOLE_SYNC_SECRET: ci-console-sync-secret
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install
+        run: npm ci
+        working-directory: .
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build

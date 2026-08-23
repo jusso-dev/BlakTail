@@ -89,8 +89,11 @@ pub fn app(store: Store, region: String) -> Router {
         .route("/health", get(health))
         .route("/v1/orgs", post(create_org))
         .route("/v1/orgs/:org_id/join-keys", post(mint_join_key))
+        .route("/v1/orgs/:org_id/nodes", get(list_nodes))
+        .route("/v1/orgs/:org_id/nodes/:node_id", delete(admin_revoke_node))
         .route("/v1/orgs/:org_id/acl", get(get_acl))
         .route("/v1/orgs/:org_id/acl", put(put_acl))
+        .route("/v1/console/sessions", post(import_console_session))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
         .route("/v1/nodes/:node_id", delete(revoke_node))
@@ -444,6 +447,135 @@ async fn revoke_node(
     }
     info!(%node_id,"node revoked");
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize, Deserialize)]
+struct NodeRow {
+    id: Uuid,
+    name: String,
+    wg_public_key: String,
+    endpoint: Option<String>,
+    allowed_ips: Vec<String>,
+    dns_name: String,
+    user_id: String,
+    user_role: String,
+    tags: Vec<DeviceTag>,
+    created_at: i64,
+    revoked: bool,
+}
+
+async fn list_nodes(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<NodeRow>>, ApiError> {
+    console_session(&s.store, &headers, org_id)?;
+    let db = s.store.0.lock().unwrap();
+    let mut query = db.prepare(
+        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,revoked_at IS NOT NULL FROM nodes WHERE org_id=?1 ORDER BY name",
+    )?;
+    let rows = query
+        .query_map(params![org_id.to_string()], |r| {
+            let created_raw: String = r.get(9)?;
+            Ok(NodeRow {
+                id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap(),
+                name: r.get(1)?,
+                wg_public_key: r.get(2)?,
+                endpoint: r.get(3)?,
+                allowed_ips: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
+                dns_name: r.get(5)?,
+                user_id: r.get(6)?,
+                user_role: r.get(7)?,
+                tags: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
+                created_at: created_raw.parse::<i64>().unwrap_or(0),
+                revoked: r.get(10)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(rows))
+}
+
+async fn admin_revoke_node(
+    State(s): State<AppState>,
+    UrlPath((org_id, node_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let session = console_session(&s.store, &headers, org_id)?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    let changed = s.store.0.lock().unwrap().execute(
+        "UPDATE nodes SET revoked_at=?1 WHERE id=?2 AND org_id=?3 AND revoked_at IS NULL",
+        params![now(), node_id.to_string(), org_id.to_string()],
+    )?;
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    info!(%node_id, %org_id, "node revoked by console");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct ImportSession {
+    token: String,
+    org_id: Uuid,
+    user_id: String,
+    role: Role,
+    expires_at: i64,
+}
+
+async fn import_console_session(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ImportSession>,
+) -> Result<StatusCode, ApiError> {
+    require_console_sync_secret(&headers)?;
+    if input.token.is_empty() || input.user_id.trim().is_empty() {
+        return Err(ApiError::BadRequest(
+            "token and user_id must not be empty".into(),
+        ));
+    }
+    if input.expires_at <= now() {
+        return Err(ApiError::BadRequest("expires_at must be in the future".into()));
+    }
+    let exists: bool = s
+        .store
+        .0
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT 1 FROM orgs WHERE id=?1",
+            params![input.org_id.to_string()],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !exists {
+        return Err(ApiError::NotFound);
+    }
+    s.store.put_session(
+        &input.token,
+        input.org_id,
+        input.user_id.trim(),
+        input.role,
+        input.expires_at,
+    )?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn require_console_sync_secret(headers: &HeaderMap) -> Result<(), ApiError> {
+    let expected = std::env::var("BLAKTAIL_CONSOLE_SYNC_SECRET").unwrap_or_default();
+    if expected.is_empty() {
+        return Err(ApiError::Unauthorized);
+    }
+    let provided = headers
+        .get("x-blaktail-console-secret")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided.is_empty() || provided.as_bytes() != expected.as_bytes() {
+        return Err(ApiError::Unauthorized);
+    }
+    Ok(())
 }
 async fn get_acl(
     State(s): State<AppState>,
@@ -890,6 +1022,102 @@ mod tests {
         )
         .await;
         assert!(peers.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn console_can_list_and_revoke_nodes() {
+        let store = Store::memory().unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into());
+        let o: OrgResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name": "console-org"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        store
+            .put_session("owner-session", o.id, "owner-1", Role::Owner, now() + 60)
+            .unwrap();
+        let key: JoinKeyResponse = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", o.id),
+                serde_json::json!({}),
+                Some("owner-session"),
+            )
+            .await,
+        )
+        .await;
+        let node: RegisterResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/nodes/register",
+                serde_json::json!({
+                    "join_key": key.key,
+                    "name": "laptop",
+                    "wg_public_key": "wg-laptop"
+                }),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let listed: Vec<NodeRow> = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", o.id),
+                serde_json::Value::Null,
+                Some("owner-session"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "laptop");
+        assert!(!listed[0].revoked);
+        assert_eq!(
+            call(
+                &r,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/nodes/{}", o.id, node.id),
+                serde_json::Value::Null,
+                Some("owner-session"),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let after: Vec<NodeRow> = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", o.id),
+                serde_json::Value::Null,
+                Some("owner-session"),
+            )
+            .await,
+        )
+        .await;
+        assert!(after[0].revoked);
+        assert_eq!(
+            call(
+                &r,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/nodes/{}", o.id, node.id),
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[test]

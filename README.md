@@ -23,6 +23,11 @@ https://github.com/jusso-dev/BlakTail
 - Not a clone of Tailscale's trademark or UI assets
 - No Go or Zig
 
+## Console
+
+Operator UI lives in `apps/console` (Next.js 16.3, Better Auth, Drizzle, onshore Postgres).
+See [docs/console.md](docs/console.md).
+
 ## Stack (locked for first cut)
 
 - Rust workspace: `blaktaild` (node agent), `blaktail-coord`, `blaktail-relay`

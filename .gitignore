@@ -15,3 +15,11 @@ wg*.conf
 .env
 .env.*
 !*.env.example
+
+# Node / Next.js
+node_modules/
+**/node_modules/
+apps/console/.next/
+**/.next/
+npm-debug.log*
+.turbo/
