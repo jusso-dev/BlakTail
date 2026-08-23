@@ -9,9 +9,9 @@ https://github.com/jusso-dev/BlakTail
 ## What v1 does
 
 - Org tailnet: approve devices, issue join keys, revoke a node
-- WireGuard tunnels between nodes (kernel or userspace)
+- WireGuard tunnels between nodes (Linux kernel WG, userspace Rust elsewhere)
 - Coordination server the org runs (Sydney or another AU region they pick)
-- Optional AU relay when NAT blocks a direct path (DERP-style)
+- Optional AU relay when NAT blocks a direct path (DERP-style, Rust)
 - MagicDNS-style names: `laptop.org.blaktail`
 - ACLs: who can reach which tags (office, ranger, store)
 - Linux first, then Windows and macOS. Android later
@@ -22,11 +22,13 @@ https://github.com/jusso-dev/BlakTail
 - No closed-source agent
 - Not a file sync tool (that is BlakSync)
 - Not a clone of Tailscale's trademark or UI assets
+- No Go or Zig in v1
 
 ## Stack (locked for first cut)
 
-- WireGuard (kernel on Linux, userspace elsewhere)
-- Go control plane. Headscale is the reference, not a silent rebrand. Vendor or speak its API, keep BlakTail as the product name and policy layer
+- Rust (edition 2021), one workspace: `blaktaild` (node), `blaktail-coord` (control plane), `blaktail-relay`
+- WireGuard: kernel module on Linux, `boringtun` or equivalent userspace where needed
+- Headscale and Tailscale are references only. Do not vendor Go. Speak the ideas, write Rust.
 - Self-hosted CI: `runs-on: [self-hosted]`
 - Apache-2.0
 
