@@ -36,6 +36,10 @@ pub struct Peer {
     pub wg_public_key: String,
     pub endpoint: Option<String>,
     pub allowed_ips: Vec<String>,
+    #[serde(default)]
+    pub dns_name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerChange {
@@ -330,6 +334,8 @@ mod tests {
             wg_public_key: key.into(),
             endpoint: endpoint.map(str::to_owned),
             allowed_ips: vec!["100.64.0.1/32".into()],
+            dns_name: format!("{key}.tail.blaktail"),
+            tags: vec![],
         }
     }
     #[test]
