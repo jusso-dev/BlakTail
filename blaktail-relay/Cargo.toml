@@ -1,0 +1,11 @@
+[package]
+name = "blaktail-relay"
+description = "BlakTail relay (stub)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "blaktail-relay"
+path = "src/main.rs"

@@ -1,0 +1,11 @@
+[package]
+name = "blaktaild"
+description = "BlakTail node agent (stub)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "blaktaild"
+path = "src/main.rs"
