@@ -26,6 +26,26 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Validate rollout scripts
+        run: >-
+          sh -n scripts/package-agent.sh scripts/install-agent.sh
+          scripts/agent-checksums.sh scripts/two-vm-test.sh
+
+      - name: Build and inspect Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes rpm
+          cargo build --locked -p blaktaild
+          dist="${RUNNER_TEMP}/blaktail-agent-packages"
+          scripts/package-agent.sh deb target/debug/blaktaild "${dist}"
+          scripts/package-agent.sh rpm target/debug/blaktaild "${dist}"
+          scripts/agent-checksums.sh "${dist}"
+          (cd "${dist}" && sha256sum --check SHA256SUMS)
+          dpkg-deb --info "${dist}/blaktaild-x86_64-unknown-linux-gnu.deb"
+          dpkg-deb --contents "${dist}/blaktaild-x86_64-unknown-linux-gnu.deb" | grep '/usr/local/bin/blaktaild'
+          rpm --query --package --info "${dist}/blaktaild-x86_64-unknown-linux-gnu.rpm"
+          rpm --query --package --list "${dist}/blaktaild-x86_64-unknown-linux-gnu.rpm" | grep '^/usr/local/bin/blaktaild$'
+
   console:
     name: lint, typecheck, build
     runs-on: ubuntu-latest

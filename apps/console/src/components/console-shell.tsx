@@ -42,6 +42,9 @@ export function ConsoleShell({
           <div>
             {ctx.name} · {roleLabel(ctx.role)}
           </div>
+          <div>
+            <Link href="/privacy">Privacy and data handling</Link>
+          </div>
         </div>
       </aside>
       <main className="main">{children}</main>

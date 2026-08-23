@@ -28,6 +28,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 const DEFAULT_NODE_KEY_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_NODE_KEY_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_NODE_KEY_TTL_SECS: i64 = 365 * 24 * 60 * 60;
@@ -37,65 +38,137 @@ const MAX_PENDING_DEVICE_AUTHS: i64 = 1_000;
 const DEFAULT_CONSOLE_URL: &str = "https://console.invalid";
 #[derive(Clone)]
 pub struct Store(Arc<Mutex<Connection>>);
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error(
+        "database schema version {found} is newer than this coordinator supports ({supported}); upgrade blaktail-coord"
+    )]
+    UnsupportedSchema { found: i64, supported: i64 },
+    #[error("invalid coordinator migration plan: expected version {expected}, found {found}")]
+    InvalidMigrationPlan { expected: i64, found: i64 },
+    #[error(transparent)]
+    Database(#[from] rusqlite::Error),
+}
+
+struct Migration {
+    version: i64,
+    name: &'static str,
+    apply: fn(&Connection) -> Result<(), rusqlite::Error>,
+}
+
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "consolidated SQLite baseline",
+    apply: migrate_to_v1,
+}];
+
 impl Store {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, rusqlite::Error> {
-        let db = Connection::open(path)?;
-        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
-        db.execute_batch(SCHEMA)?;
-        // `CREATE TABLE IF NOT EXISTS` does not evolve databases created by an
-        // earlier release. Keep the v1 SQLite schema forward-compatible.
-        ensure_column(&db, "join_keys", "user_id", "TEXT NOT NULL DEFAULT ''")?;
-        ensure_column(
-            &db,
-            "join_keys",
-            "user_role",
-            "TEXT NOT NULL DEFAULT 'owner'",
-        )?;
-        ensure_column(&db, "join_keys", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
-        ensure_column(&db, "nodes", "user_id", "TEXT NOT NULL DEFAULT ''")?;
-        ensure_column(&db, "nodes", "user_role", "TEXT NOT NULL DEFAULT 'owner'")?;
-        ensure_column(&db, "nodes", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
-        ensure_column(&db, "nodes", "dns_name", "TEXT NOT NULL DEFAULT ''")?;
-        ensure_column(
-            &db,
-            "nodes",
-            "advertised_routes_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        ensure_column(
-            &db,
-            "nodes",
-            "approved_routes_json",
-            "TEXT NOT NULL DEFAULT '[]'",
-        )?;
-        ensure_column(&db, "nodes", "relay_endpoint", "TEXT")?;
-        ensure_column(&db, "nodes", "relay_endpoint_updated_at", "INTEGER")?;
-        ensure_column(
-            &db,
-            "orgs",
-            "node_key_ttl_seconds",
-            "INTEGER NOT NULL DEFAULT 7776000",
-        )?;
-        ensure_column(
-            &db,
-            "nodes",
-            "credential_expires_at",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        db.execute(
-            "UPDATE nodes SET credential_expires_at=CAST(created_at AS INTEGER)+(SELECT node_key_ttl_seconds FROM orgs WHERE orgs.id=nodes.org_id) WHERE credential_expires_at=0",
-            [],
-        )?;
-        normalise_dns_names(&db)?;
-        backfill_ipv6_addresses(&db)?;
-        db.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS nodes_dns_name_org_idx ON nodes(org_id,dns_name) WHERE dns_name<>''",
-        )?;
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let mut db = Connection::open(path)?;
+        db.execute_batch("PRAGMA foreign_keys=ON;")?;
+        apply_migrations(&mut db)?;
+        db.execute_batch("PRAGMA journal_mode=WAL;")?;
         Ok(Self(Arc::new(Mutex::new(db))))
     }
-    pub fn memory() -> Result<Self, rusqlite::Error> {
+    pub fn memory() -> Result<Self, StoreError> {
         Self::open(":memory:")
     }
+}
+
+fn apply_migrations(db: &mut Connection) -> Result<(), StoreError> {
+    let found = db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+    if found > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+
+    let mut applied = found;
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > found)
+    {
+        let expected = applied + 1;
+        if migration.version != expected {
+            return Err(StoreError::InvalidMigrationPlan {
+                expected,
+                found: migration.version,
+            });
+        }
+        let tx = db.transaction()?;
+        (migration.apply)(&tx)?;
+        tx.pragma_update(None, "user_version", migration.version)?;
+        tx.commit()?;
+        info!(
+            version = migration.version,
+            name = migration.name,
+            "coordinator database migration applied"
+        );
+        applied = migration.version;
+    }
+    if applied != CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidMigrationPlan {
+            expected: CURRENT_SCHEMA_VERSION,
+            found: applied,
+        });
+    }
+    Ok(())
+}
+
+fn migrate_to_v1(db: &Connection) -> Result<(), rusqlite::Error> {
+    db.execute_batch(SCHEMA)?;
+    // Version zero includes every pre-runner database. These guarded additions
+    // consolidate that historical schema into the version-one baseline.
+    ensure_column(db, "join_keys", "user_id", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        db,
+        "join_keys",
+        "user_role",
+        "TEXT NOT NULL DEFAULT 'owner'",
+    )?;
+    ensure_column(db, "join_keys", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(db, "nodes", "user_id", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(db, "nodes", "user_role", "TEXT NOT NULL DEFAULT 'owner'")?;
+    ensure_column(db, "nodes", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(db, "nodes", "dns_name", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        db,
+        "nodes",
+        "advertised_routes_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        db,
+        "nodes",
+        "approved_routes_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(db, "nodes", "relay_endpoint", "TEXT")?;
+    ensure_column(db, "nodes", "relay_endpoint_updated_at", "INTEGER")?;
+    ensure_column(
+        db,
+        "orgs",
+        "node_key_ttl_seconds",
+        "INTEGER NOT NULL DEFAULT 7776000",
+    )?;
+    ensure_column(
+        db,
+        "nodes",
+        "credential_expires_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    db.execute(
+        "UPDATE nodes SET credential_expires_at=CAST(created_at AS INTEGER)+(SELECT node_key_ttl_seconds FROM orgs WHERE orgs.id=nodes.org_id) WHERE credential_expires_at=0",
+        [],
+    )?;
+    normalise_dns_names(db)?;
+    backfill_ipv6_addresses(db)?;
+    db.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS nodes_dns_name_org_idx ON nodes(org_id,dns_name) WHERE dns_name<>''",
+    )?;
+    Ok(())
 }
 
 fn normalise_dns_names(db: &Connection) -> Result<(), rusqlite::Error> {
@@ -3806,7 +3879,74 @@ mod tests {
         assert_eq!(dns_names.len(), 2);
         assert!(dns_names.iter().all(|name| !name.is_empty()));
         assert_ne!(dns_names[0], dns_names[1]);
+        let version = store
+            .0
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
         drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        let node_count: i64 = reopened
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(node_count, 2);
+        drop(reopened);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fresh_database_records_schema_version() {
+        let store = Store::memory().unwrap();
+        let db = store.0.lock().unwrap();
+        let version = db
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap();
+        let audit_table: String = db
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(audit_table, "audit_events");
+    }
+
+    #[test]
+    fn newer_database_schema_is_rejected_without_mutation() {
+        let path = std::env::temp_dir().join(format!(
+            "blaktail-future-migration-{}.sqlite3",
+            Uuid::new_v4()
+        ));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+                .unwrap();
+        }
+        let result = Store::open(&path);
+        assert!(matches!(
+            result,
+            Err(StoreError::UnsupportedSchema {
+                found,
+                supported
+            }) if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION
+        ));
+        let db = Connection::open(&path).unwrap();
+        let table_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+        drop(db);
         std::fs::remove_file(path).unwrap();
     }
 }

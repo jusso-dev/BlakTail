@@ -78,6 +78,11 @@ Production additions:
 * ACM certificate for the console: `-var="console_acm_certificate_arn=arn:aws:acm:..."` plus a Route53 alias; then set `-var="better_auth_url=https://your-domain"`.
 * Replace the default VPC with a dedicated VPC, private subnets, and NAT gateways.
 * Coordinate certificate: a publicly trusted cert (e.g. Let's Encrypt DNS-01 for your coord hostname) works best; agents must trust whatever chain coord presents.
+* Complete [privacy.md](privacy.md) with the operating organisation's real contact,
+  locations, retention, subprocessors, and rights-request process. Confirm `/privacy`
+  is reachable without signing in before publishing the console URL.
+* Run the pinned published-package [two-node drill](two-node-drill.md). A successful
+  image push or health check alone does not prove enrollment or tunnel traffic.
 
 ## Scaling limits and next steps
 

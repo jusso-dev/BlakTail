@@ -28,3 +28,14 @@ jobs:
       - name: Test
         working-directory: apps/macos
         run: swift test
+
+      - name: Build and inspect unsigned agent package
+        run: |
+          cargo build --locked --release -p blaktaild
+          dist="${RUNNER_TEMP}/blaktail-agent-package"
+          package="$(scripts/package-agent.sh pkg target/release/blaktaild "${dist}")"
+          scripts/agent-checksums.sh "${dist}"
+          (cd "${dist}" && shasum -a 256 -c SHA256SUMS)
+          payload="$(pkgutil --payload-files "${package}")"
+          grep -Fqx './usr/local/bin/blaktaild' <<<"${payload}"
+          grep -Fqx './Library/LaunchDaemons/com.blaktail.agent.plist' <<<"${payload}"

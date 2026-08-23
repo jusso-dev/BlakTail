@@ -7,6 +7,7 @@ tailnet authorisation.
 ## Pages
 
 - `/sign-in` — email and password; shows the locked product tagline
+- `/privacy` — public software data-handling and retention statement
 - `/devices` — list and revoke nodes
 - `/join-keys` — mint join keys (owner/admin)
 - `/acls` — read and edit ACL JSON (owner/admin write)
@@ -56,3 +57,8 @@ npm run build
 ```
 
 Do not pull fonts or analytics from offshore CDNs.
+
+Before public hosting, complete the operator-specific requirements in
+[privacy.md](privacy.md): legal name, contact, verified data/backup locations,
+retention, subprocessors, and request handling. The generic `/privacy` page does not
+invent those deployment-specific facts.

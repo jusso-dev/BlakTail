@@ -6,6 +6,11 @@
 
 A Mac build is checked on GitHub's hosted macOS runner (`macos-latest`). For local builds, use macOS 13 or later:
 
+No agent release is published yet. After a tagged release, use the signed,
+notarised `.pkg` and checksum-verifying installer described in
+[releases.md](releases.md); the installer rejects unsigned packages. Until then,
+build from source:
+
 ```sh
 cargo build --release -p blaktaild
 sudo install -m 0755 target/release/blaktaild /usr/local/bin/blaktaild
@@ -72,3 +77,5 @@ ping6 <peer-ULA>
 
 Restart each LaunchDaemon afterward to restore the dual-stack interface. Relay
 frames remain IP-version agnostic because they carry opaque WireGuard ciphertext.
+
+See [upgrades.md](upgrades.md) before replacing the package on an enrolled node.

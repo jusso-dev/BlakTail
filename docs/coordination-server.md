@@ -22,6 +22,27 @@ cargo run -p blaktail-coord --release
 
 The default database is `blaktail-coord.sqlite3`, suitable for a single office box. SQLite WAL mode and foreign keys are enabled. PostgreSQL is not implemented in v1; it can later be added behind the store interface without changing the API. Set `RUST_LOG=info` for startup, registration, and revocation events. Startup and `GET /health` report the configured region.
 
+## SQLite migrations and rollback
+
+The coordinator records an ordered schema version in SQLite's
+`PRAGMA user_version`. A version-zero database—including databases created before
+the runner existed—is migrated to the consolidated version-one schema inside one
+transaction. Reopening the database is idempotent. A coordinator refuses to open a
+database whose version is newer than the binary supports instead of mutating it.
+
+Before upgrading, take a consistent backup while the coordinator is stopped, or use
+SQLite's online backup command:
+
+```sh
+sqlite3 /var/lib/blaktail/coord.sqlite3 \
+  ".backup '/var/lib/blaktail/coord-before-upgrade.sqlite3'"
+```
+
+Check the backup off-host, then start the new coordinator and inspect its startup
+log and `/health`. Database downgrade is unsupported; restore the snapshot before
+starting the old binary. Future schema changes must append an ordered migration and
+advance `CURRENT_SCHEMA_VERSION`, not add another unconditional startup mutation.
+
 ## HTTP API
 
 - `POST /v1/orgs` — `{ "name": "org", "acl": { "rules": [] } }`
@@ -55,8 +76,8 @@ Join and node credentials are returned once; only SHA-256 hashes are stored. Joi
 
 Each organisation gets a deterministic ULA `/64` under `fd00::/8`, derived
 from its UUID. Each node receives both its existing `100.64.0.x/32` address and
-a unique `/128` in that organisation prefix. Existing SQLite rows are backfilled
-at startup. Agents request the `ipv6=true` peer capability; responses without
+a unique `/128` in that organisation prefix. Existing version-zero SQLite rows are
+backfilled by migration. Agents request the `ipv6=true` peer capability; responses without
 that query remain IPv4-only so an upgraded coordinator does not hand IPv6 routes
 to an older agent. Registration and peer responses include `assigned_ips`, while
 the singular `assigned_ip` remains as the IPv4 compatibility field.
@@ -91,7 +112,7 @@ nonce-confirmed UDP hole punch while keeping relayed WireGuard traffic available
 
 ## SQLite schema dump
 
-The canonical executable schema is [`blaktail-coord/schema.sql`](../blaktail-coord/schema.sql). Its tables are:
+The canonical version-one schema is [`blaktail-coord/schema.sql`](../blaktail-coord/schema.sql). It is applied only through the versioned migration runner. Its tables are:
 
 ```sql
 CREATE TABLE orgs (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,

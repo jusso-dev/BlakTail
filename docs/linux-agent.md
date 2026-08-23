@@ -2,6 +2,10 @@
 
 `blaktaild` requires Linux, `iproute2`, `wireguard-tools`, `iptables`, `sysctl`, and `CAP_NET_ADMIN` (normally run as root). It first creates a kernel WireGuard interface. If the kernel does not support WireGuard, it tries the Rust `boringtun` binary as a userspace fallback.
 
+No agent release is published yet. Build from source, or after a tagged release use
+the checksum-verifying `.deb`/`.rpm` flow in [releases.md](releases.md). Packages
+install the binary and systemd unit but do not enrol or enable the service.
+
 ```sh
 sudo install -d -m 0700 /var/lib/blaktail
 sudo blaktaild up --coord https://coord.example.org \
@@ -115,4 +119,8 @@ enrolment with a fresh join key; the node keeps its tailnet IP and WireGuard key
 printf '%s' "$BLAKTAIL_JOIN_KEY" | sudo blaktaild reauth
 ```
 
-For systemd, install `packaging/systemd/blaktaild.service` and create `/etc/blaktail/blaktaild.env` (mode `0600`) containing `BLAKTAIL_COORD`, `BLAKTAIL_JOIN_KEY`, and `BLAKTAIL_ENDPOINT`. Remove the join key from that file after the first successful registration; subsequent service design should use persisted enrollment state.
+For systemd, first complete enrollment with `--exit-after-join`, then install
+`packaging/systemd/blaktaild.service` and run
+`sudo systemctl enable --now blaktaild`. The unit resumes persisted state with
+`blaktaild run`; it never puts a join key in argv or an environment file. See the
+[upgrade/version-skew policy](upgrades.md) before replacing a running agent.

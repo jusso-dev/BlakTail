@@ -288,6 +288,21 @@ h2 {
   gap: 0.9rem;
 }
 
+.policy-page {
+  width: min(52rem, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 2rem 0 4rem;
+}
+
+.policy-page section {
+  gap: 0.25rem;
+}
+
+.policy-page p,
+.policy-page ul {
+  margin-block: 0.35rem;
+}
+
 @media (max-width: 800px) {
   .shell {
     grid-template-columns: 1fr;

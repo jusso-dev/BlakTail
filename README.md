@@ -6,12 +6,31 @@ A WireGuard mesh VPN for Indigenous organisations. Same job as Tailscale: device
 
 https://github.com/jusso-dev/BlakTail
 
+## Project status
+
+BlakTail is pre-release. There are no published agent tags or install artifacts yet;
+build from source until the release checklist in
+[docs/releases.md](docs/releases.md) has been completed on clean hosts.
+
+Direct candidates, an Australian relay fallback, and nonce-confirmed UDP hole
+punching are implemented and covered by local tests. The literal two-independent-NAT
+deployment proof is still pending in
+[#24](https://github.com/jusso-dev/BlakTail/issues/24), so NAT traversal is not yet a
+production-verified claim. Dual-stack code is also awaiting its two-node IPv6-only
+deployment drill in [#32](https://github.com/jusso-dev/BlakTail/issues/32).
+
+“Onshore” is a deployment responsibility as well as a product rule. Included AWS
+infrastructure is pinned to Sydney and the relay rejects non-Australian cloud region
+identifiers; self-hosters must independently keep the console database, coordinator
+state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
+
 ## What v1 does
 
 - Org tailnet: approve devices, issue join keys, revoke a node
 - Next.js 16.3 console: Drizzle ORM, Better Auth, talks to the Rust control plane for auth and ACLs
-- WireGuard agents: macOS first, then Linux and Windows
-- Desktop apps for Mac, then Windows and Linux, that drive the local agent
+- WireGuard agents for Linux and macOS; Windows is not implemented
+- A macOS desktop app that drives the local agent; Windows and Linux desktop apps
+  are not implemented
 - Coordination server and AU relay the org runs
 - MagicDNS-style names and tag ACLs (office, ranger, store)
 - Owner-approved Linux subnet routers and opt-in IPv4 exit nodes
@@ -32,6 +51,22 @@ Operator UI lives in `apps/console` (Next.js 16.3, Better Auth, Drizzle, onshore
 See [docs/console.md](docs/console.md).
 
 Metrics, audit coverage, and alert examples: [docs/observability.md](docs/observability.md).
+The public data-handling page is `/privacy`; operator duties and current retention
+limits are in [docs/privacy.md](docs/privacy.md).
+
+## Agent install
+
+Until the first release is published, build the agent on its target operating system:
+
+```sh
+cargo build --locked --release -p blaktaild
+sudo install -m 0755 target/release/blaktaild /usr/local/bin/blaktaild
+```
+
+Release packaging and the checksum-verifying installer support macOS `.pkg`, Debian
+`.deb`, and RPM `.rpm` artifacts, but they intentionally fail when the selected
+GitHub release does not exist. See [docs/releases.md](docs/releases.md) and the
+[upgrade/version-skew policy](docs/upgrades.md).
 
 ## Deployment
 
@@ -40,6 +75,10 @@ Host it yourself, on one box or scaled out on AWS:
 - **Single EC2 / any Docker host:** `compose.yaml` quickstart in [docs/deploy-aws.md](docs/deploy-aws.md).
 - **AWS (Fargate + RDS + EFS + ALB/NLB):** Terraform in `deploy/aws`; console autoscales, while coordinator and relay are pinned to one task until SQLite and relay registration state are sharded. Region is pinned to Sydney (`ap-southeast-2`) — the relay refuses anything else.
 - Images: `deploy/docker/*.Dockerfile` and `apps/console/Dockerfile`; push with `scripts/publish-images.sh`.
+
+The Compose/AWS files are deployment inputs, not evidence of a running production
+service. Verify TLS, health, metrics, storage, backups, privacy contact/retention,
+and an enrolled node on the actual destination.
 
 ## Stack (locked for first cut)
 

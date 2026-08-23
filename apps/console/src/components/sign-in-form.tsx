@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
 import { authClient } from "@/lib/auth-client";
@@ -71,6 +72,9 @@ export function SignInForm({ nextPath = "/devices" }: { nextPath?: string }) {
             Email and password only for now. Sessions stay in your onshore
             Postgres. The Rust coordinator checks them before it changes the
             tailnet.
+          </p>
+          <p className="muted">
+            <Link href="/privacy">Privacy and data handling</Link>
           </p>
         </div>
       </div>
