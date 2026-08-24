@@ -8,12 +8,14 @@ tailnet authorisation.
 
 - `/sign-in` — email and password; shows the shared project mission
 - `/privacy` — public software data-handling and retention statement
-- `/devices` — give active nodes friendly names, approve routes, and revoke access
+- `/devices` — **All networks** inventory; every row shows its network and
+  supports owning-organisation-checked rename, route approval, and revocation
 - `/join-keys` — mint join keys (owner/admin)
 - `/acls` — read and edit ACL JSON (owner/admin write)
 - `/audit` — latest actor-attributed security and administration changes
 - `/status` — status-only coordinator readiness; region stays in protected diagnostics
-- `/settings` — account details, owner-only invitations, and the shared project mission
+- `/settings` — separate **Network accounts** and **Ways to sign in**, secure
+  login linking/unlinking, owner conflict decisions, invitations, and account details
 - `/invite?token=…` — one-use invitation acceptance; public account creation remains disabled
 
 ## First owner and invitations
@@ -70,10 +72,60 @@ npm run bootstrap -- recover-owner \
 Recovery requires the exact sole-owner email, rotates that credential, revokes all
 existing sessions, and writes an audit event.
 
+## Linked login identities and network accounts
+
+The product invariant is: **one person, many network accounts, one all-machines
+view, with no logout/login switching**. The data model intentionally keeps the
+person, immutable login identities (Better Auth users), authentication methods
+(Better Auth accounts), organisation memberships, and named network accounts as
+separate records. Linking changes only the person-to-identity graph. It never
+copies a password, OIDC access/refresh token, provider session, or MFA state.
+
+**Link another login** creates a random, hashed-at-rest, ten-minute challenge
+bound to the current person, login identity, and Better Auth session. Completion
+requires fresh authentication of the second identity. An email address,
+invitation URL, existing browser cookie, or cross-origin request is insufficient.
+Challenges are single-use; replay, expiry, an already-linked identity, a changed
+link graph, or concurrent attempts fail closed and write redacted audit events.
+Errors use a generic reauthentication/recovery response so they do not disclose
+whether an unrelated identity exists.
+
+A same-organisation role mismatch pauses linking after fresh authentication.
+An owner of that organisation must explicitly choose one of the existing roles as
+the effective linked-person role. Both membership rows and their original roles
+remain intact, and the decision is audited. A changed membership signature
+invalidates the decision instead of silently elevating access.
+
+Unlink and revocation require fresh authentication of the current identity.
+Unlink moves the other identity back to its own person without deleting its
+memberships. Revocation suspends only that identity in the live graph. The console
+refuses to remove the last active sign-in or to suspend an identity that would
+orphan a sole-owner organisation. Recovery reactivates the identity and is
+audited. Existing browser and desktop sessions resolve the graph and memberships
+again on every request, so unlink, deletion, suspension, role changes, and network
+account revocation take effect on the next request.
+
+Email changes do not relink accounts because identity ownership uses immutable
+user IDs, never matching email strings. OIDC identities are keyed by issuer and
+subject; a subject change is a new identity requiring the same explicit link or
+recovery process. Deleting an identity cascades only its own network accounts and
+memberships; unrelated linked identities remain. Provider-specific
+reauthentication must preserve provider MFA when OIDC linking is enabled.
+
+The browser `GET /api/me` and desktop `GET /api/desktop/me` responses list all
+live organisations and network accounts. The workspace cookie selects only which
+organisation-scoped ACL, key, audit, invitation, and enrolment pages are shown; it
+is not an authorisation boundary and does not replace the Better Auth session.
+Every device mutation from All networks submits the row's organisation ID and
+performs a fresh membership/role lookup before a coordinator assertion is signed.
+
+
 ## Auth flow
 
 1. Operators sign in with Better Auth. Sessions live in onshore Postgres.
-2. For each coordinator call, the console revalidates the database session and loads the user's organisation membership.
+2. On every request, the console resolves the current identity's live person graph,
+   active network accounts, and all organisation memberships. Each coordinator
+   mutation then selects the row's owning organisation and checks its live role.
 3. The console signs a fresh assertion for each coordinator request. It binds the
    actor, role, organisation, exact issuer (`blaktail-console`), audience
    (`blaktail-coord`), action where applicable, a 60-second maximum lifetime, and a

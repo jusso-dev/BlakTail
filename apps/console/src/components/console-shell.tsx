@@ -1,9 +1,10 @@
 import Link from "next/link";
+import { selectOrganisationAction } from "@/app/actions";
 import { roleLabel } from "@/lib/roles";
-import type { ConsoleContext } from "@/lib/session";
+import type { ConsoleContext, PersonSessionContext } from "@/lib/session";
 
 const links = [
-  { href: "/devices", label: "Devices" },
+  { href: "/devices", label: "All networks" },
   { href: "/join-keys", label: "Join keys" },
   { href: "/acls", label: "ACL rules" },
   { href: "/audit", label: "Audit log" },
@@ -16,16 +17,45 @@ export function ConsoleShell({
   current,
   children,
 }: {
-  ctx: ConsoleContext;
+  ctx: ConsoleContext | PersonSessionContext;
   current: (typeof links)[number]["href"];
   children: React.ReactNode;
 }) {
+  const selectedId =
+    "organisationId" in ctx
+      ? ctx.organisationId
+      : ctx.organisations[0]?.organisationId;
+  const selected = ctx.organisations.find(
+    (organisation) => organisation.organisationId === selectedId,
+  );
+
   return (
     <div className="shell">
       <aside className="nav">
         <Link className="brand" href="/devices">
           BlakTail
         </Link>
+        <form action={selectOrganisationAction} className="workspace-switcher">
+          <label htmlFor="workspace">Workspace</label>
+          <select
+            id="workspace"
+            name="organisationId"
+            defaultValue={selectedId}
+          >
+            {ctx.organisations.map((organisation) => (
+              <option
+                key={organisation.organisationId}
+                value={organisation.organisationId}
+              >
+                {organisation.organisationName}
+              </option>
+            ))}
+          </select>
+          <input type="hidden" name="returnPath" value={current} />
+          <button type="submit" className="secondary">
+            Switch
+          </button>
+        </form>
         <nav aria-label="Console">
           {links.map((link) => (
             <Link
@@ -38,9 +68,10 @@ export function ConsoleShell({
           ))}
         </nav>
         <div className="muted">
-          <div>{ctx.organisationName}</div>
+          <div>{selected?.organisationName ?? "All networks"}</div>
           <div>
-            {ctx.name} · {roleLabel(ctx.role)}
+            {ctx.name}
+            {selected ? ` · ${roleLabel(selected.role)}` : ""}
           </div>
           <div>
             <Link href="/privacy">Privacy and data handling</Link>

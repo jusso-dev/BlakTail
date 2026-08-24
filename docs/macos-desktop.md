@@ -42,9 +42,11 @@ the app menu-bar-first.
 2. **Sign in…** opens ASWebAuthenticationSession against `/desktop/auth`.
 3. After sign-in, the console redirects to `blaktail://auth/callback#token=…`. The token is
    stored in Keychain (`au.org.blaktail.desktop` / `better-auth.session_token`).
-4. **Connect** asks the console to mint a short-lived join key, then runs
-   `blaktaild up` with the key on **stdin only** (never `--join-key`, never process env that
-   persists). The LaunchDaemon is bootstrapped afterward.
+4. The desktop `/me` response lists every live accessible organisation without
+   replacing the Better Auth session. **Connect** supplies the selected organisation ID
+   when it asks the console to mint a short-lived join key, then runs `blaktaild up`
+   with the key on **stdin only** (never `--join-key`, never process env that persists).
+   The LaunchDaemon is bootstrapped afterward.
 5. Status shows connection state, device name, tailnet IP, and the last error.
 6. **Disconnect** boots out the daemon and runs `blaktaild down`.
 7. **Quit** clears transient UI state. It does not leave the join key in argv, environment,

@@ -379,9 +379,19 @@ async function createOwnerCredential(sql, input, prepared, passwordHash) {
     if (existingCredentialCount !== 0) {
       throw new Error("bootstrap owner credential state is invalid");
     }
+    const membershipId = randomUUID();
+    const networkAccountId = randomUUID();
     await transaction`
       INSERT INTO "user" (id, name, email, email_verified)
       VALUES (${prepared.userId}, ${input.ownerName}, ${input.email}, true)
+    `;
+    await transaction`
+      INSERT INTO person (id, display_name)
+      VALUES (${prepared.userId}, ${input.ownerName})
+    `;
+    await transaction`
+      INSERT INTO person_login_identity (id, person_id, user_id)
+      VALUES (${randomUUID()}, ${prepared.userId}, ${prepared.userId})
     `;
     await transaction`
       INSERT INTO organisation (id, name, coord_org_id)
@@ -389,7 +399,15 @@ async function createOwnerCredential(sql, input, prepared, passwordHash) {
     `;
     await transaction`
       INSERT INTO membership (id, organisation_id, user_id, role)
-      VALUES (${randomUUID()}, ${prepared.organisationId}, ${prepared.userId}, 'owner')
+      VALUES (${membershipId}, ${prepared.organisationId}, ${prepared.userId}, 'owner')
+    `;
+    await transaction`
+      INSERT INTO network_account (
+        id, membership_id, login_identity_user_id, organisation_id, name
+      ) VALUES (
+        ${networkAccountId}, ${membershipId}, ${prepared.userId},
+        ${prepared.organisationId}, ${input.organisationName}
+      )
     `;
     await transaction`
       INSERT INTO account (

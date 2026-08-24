@@ -1,15 +1,35 @@
 import Foundation
 
+public struct DesktopNetworkAccount: Equatable, Sendable {
+    public var id: String
+    public var name: String
+}
+
+public struct DesktopOrganisation: Equatable, Sendable, Identifiable {
+    public var id: String
+    public var name: String
+    public var role: String
+    public var networkAccounts: [DesktopNetworkAccount]
+}
+
 public struct DesktopSession: Equatable, Sendable {
     public var email: String
     public var organisationName: String
     public var role: String
+    public var organisations: [DesktopOrganisation]
     public var coordinatorURL: String?
 
-    public init(email: String, organisationName: String, role: String, coordinatorURL: String?) {
+    public init(
+        email: String,
+        organisationName: String,
+        role: String,
+        organisations: [DesktopOrganisation] = [],
+        coordinatorURL: String?
+    ) {
         self.email = email
         self.organisationName = organisationName
         self.role = role
+        self.organisations = organisations
         self.coordinatorURL = coordinatorURL
     }
 }
@@ -75,16 +95,32 @@ public struct ConsoleClient: Sendable {
             email: decoded.email,
             organisationName: decoded.organisationName,
             role: decoded.role,
+            organisations: decoded.organisations.map { organisation in
+                DesktopOrganisation(
+                    id: organisation.id,
+                    name: organisation.name,
+                    role: organisation.role,
+                    networkAccounts: organisation.networkAccounts.map { account in
+                        DesktopNetworkAccount(id: account.id, name: account.name)
+                    }
+                )
+            },
             coordinatorURL: decoded.coordinatorUrl
         )
     }
 
-    public func mintJoinKey(tags: [String] = [], expiresInSeconds: Int = 600) async throws -> JoinKeyMaterial {
-        let payload = try JSONSerialization.data(withJSONObject: [
+    public func mintJoinKey(
+        organisationId: String? = nil,
+        tags: [String] = [],
+        expiresInSeconds: Int = 600
+    ) async throws -> JoinKeyMaterial {
+        var input: [String: Any] = [
             "tags": tags,
             "expiresInSeconds": expiresInSeconds,
             "singleUse": true
-        ])
+        ]
+        if let organisationId { input["organisationId"] = organisationId }
+        let payload = try JSONSerialization.data(withJSONObject: input)
         let (data, response) = try await request(path: "/api/desktop/join-key", method: "POST", body: payload)
         guard let http = response as? HTTPURLResponse else { throw ConsoleClientError.decoding }
         if http.statusCode == 401 { throw ConsoleClientError.unauthorised }
@@ -117,7 +153,20 @@ public struct ConsoleClient: Sendable {
         var email: String
         var organisationName: String
         var role: String
+        var organisations: [Organisation]
         var coordinatorUrl: String?
+
+        struct Organisation: Decodable {
+            var id: String
+            var name: String
+            var role: String
+            var networkAccounts: [NetworkAccount]
+        }
+
+        struct NetworkAccount: Decodable {
+            var id: String
+            var name: String
+        }
     }
 
     private struct JoinKeyResponse: Decodable {

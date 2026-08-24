@@ -9,8 +9,20 @@ struct StatusWindow: View {
             Section("Account") {
                 if let session = model.session {
                     LabeledContent("Signed in as", value: session.email)
-                    LabeledContent("Organisation", value: session.organisationName)
-                    LabeledContent("Role", value: session.role)
+                    if session.organisations.isEmpty {
+                        LabeledContent("Organisation", value: session.organisationName)
+                        LabeledContent("Role", value: session.role)
+                    } else {
+                        Picker("Network", selection: $model.selectedOrganisationId) {
+                            ForEach(session.organisations) { organisation in
+                                Text("\(organisation.name) · \(organisation.role)")
+                                    .tag(organisation.id)
+                            }
+                        }
+                        Text("\(session.organisations.count) accessible organisations")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     Button("Sign out", role: .destructive, action: model.signOut)
                 } else {
                     Text("Sign in with your onshore console account to connect.")

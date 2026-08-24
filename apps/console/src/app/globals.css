@@ -336,3 +336,33 @@ h2 {
     overflow-x: auto;
   }
 }
+
+.workspace-switcher,
+.inline-form {
+  display: grid;
+  gap: 0.55rem;
+}
+
+.workspace-switcher button,
+.inline-form button {
+  justify-self: start;
+}
+
+.identity-row {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1fr) minmax(18rem, 1fr);
+  gap: 1rem;
+  align-items: start;
+  padding-block: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.identity-row:last-of-type {
+  border-bottom: 0;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}

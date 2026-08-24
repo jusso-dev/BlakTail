@@ -284,9 +284,19 @@ export async function acceptInvitation(input: {
         return { ok: false as const };
       }
       const userId = randomUUID();
+      const membershipId = randomUUID();
+      const networkAccountId = randomUUID();
       await transaction`
         INSERT INTO "user" (id, name, email, email_verified)
         VALUES (${userId}, ${name}, ${email}, true)
+      `;
+      await transaction`
+        INSERT INTO person (id, display_name)
+        VALUES (${userId}, ${name})
+      `;
+      await transaction`
+        INSERT INTO person_login_identity (id, person_id, user_id)
+        VALUES (${randomUUID()}, ${userId}, ${userId})
       `;
       await transaction`
         INSERT INTO account (
@@ -298,8 +308,17 @@ export async function acceptInvitation(input: {
       `;
       await transaction`
         INSERT INTO membership (id, organisation_id, user_id, role)
-        VALUES (${randomUUID()}, ${invitation.organisation_id},
+        VALUES (${membershipId}, ${invitation.organisation_id},
           ${userId}, ${invitation.role})
+      `;
+      await transaction`
+        INSERT INTO network_account (
+          id, membership_id, login_identity_user_id,
+          organisation_id, name
+        )
+        SELECT ${networkAccountId}, ${membershipId}, ${userId}, o.id, o.name
+        FROM organisation o
+        WHERE o.id = ${invitation.organisation_id}
       `;
       await transaction`
         UPDATE invitation SET status = 'accepted', accepted_at = now()

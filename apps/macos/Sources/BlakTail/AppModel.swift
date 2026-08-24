@@ -6,6 +6,7 @@ import SwiftUI
 final class AppModel: ObservableObject {
     @Published var preferences: Preferences
     @Published var session: DesktopSession?
+    @Published var selectedOrganisationId = ""
     @Published var connectionState: ConnectionState = .disconnected
     @Published var agentStatus: AgentStatus = .disconnected
     @Published var lastError: String?
@@ -71,6 +72,7 @@ final class AppModel: ObservableObject {
             let client = ConsoleClient(sessionToken: token, baseURL: base)
             let desktop = try await client.fetchSession()
             session = desktop
+            selectedOrganisationId = desktop.organisations.first?.id ?? ""
             if let coordinator = desktop.coordinatorURL, !coordinator.isEmpty {
                 preferences.coordinatorURL = coordinator
                 preferences.save()
@@ -86,6 +88,7 @@ final class AppModel: ObservableObject {
     func signOut() {
         try? keychain.delete()
         session = nil
+        selectedOrganisationId = ""
         lastError = nil
     }
 
@@ -107,7 +110,9 @@ final class AppModel: ObservableObject {
         var material: JoinKeyMaterial?
         do {
             let client = ConsoleClient(sessionToken: token, baseURL: base)
-            material = try await client.mintJoinKey()
+            material = try await client.mintJoinKey(
+                organisationId: selectedOrganisationId.isEmpty ? nil : selectedOrganisationId
+            )
             var join = material!
             let coordinator = join.coordinatorURL.isEmpty ? preferences.coordinatorURL : join.coordinatorURL
             preferences.coordinatorURL = coordinator
@@ -152,12 +157,14 @@ final class AppModel: ObservableObject {
         do {
             let desktop = try await ConsoleClient(sessionToken: token, baseURL: base).fetchSession()
             session = desktop
+            selectedOrganisationId = desktop.organisations.first?.id ?? ""
             if let coordinator = desktop.coordinatorURL, !coordinator.isEmpty {
                 preferences.coordinatorURL = coordinator
             }
         } catch {
             try? keychain.delete()
             session = nil
+            selectedOrganisationId = ""
         }
     }
 

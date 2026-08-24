@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import {
-  requireConsoleContextFromSession,
+  requirePersonContextFromSession,
   sessionFromBearer,
 } from "@/lib/desktop-auth";
 
@@ -10,11 +10,23 @@ export async function GET(request: Request) {
     if (!session) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
-    const ctx = await requireConsoleContextFromSession(session);
+    const ctx = await requirePersonContextFromSession(session);
+    const primary = ctx.organisations[0]!;
     return NextResponse.json({
       email: ctx.email,
-      organisationName: ctx.organisationName,
-      role: ctx.role,
+      organisationName: primary.organisationName,
+      role: primary.role,
+      organisations: ctx.organisations.map((organisation) => ({
+        id: organisation.organisationId,
+        name: organisation.organisationName,
+        role: organisation.role,
+        networkAccounts: organisation.networkAccountIds.map((id, index) => ({
+          id,
+          name:
+            organisation.networkAccountNames[index] ??
+            organisation.organisationName,
+        })),
+      })),
       coordinatorUrl: process.env.COORD_BASE_URL?.replace(/\/$/, "") ?? null,
     });
   } catch (error) {

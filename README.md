@@ -23,6 +23,11 @@ so operators have one consistent technical identity.
 
 - **Your network:** each organisation has its own private address space, device
   inventory, MagicDNS names, routes, and access rules.
+- **One live session:** one person can explicitly link independently
+  authenticated login identities and see every accessible network account in one
+  **All networks** machine view. Linking never copies provider credentials,
+  tokens, or MFA state, and reaching another network never requires
+  logout/login profile switching.
 - **Your rules:** owners and admins approve enrolment, assign tags, give devices
   friendly names, approve routes, audit changes, and revoke access.
 - **Your country:** the supplied cloud deployment is pinned to Sydney, and the
@@ -62,8 +67,9 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 ## What works today
 
 - Browser-based device enrolment without copying a join key
-- Organisation device inventory with stable technical identity and editable,
-  audited friendly names
+- One person, many explicitly linked network accounts, and one concurrent
+  all-machines inventory with a visible network name on every row
+- Stable technical device identity and editable, audited friendly names
 - Join-key enrolment for automation, tags, route approval, ACLs, and revocation
 - Next.js 16.3 console: Drizzle ORM, Better Auth, talks to the Rust control plane for auth and ACLs
 - WireGuard agents for Linux and macOS; Windows is not implemented
@@ -95,6 +101,9 @@ console host. Public Better Auth sign-up is disabled at the HTTP endpoint. After
 bootstrap locks, owners add people with one-use, organisation-bound invitations;
 lost sole-owner access requires an audited on-host recovery. See
 [First owner and invitations](docs/console.md#first-owner-and-invitations).
+Login identities can then be linked only by freshly authenticating the other
+identity. Organisation memberships, roles, ACLs, address spaces, keys, and audit
+histories remain separate.
 
 Metrics, audit coverage, and alert examples: [docs/observability.md](docs/observability.md).
 The public data-handling page is `/privacy`; operator duties and current retention

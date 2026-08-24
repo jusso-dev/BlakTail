@@ -1,7 +1,11 @@
 import "server-only";
 
 import { signCoordAssertion } from "./coord-assertion";
-import type { ConsoleContext } from "./session";
+import {
+  organisationContext,
+  type ConsoleContext,
+  type PersonSessionContext,
+} from "./session";
 
 export type DeviceTag = "office" | "ranger" | "store";
 
@@ -23,6 +27,14 @@ export type CoordNode = {
   expired: boolean;
   expires_soon: boolean;
   revoked: boolean;
+};
+
+export type NetworkNode = CoordNode & {
+  organisation_id: string;
+  organisation_name: string;
+  network_account_id: string;
+  network_account_name: string;
+  effective_role: ConsoleContext["role"];
 };
 
 export type JoinKeyResult = {
@@ -110,6 +122,26 @@ export async function listNodes(ctx: ConsoleContext): Promise<CoordNode[]> {
     throw new Error(await readError(res));
   }
   return res.json() as Promise<CoordNode[]>;
+}
+
+export async function listAllNodes(
+  person: PersonSessionContext,
+): Promise<NetworkNode[]> {
+  const groups = await Promise.all(
+    person.organisations.map(async (organisation) => {
+      const ctx = organisationContext(person, organisation.organisationId);
+      const nodes = await listNodes(ctx);
+      return nodes.map((node) => ({
+        ...node,
+        organisation_id: ctx.organisationId,
+        organisation_name: ctx.organisationName,
+        network_account_id: ctx.networkAccountId,
+        network_account_name: ctx.networkAccountName,
+        effective_role: ctx.role,
+      }));
+    }),
+  );
+  return groups.flat();
 }
 
 export async function listAuditEvents(

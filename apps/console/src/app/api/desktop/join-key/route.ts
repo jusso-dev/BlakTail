@@ -16,19 +16,22 @@ export async function POST(request: Request) {
     if (!session) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
-    const ctx = await requireConsoleContextFromSession(session);
+    const body = (await request.json().catch(() => ({}))) as {
+      organisationId?: string;
+      expiresInSeconds?: number;
+      singleUse?: boolean;
+      tags?: string[];
+    };
+    const ctx = await requireConsoleContextFromSession(
+      session,
+      body.organisationId,
+    );
     if (!canMutateTailnet(ctx.role)) {
       return NextResponse.json(
         { error: "Only owners and admins can mint join keys." },
         { status: 403 },
       );
     }
-
-    const body = (await request.json().catch(() => ({}))) as {
-      expiresInSeconds?: number;
-      singleUse?: boolean;
-      tags?: string[];
-    };
     const tags = (body.tags ?? []).map(String).filter(isDeviceTag);
     const result = await mintJoinKey(ctx, {
       expiresInSeconds: body.expiresInSeconds ?? 600,
