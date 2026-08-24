@@ -1,8 +1,8 @@
 import "server-only";
 
+import type { SQL, TransactionSQL } from "bun";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { hashPassword } from "better-auth/crypto";
-import type postgres from "postgres";
 import type { ConsoleContext } from "./session";
 import { rawSqlClient } from "./db/client";
 import { consumeRateLimit } from "./request-security";
@@ -24,6 +24,14 @@ export type PendingInvitation = {
   role: InvitationRole;
   expiresAt: Date;
   createdAt: Date;
+};
+
+type PendingInvitationRow = {
+  id: string;
+  email: string;
+  role: InvitationRole;
+  expires_at: Date | string;
+  created_at: Date | string;
 };
 
 function tokenHash(token: string): string {
@@ -50,7 +58,7 @@ function validName(value: string): string {
 }
 
 async function appendAudit(
-  sql: postgres.Sql | postgres.TransactionSql,
+  sql: SQL | TransactionSQL,
   event: {
     organisationId: string;
     actorUserId?: string;
@@ -60,7 +68,7 @@ async function appendAudit(
     result: "success" | "denied";
     targetType: string;
     targetId?: string;
-    details?: postgres.JSONValue;
+    details?: unknown;
   },
 ) {
   await sql`
@@ -71,7 +79,7 @@ async function appendAudit(
       ${randomUUID()}, ${event.organisationId}, ${event.actorUserId ?? null},
       ${event.actorEmail}, ${event.actorRole}, 'console', ${event.action},
       ${event.result}, ${event.targetType}, ${event.targetId ?? null},
-      ${sql.json(event.details ?? {})}
+      CAST(${JSON.stringify(event.details ?? {})} AS jsonb)
     )
   `;
 }
@@ -110,10 +118,17 @@ export async function createInvitation(
   await sql.begin("isolation level serializable", async (transaction) => {
     await transaction`SELECT pg_advisory_xact_lock(hashtextextended(${email}, 0))`;
     const [existingUser] = await transaction`
-      SELECT id FROM "user" WHERE lower(email) = ${email} LIMIT 1
+      SELECT u.id, m.id AS membership_id
+      FROM "user" u
+      LEFT JOIN membership m ON m.user_id = u.id
+        AND m.organisation_id = ${ctx.organisationId}
+      WHERE lower(u.email) = ${email}
+      LIMIT 1
     `;
-    if (existingUser) {
-      throw new InvitationError("That address already belongs to an account.");
+    if (existingUser?.membership_id) {
+      throw new InvitationError(
+        "That account already belongs to this workspace.",
+      );
     }
     await transaction`
       UPDATE invitation SET status = 'revoked', revoked_at = now()
@@ -163,7 +178,7 @@ export async function listPendingInvitations(
 ): Promise<PendingInvitation[]> {
   if (ctx.role !== "owner") return [];
   const sql = rawSqlClient();
-  const rows = await sql`
+  const rows = await sql<PendingInvitationRow[]>`
     SELECT id, email, role, expires_at, created_at
     FROM invitation
     WHERE organisation_id = ${ctx.organisationId}
@@ -223,20 +238,31 @@ export async function revokeInvitation(
 
 export async function acceptInvitation(input: {
   token: string;
+  email?: string;
+  name?: string;
+  password?: string;
+  authenticatedUser?: { id: string; email: string };
+}): Promise<{
   email: string;
-  name: string;
-  password: string;
-}): Promise<{ email: string; organisationId: string }> {
+  organisationId: string;
+  accountCreated: boolean;
+}> {
   const token = input.token.trim();
   if (!token.startsWith("bti_") || token.length < 40 || token.length > 128) {
     throw new InvitationError("Invitation is invalid or expired.");
   }
-  const email = normaliseEmail(input.email);
-  const name = validName(input.name);
-  if (input.password.length < 10 || input.password.length > 128) {
-    throw new InvitationError("Password must contain 10-128 characters.");
+  const authenticatedUser = input.authenticatedUser;
+  const email = normaliseEmail(authenticatedUser?.email ?? input.email ?? "");
+  let name: string | undefined;
+  let passwordHash: string | undefined;
+  if (!authenticatedUser) {
+    name = validName(input.name ?? "");
+    const password = input.password ?? "";
+    if (password.length < 10 || password.length > 128) {
+      throw new InvitationError("Password must contain 10-128 characters.");
+    }
+    passwordHash = await hashPassword(password);
   }
-  const passwordHash = await hashPassword(input.password);
   const sql = rawSqlClient();
   const outcome = await sql.begin(
     "isolation level serializable",
@@ -250,11 +276,16 @@ export async function acceptInvitation(input: {
         invitation.status !== "pending" ||
         new Date(invitation.expires_at).getTime() <= Date.now()
       ) {
-        return { ok: false as const };
+        return {
+          ok: false as const,
+          message: "Invitation is invalid or expired.",
+          status: 400,
+        };
       }
-      if (invitation.email !== email) {
+      if (invitation.email.toLowerCase() !== email) {
         await appendAudit(transaction, {
           organisationId: invitation.organisation_id,
+          actorUserId: authenticatedUser?.id,
           actorEmail: email,
           actorRole: "invitee",
           action: "invitation.accept",
@@ -263,39 +294,102 @@ export async function acceptInvitation(input: {
           targetId: invitation.id,
           details: { reason: "recipient_mismatch" },
         });
-        return { ok: false as const };
+        return {
+          ok: false as const,
+          message: authenticatedUser
+            ? "Sign in with the account named in this invitation."
+            : "Invitation is invalid or expired.",
+          status: authenticatedUser ? 403 : 400,
+        };
       }
       await transaction`SELECT pg_advisory_xact_lock(hashtextextended(${email}, 0))`;
       const [existingUser] = await transaction`
-        SELECT id FROM "user" WHERE lower(email) = ${email} LIMIT 1
+        SELECT id, email FROM "user" WHERE lower(email) = ${email} LIMIT 1
       `;
-      if (existingUser) {
+      let userId: string;
+      let accountCreated = false;
+      if (authenticatedUser) {
+        if (!existingUser || existingUser.id !== authenticatedUser.id) {
+          await appendAudit(transaction, {
+            organisationId: invitation.organisation_id,
+            actorUserId: authenticatedUser.id,
+            actorEmail: email,
+            actorRole: "invitee",
+            action: "invitation.accept",
+            result: "denied",
+            targetType: "invitation",
+            targetId: invitation.id,
+            details: { reason: "authenticated_identity_mismatch" },
+          });
+          return {
+            ok: false as const,
+            message: "Sign in with the account named in this invitation.",
+            status: 403,
+          };
+        }
+        userId = existingUser.id;
+      } else {
+        if (existingUser) {
+          await appendAudit(transaction, {
+            organisationId: invitation.organisation_id,
+            actorUserId: existingUser.id,
+            actorEmail: email,
+            actorRole: "invitee",
+            action: "invitation.accept",
+            result: "denied",
+            targetType: "invitation",
+            targetId: invitation.id,
+            details: { reason: "existing_account_requires_sign_in" },
+          });
+          return {
+            ok: false as const,
+            message: "This email already has an account. Sign in, then open the invitation again.",
+            status: 409,
+          };
+        }
+        userId = randomUUID();
+        accountCreated = true;
+        await transaction`
+          INSERT INTO "user" (id, name, email, email_verified)
+          VALUES (${userId}, ${name!}, ${email}, true)
+        `;
+        await transaction`
+          INSERT INTO account (
+            id, issuer, account_id, provider_id, user_id, password
+          ) VALUES (
+            ${randomUUID()}, 'local:credential', ${userId},
+            'credential', ${userId}, ${passwordHash!}
+          )
+        `;
+      }
+      const [existingMembership] = await transaction`
+        SELECT id FROM membership
+        WHERE organisation_id = ${invitation.organisation_id}
+          AND user_id = ${userId}
+        LIMIT 1
+      `;
+      if (existingMembership) {
+        await transaction`
+          UPDATE invitation SET status = 'revoked', revoked_at = now()
+          WHERE id = ${invitation.id} AND status = 'pending'
+        `;
         await appendAudit(transaction, {
           organisationId: invitation.organisation_id,
-          actorUserId: existingUser.id,
+          actorUserId: userId,
           actorEmail: email,
-          actorRole: "invitee",
+          actorRole: invitation.role,
           action: "invitation.accept",
           result: "denied",
           targetType: "invitation",
           targetId: invitation.id,
-          details: { reason: "existing_account_requires_operator_review" },
+          details: { reason: "membership_already_exists" },
         });
-        return { ok: false as const };
+        return {
+          ok: false as const,
+          message: "This account already has access to the workspace.",
+          status: 409,
+        };
       }
-      const userId = randomUUID();
-      await transaction`
-        INSERT INTO "user" (id, name, email, email_verified)
-        VALUES (${userId}, ${name}, ${email}, true)
-      `;
-      await transaction`
-        INSERT INTO account (
-          id, issuer, account_id, provider_id, user_id, password
-        ) VALUES (
-          ${randomUUID()}, 'local:credential', ${userId},
-          'credential', ${userId}, ${passwordHash}
-        )
-      `;
       await transaction`
         INSERT INTO membership (id, organisation_id, user_id, role)
         VALUES (${randomUUID()}, ${invitation.organisation_id},
@@ -330,9 +424,16 @@ export async function acceptInvitation(input: {
         ok: true as const,
         email,
         organisationId: invitation.organisation_id,
+        accountCreated,
       };
     },
   );
-  if (!outcome.ok) throw new InvitationError("Invitation is invalid or expired.");
-  return { email: outcome.email, organisationId: outcome.organisationId };
+  if (!outcome.ok) {
+    throw new InvitationError(outcome.message, outcome.status);
+  }
+  return {
+    email: outcome.email,
+    organisationId: outcome.organisationId,
+    accountCreated: outcome.accountCreated,
+  };
 }

@@ -5,6 +5,7 @@ import {
   sessionFromBearer,
 } from "@/lib/desktop-auth";
 import { canMutateTailnet } from "@/lib/roles";
+import { activeOrganisationIdFromRequest } from "@/lib/session";
 
 function isDeviceTag(value: string): value is DeviceTag {
   return value === "office" || value === "ranger" || value === "store";
@@ -16,7 +17,10 @@ export async function POST(request: Request) {
     if (!session) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
-    const ctx = await requireConsoleContextFromSession(session);
+    const ctx = await requireConsoleContextFromSession(
+      session,
+      activeOrganisationIdFromRequest(request),
+    );
     if (!canMutateTailnet(ctx.role)) {
       return NextResponse.json(
         { error: "Only owners and admins can mint join keys." },

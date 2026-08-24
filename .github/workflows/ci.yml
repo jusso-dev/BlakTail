@@ -13,6 +13,22 @@ jobs:
   rust:
     name: fmt, clippy, test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: blaktail
+          POSTGRES_PASSWORD: blaktail
+          POSTGRES_DB: blaktail_coord_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blaktail -d blaktail_coord_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      BLAKTAIL_COORD_TEST_DATABASE_URL: postgres://blaktail:blaktail@127.0.0.1:5432/blaktail_coord_test
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -70,9 +86,6 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
-    defaults:
-      run:
-        working-directory: apps/console
     env:
       DATABASE_URL: postgres://blaktail:blaktail@127.0.0.1:5432/blaktail
       BETTER_AUTH_SECRET: ci-better-auth-secret-at-least-32-chars
@@ -85,21 +98,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
       - name: Install
-        run: npm ci
-        working-directory: .
+        run: bun ci
 
       - name: Lint
-        run: npm run lint
+        run: bun --filter @blaktail/console lint
 
       - name: Typecheck
-        run: npm run typecheck
+        run: bun --filter @blaktail/console typecheck
+
+      - name: Migrate with Bun SQL
+        run: bun --filter @blaktail/console db:migrate
 
       - name: Bootstrap race and replay tests
-        run: npm test
+        run: bun --filter @blaktail/console test
 
       - name: Build
-        run: npm run build
+        run: bun --filter @blaktail/console build
 
       - name: Auth and invitation HTTP E2E
-        run: npm run test:auth-e2e
+        run: bun --filter @blaktail/console test:auth-e2e

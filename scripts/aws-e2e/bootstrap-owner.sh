@@ -63,14 +63,14 @@ cleanup() { rm -f -- "$token_file" "$password_file"; }
 trap cleanup EXIT HUP INT TERM
 aws s3 cp "s3://$ARTIFACT_BUCKET/$CREDENTIAL_KEY" "$password_file" --only-show-errors
 chmod 600 "$password_file"
-node scripts/bootstrap.mjs init --token-file "$token_file"
-node scripts/bootstrap.mjs claim \
+bun scripts/bootstrap.mjs init --token-file "$token_file"
+bun scripts/bootstrap.mjs claim \
   --token-file "$token_file" \
   --password-file "$password_file" \
   --email "$OWNER_EMAIL" \
   --name "$OWNER_NAME" \
   --organisation-name "$ORGANISATION_NAME"
-node scripts/bootstrap.mjs status
+bun scripts/bootstrap.mjs status
 REMOTE
 task_overrides=$(jq -cn \
   --rawfile script "$task_script_file" \

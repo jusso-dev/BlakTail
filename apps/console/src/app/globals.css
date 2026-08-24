@@ -115,6 +115,26 @@ label {
   text-decoration: none;
 }
 
+.workspace-switcher,
+.workspace-summary {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.workspace-switcher label,
+.workspace-summary span {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.workspace-switcher select {
+  min-width: 0;
+}
+
+.workspace-switcher .error {
+  font-size: 0.82rem;
+}
+
 .nav nav {
   display: grid;
   gap: 0.45rem;

@@ -46,7 +46,7 @@ printf '%s' "$coord_task_result" | jq -e '
 ' >/dev/null || die "coordinator migration task failed"
 
 overrides=$(jq -cn \
-  '{containerOverrides:[{name:"console",command:["sh","-c","blaktail-config dump-config --service console --redacted && exec ./node_modules/.bin/drizzle-kit migrate --config drizzle.config.ts"]}]}')
+  '{containerOverrides:[{name:"console",command:["sh","-c","blaktail-config dump-config --service console --redacted && exec bun scripts/migrate.mjs"]}]}')
 
 console_task_arn=$(aws_cli ecs run-task --cluster "$cluster_name" --launch-type FARGATE \
   --task-definition "$console_task_definition" --network-configuration "$network_configuration" \

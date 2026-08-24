@@ -46,7 +46,7 @@ run_console_task() {
 
 if [ "$mode" = status ]; then
   overrides=$(jq -cn \
-    '{containerOverrides:[{name:"console",command:["node","scripts/bootstrap.mjs","status"]}]}')
+    '{containerOverrides:[{name:"console",command:["bun","scripts/bootstrap.mjs","status"]}]}')
   task_arn=$(run_console_task status "$overrides")
   printf 'bootstrap status completed in task %s; inspect its redacted log stream\n' "$task_arn"
   exit 0
@@ -77,7 +77,7 @@ password_file=/tmp/blaktail-owner-recovery-password
 trap 'rm -f -- "$password_file"' EXIT HUP INT TERM
 aws s3 cp "s3://$ARTIFACT_BUCKET/$CREDENTIAL_KEY" "$password_file" --only-show-errors
 chmod 600 "$password_file"
-node scripts/bootstrap.mjs recover-owner \
+bun scripts/bootstrap.mjs recover-owner \
   --email "$OWNER_EMAIL" --password-file "$password_file"
 REMOTE
 overrides=$(jq -cn \

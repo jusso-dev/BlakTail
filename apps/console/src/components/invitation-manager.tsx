@@ -29,8 +29,8 @@ export function InvitationManager({
       <div>
         <h2>Invite organisation member</h2>
         <p className="muted">
-          Link is shown once. Send it through a trusted channel. Recipient creates
-          an account bound to this organisation and role.
+          Link is shown once. Send it through a trusted channel. New users create
+          an account; existing users add this workspace to their current login.
         </p>
       </div>
       <form

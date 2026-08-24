@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { NextResponse } from "next/server";
+import { auth } from "@/lib/auth";
 import { acceptInvitation, InvitationError } from "@/lib/invitations";
 import {
   assertSameOrigin,
@@ -6,6 +8,10 @@ import {
   requestRateLimitIdentity,
   RequestSecurityError,
 } from "@/lib/request-security";
+import {
+  ACTIVE_ORGANISATION_COOKIE,
+  activeOrganisationCookieOptions,
+} from "@/lib/session";
 
 function errorResponse(error: unknown): Response {
   if (error instanceof RequestSecurityError) {
@@ -32,16 +38,30 @@ export async function POST(request: Request): Promise<Response> {
       15 * 60,
       10,
     );
+    const session = await auth.api.getSession({ headers: request.headers });
     const result = await acceptInvitation({
       token,
       email: typeof body.email === "string" ? body.email : "",
       name: typeof body.name === "string" ? body.name : "",
       password: typeof body.password === "string" ? body.password : "",
+      authenticatedUser: session
+        ? { id: session.user.id, email: session.user.email }
+        : undefined,
     });
-    return Response.json(
-      { status: "accepted", email: result.email },
-      { status: 201 },
+    const response = NextResponse.json(
+      {
+        status: "accepted",
+        email: result.email,
+        accountCreated: result.accountCreated,
+      },
+      { status: result.accountCreated ? 201 : 200 },
     );
+    response.cookies.set(
+      ACTIVE_ORGANISATION_COOKIE,
+      result.organisationId,
+      activeOrganisationCookieOptions,
+    );
+    return response;
   } catch (error) {
     return errorResponse(error);
   }

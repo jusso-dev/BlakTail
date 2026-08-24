@@ -4,11 +4,24 @@ import type { AuditEvent } from "./coord";
 import { rawSqlClient } from "./db/client";
 import type { ConsoleContext } from "./session";
 
+type ConsoleAuditRow = {
+  id: string;
+  actor_user_id: string | null;
+  actor_email: string;
+  actor_role: string;
+  action: string;
+  result: string;
+  target_type: string;
+  target_id: string | null;
+  details: Record<string, unknown>;
+  created_at: Date | string;
+};
+
 export async function listConsoleAuditEvents(
   ctx: ConsoleContext,
 ): Promise<AuditEvent[]> {
   const sql = rawSqlClient();
-  const rows = await sql`
+  const rows = await sql<ConsoleAuditRow[]>`
     SELECT id, actor_user_id, actor_email, actor_role, action,
       result, target_type, target_id, details, created_at
     FROM console_audit_event

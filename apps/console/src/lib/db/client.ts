@@ -1,5 +1,5 @@
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
+import { SQL } from "bun";
+import { drizzle } from "drizzle-orm/bun-sql";
 import * as schema from "./schema";
 
 function databaseUrl(): string {
@@ -13,13 +13,13 @@ function databaseUrl(): string {
 }
 
 const globalForDb = globalThis as unknown as {
-  blaktailSql?: ReturnType<typeof postgres>;
-  blaktailRawSql?: ReturnType<typeof postgres>;
+  blaktailSql?: SQL;
+  blaktailRawSql?: SQL;
 };
 
 function sqlClient() {
   if (!globalForDb.blaktailSql) {
-    globalForDb.blaktailSql = postgres(databaseUrl(), {
+    globalForDb.blaktailSql = new SQL(databaseUrl(), {
       max: 10,
       prepare: false,
     });
@@ -29,7 +29,7 @@ function sqlClient() {
 
 export function rawSqlClient() {
   if (!globalForDb.blaktailRawSql) {
-    globalForDb.blaktailRawSql = postgres(databaseUrl(), {
+    globalForDb.blaktailRawSql = new SQL(databaseUrl(), {
       max: 5,
       prepare: false,
     });

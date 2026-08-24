@@ -1,10 +1,11 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
+import { SQL } from "bun";
 import assert from "node:assert/strict";
+import { hashPassword } from "better-auth/crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import postgres from "postgres";
 import {
   claimBootstrap,
   initialiseBootstrap,
@@ -19,6 +20,15 @@ const owner = {
   name: "HTTP Test Owner",
   password: "owner-http-test-password",
   organisation: "BlakPath HTTP Test",
+};
+const secondOwner = {
+  id: "second-owner-http-e2e",
+  email: "second-owner.http@example.test",
+  name: "Second HTTP Test Owner",
+  password: "second-owner-http-test-password",
+  organisationId: "second-org-http-e2e",
+  organisation: "Ranger Operations",
+  coordOrgId: "22222222-2222-4222-8222-222222222222",
 };
 const migrations = [
   "0000_init.sql",
@@ -110,10 +120,9 @@ async function stopChild(child) {
   if (child.exitCode === null) child.kill("SIGKILL");
 }
 
-const sql = postgres(databaseUrl, {
+const sql = new SQL(databaseUrl, {
   max: 10,
   prepare: false,
-  onnotice: () => {},
 });
 const coordinator = createServer(async (request, response) => {
   let raw = "";
@@ -122,6 +131,38 @@ const coordinator = createServer(async (request, response) => {
     const body = JSON.parse(raw);
     response.writeHead(202, { "content-type": "application/json" });
     response.end(JSON.stringify({ id: body.id, name: body.name }));
+    return;
+  }
+  const nodesMatch = request.url?.match(/^\/v1\/orgs\/([^/]+)\/nodes$/u);
+  if (request.method === "GET" && nodesMatch) {
+    const coordOrgId = nodesMatch[1];
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify([
+        {
+          id: `node-${coordOrgId}`,
+          name:
+            coordOrgId === secondOwner.coordOrgId
+              ? "ranger-field-laptop"
+              : "community-office-server",
+          display_name: null,
+          wg_public_key: "test-public-key",
+          endpoint: null,
+          allowed_ips: ["100.64.0.1/32"],
+          advertised_routes: [],
+          approved_routes: [],
+          dns_name: "test.blaktail.internal",
+          user_id: "test-user",
+          user_role: "member",
+          tags: [],
+          created_at: 1_700_000_000,
+          credential_expires_at: 2_000_000_000,
+          expired: false,
+          expires_soon: false,
+          revoked: false,
+        },
+      ]),
+    );
     return;
   }
   const match = request.url?.match(
@@ -265,6 +306,141 @@ try {
   });
   assert.equal(memberInvite.response.status, 403);
 
+  const secondOwnerPasswordHash = await hashPassword(secondOwner.password);
+  await sql.begin(async (transaction) => {
+    await transaction`
+      INSERT INTO "user" (id, name, email, email_verified)
+      VALUES (${secondOwner.id}, ${secondOwner.name}, ${secondOwner.email}, true)
+    `;
+    await transaction`
+      INSERT INTO account (
+        id, issuer, account_id, provider_id, user_id, password
+      ) VALUES (
+        'second-owner-account-http-e2e', 'local:credential', ${secondOwner.id},
+        'credential', ${secondOwner.id}, ${secondOwnerPasswordHash}
+      )
+    `;
+    await transaction`
+      INSERT INTO organisation (id, name, coord_org_id)
+      VALUES (
+        ${secondOwner.organisationId}, ${secondOwner.organisation},
+        ${secondOwner.coordOrgId}
+      )
+    `;
+    await transaction`
+      INSERT INTO membership (id, organisation_id, user_id, role)
+      VALUES (
+        'second-owner-membership-http-e2e', ${secondOwner.organisationId},
+        ${secondOwner.id}, 'owner'
+      )
+    `;
+  });
+  const secondOwnerSignIn = await jsonRequest(
+    baseUrl,
+    "/api/auth/sign-in/email",
+    {
+      body: {
+        email: secondOwner.email,
+        password: secondOwner.password,
+      },
+    },
+  );
+  assert.equal(secondOwnerSignIn.response.status, 200);
+  const secondOwnerCookie = cookies(secondOwnerSignIn.response);
+  const existingAccountInvitation = await jsonRequest(
+    baseUrl,
+    "/api/invitations",
+    {
+      cookie: secondOwnerCookie,
+      body: { email: "member@example.test", role: "admin" },
+    },
+  );
+  assert.equal(
+    existingAccountInvitation.response.status,
+    201,
+    JSON.stringify(existingAccountInvitation.body),
+  );
+  const existingAccountToken = new URL(
+    existingAccountInvitation.body.url,
+  ).searchParams.get("token");
+  const unauthenticatedExistingAcceptance = await jsonRequest(
+    baseUrl,
+    "/api/invitations/accept",
+    {
+      body: {
+        token: existingAccountToken,
+        email: "member@example.test",
+        name: "Ignored Existing User",
+        password: "ignored-existing-password",
+      },
+    },
+  );
+  assert.equal(unauthenticatedExistingAcceptance.response.status, 409);
+  const existingAccountAcceptance = await jsonRequest(
+    baseUrl,
+    "/api/invitations/accept",
+    {
+      cookie: memberCookie,
+      body: { token: existingAccountToken },
+    },
+  );
+  assert.equal(
+    existingAccountAcceptance.response.status,
+    200,
+    JSON.stringify(existingAccountAcceptance.body),
+  );
+  assert.equal(existingAccountAcceptance.body.accountCreated, false);
+  const [membershipCount] = await sql`
+    SELECT count(*)::int AS count FROM membership m
+    JOIN "user" u ON u.id = m.user_id
+    WHERE u.email = 'member@example.test'
+  `;
+  assert.equal(membershipCount.count, 2);
+
+  const allNetworks = await fetch(`${baseUrl}/devices`, {
+    headers: { cookie: memberCookie },
+  });
+  const allNetworksHtml = await allNetworks.text();
+  assert.equal(allNetworks.status, 200, allNetworksHtml.slice(-2000));
+  for (const visibleValue of [
+    owner.organisation,
+    secondOwner.organisation,
+    "community-office-server",
+    "ranger-field-laptop",
+  ]) {
+    assert.ok(
+      allNetworksHtml.includes(visibleValue),
+      `all-networks inventory missing ${visibleValue}`,
+    );
+  }
+
+  const switched = await jsonRequest(
+    baseUrl,
+    "/api/organisations/active",
+    {
+      cookie: memberCookie,
+      body: { organisationId: secondOwner.organisationId },
+    },
+  );
+  assert.equal(switched.response.status, 204);
+  const switchedCookie = `${memberCookie}; ${cookies(switched.response)}`;
+  const switchedSettings = await fetch(`${baseUrl}/settings`, {
+    headers: { cookie: switchedCookie },
+  });
+  const switchedSettingsHtml = await switchedSettings.text();
+  assert.equal(switchedSettings.status, 200);
+  assert.ok(switchedSettingsHtml.includes(secondOwner.organisation));
+  assert.ok(switchedSettingsHtml.includes("Accessible workspaces:"));
+  const forbiddenSwitch = await jsonRequest(
+    baseUrl,
+    "/api/organisations/active",
+    {
+      cookie: memberCookie,
+      body: { organisationId: "not-a-membership" },
+    },
+  );
+  assert.equal(forbiddenSwitch.response.status, 403);
+
   const revokeCandidate = await jsonRequest(baseUrl, "/api/invitations", {
     cookie: ownerCookie,
     body: { email: "revoked@example.test", role: "admin" },
@@ -359,6 +535,9 @@ try {
       csrf: "enforced",
       invitationReplay: "rejected",
       invitationRevocation: "enforced",
+      existingAccountJoin: "same-session",
+      allNetworksInventory: "two-workspaces",
+      workspaceIsolation: "enforced",
       memberAuthorisation: "denied",
       sessionExpiry: "enforced",
       invitationRateLimit: "enforced",
@@ -369,5 +548,5 @@ try {
 } finally {
   if (consoleProcess) await stopChild(consoleProcess);
   await close(coordinator);
-  await sql.end({ timeout: 5 });
+  await sql.close({ timeout: 5 });
 }

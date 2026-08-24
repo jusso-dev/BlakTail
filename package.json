@@ -1,13 +1,14 @@
 {
   "name": "blaktail",
   "private": true,
+  "packageManager": "bun@1.4.0",
   "workspaces": [
     "apps/console"
   ],
   "scripts": {
-    "lint": "npm run lint -w @blaktail/console",
-    "typecheck": "npm run typecheck -w @blaktail/console",
-    "build": "npm run build -w @blaktail/console",
-    "dev:console": "npm run dev -w @blaktail/console"
+    "lint": "bun --filter @blaktail/console lint",
+    "typecheck": "bun --filter @blaktail/console typecheck",
+    "build": "bun --filter @blaktail/console build",
+    "dev:console": "bun --filter @blaktail/console dev"
   }
 }

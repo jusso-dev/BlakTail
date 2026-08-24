@@ -11,7 +11,11 @@ import {
   updateNodeFriendlyName,
   type DeviceTag,
 } from "@/lib/coord";
-import { canMutateTailnet, requireConsoleContext } from "@/lib/session";
+import {
+  canMutateTailnet,
+  requireConsoleContext,
+  requireConsoleContextForOrganisation,
+} from "@/lib/session";
 import {
   createInvitation,
   InvitationError,
@@ -25,6 +29,12 @@ export type ActionResult<T = void> =
 
 function isDeviceTag(value: string): value is DeviceTag {
   return value === "office" || value === "ranger" || value === "store";
+}
+
+async function deviceActionContext(formData: FormData) {
+  return requireConsoleContextForOrganisation(
+    String(formData.get("organisationId") ?? ""),
+  );
 }
 
 export async function mintJoinKeyAction(
@@ -86,7 +96,7 @@ export async function revokeDeviceAction(
   formData: FormData,
 ): Promise<ActionResult> {
   try {
-    const ctx = await requireConsoleContext();
+    const ctx = await deviceActionContext(formData);
     if (!canMutateTailnet(ctx.role)) {
       return { ok: false, error: "Only owners and admins can revoke devices." };
     }
@@ -109,7 +119,7 @@ export async function updateDeviceFriendlyNameAction(
   formData: FormData,
 ): Promise<ActionResult<{ friendlyName: string | null }>> {
   try {
-    const ctx = await requireConsoleContext();
+    const ctx = await deviceActionContext(formData);
     if (!canMutateTailnet(ctx.role)) {
       return { ok: false, error: "Only owners and admins can rename devices." };
     }
@@ -142,7 +152,7 @@ export async function approveNodeRoutesAction(
   formData: FormData,
 ): Promise<ActionResult> {
   try {
-    const ctx = await requireConsoleContext();
+    const ctx = await deviceActionContext(formData);
     if (!canMutateTailnet(ctx.role)) {
       return {
         ok: false,

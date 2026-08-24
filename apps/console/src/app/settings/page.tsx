@@ -29,6 +29,9 @@ export default async function SettingsPage() {
             <strong>Organisation:</strong> {ctx.organisationName}
           </p>
           <p>
+            <strong>Accessible workspaces:</strong> {ctx.organisations.length}
+          </p>
+          <p>
             <strong>Coordinator org id:</strong>{" "}
             <span className="mono">{ctx.coordOrgId}</span>
           </p>
@@ -36,7 +39,8 @@ export default async function SettingsPage() {
           <p className="muted">
             No analytics leave the building. Fonts are local. Auth lives in
             onshore Postgres. Tailnet authority stays with the Rust
-            coordinator.
+            coordinator. Switching workspaces never signs you out of another
+            one.
           </p>
         </div>
         {ctx.role === "owner" ? (

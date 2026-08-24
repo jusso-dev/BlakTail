@@ -9,12 +9,16 @@ import {
 } from "@/app/actions";
 import type { CoordNode } from "@/lib/coord";
 
+export type InventoryNode = CoordNode & {
+  organisationId: string;
+  organisationName: string;
+  canMutate: boolean;
+};
+
 export function DeviceActions({
   nodes,
-  canMutate,
 }: {
-  nodes: CoordNode[];
-  canMutate: boolean;
+  nodes: InventoryNode[];
 }) {
   const router = useRouter();
   const [message, setMessage] = useState<{
@@ -38,6 +42,7 @@ export function DeviceActions({
         <thead>
           <tr>
             <th>Device</th>
+            <th>Network</th>
             <th>DNS</th>
             <th>Addresses</th>
             <th>Advertised routes</th>
@@ -49,9 +54,9 @@ export function DeviceActions({
         </thead>
         <tbody>
           {nodes.map((node) => (
-            <tr key={node.id}>
+            <tr key={`${node.organisationId}:${node.id}`}>
               <td>
-                {canMutate && !node.revoked ? (
+                {node.canMutate && !node.revoked ? (
                   <form
                     className="device-name-editor"
                     onSubmit={(event) => {
@@ -74,6 +79,11 @@ export function DeviceActions({
                     }}
                   >
                     <input type="hidden" name="nodeId" value={node.id} />
+                    <input
+                      type="hidden"
+                      name="organisationId"
+                      value={node.organisationId}
+                    />
                     <label>
                       <span>Friendly name</span>
                       <input
@@ -108,6 +118,9 @@ export function DeviceActions({
                   </div>
                 )}
               </td>
+              <td>
+                <strong>{node.organisationName}</strong>
+              </td>
               <td className="mono">{node.dns_name || "—"}</td>
               <td className="mono">{node.allowed_ips.join(", ") || "—"}</td>
               <td>
@@ -133,6 +146,11 @@ export function DeviceActions({
                     }}
                   >
                     <input type="hidden" name="nodeId" value={node.id} />
+                    <input
+                      type="hidden"
+                      name="organisationId"
+                      value={node.organisationId}
+                    />
                     {node.advertised_routes.map((route) => (
                       <label key={route} className="route-option mono">
                         <input
@@ -141,7 +159,7 @@ export function DeviceActions({
                           value={route}
                           defaultChecked={node.approved_routes.includes(route)}
                           disabled={
-                            !canMutate ||
+                            !node.canMutate ||
                             pending ||
                             node.revoked ||
                             (node.expired &&
@@ -151,7 +169,7 @@ export function DeviceActions({
                         {route === "0.0.0.0/0" ? "Exit node" : route}
                       </label>
                     ))}
-                    {canMutate &&
+                    {node.canMutate &&
                     !node.revoked &&
                     (!node.expired || node.approved_routes.length > 0) ? (
                       <button
@@ -197,7 +215,7 @@ export function DeviceActions({
                 )}
               </td>
               <td>
-                {canMutate && !node.revoked ? (
+                {node.canMutate && !node.revoked ? (
                   <button
                     type="button"
                     className="secondary"
@@ -205,6 +223,7 @@ export function DeviceActions({
                     onClick={() => {
                       const formData = new FormData();
                       formData.set("nodeId", node.id);
+                      formData.set("organisationId", node.organisationId);
                       setMessage(null);
                       startTransition(async () => {
                         const result = await revokeDeviceAction(formData);

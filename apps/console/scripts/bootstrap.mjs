@@ -1,5 +1,6 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 
+import { SQL } from "bun";
 import {
   createHash,
   createHmac,
@@ -10,7 +11,6 @@ import {
 import { chmod, readFile, stat, writeFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { hashPassword } from "better-auth/crypto";
-import postgres from "postgres";
 
 const STATE_ID = "primary";
 const DEFAULT_TOKEN_TTL_SECONDS = 15 * 60;
@@ -91,10 +91,9 @@ function boundedText(value, flag, maximum) {
 }
 
 function database() {
-  return postgres(requiredEnvironment("DATABASE_URL"), {
+  return new SQL(requiredEnvironment("DATABASE_URL"), {
     max: 1,
     prepare: false,
-    onnotice: () => {},
   });
 }
 
@@ -140,7 +139,7 @@ async function appendAudit(sql, event) {
       ${event.actorUserId ?? null}, ${event.actorEmail ?? ""},
       ${event.actorRole}, ${event.source}, ${event.action}, ${event.result},
       ${event.targetType}, ${event.targetId ?? null},
-      ${sql.json(event.details ?? {})}
+      CAST(${JSON.stringify(event.details ?? {})} AS jsonb)
     )
   `;
 }
@@ -209,7 +208,7 @@ export async function initialiseBootstrap(sql, options = {}) {
     }
     await transaction`
       UPDATE bootstrap_state SET status = 'claimable',
-        token_hash = ${tokenHash}, token_expires_at = ${expiresAt},
+        token_hash = ${tokenHash}, token_expires_at = ${expiresAt.toISOString()},
         provisioning_user_id = NULL, provisioning_organisation_id = NULL,
         provisioning_coord_org_id = NULL, provisioning_email = NULL,
         provisioning_owner_name = NULL, provisioning_organisation_name = NULL,
@@ -635,7 +634,7 @@ async function runCommand(command, flags) {
     }
     throw new Error("usage: bootstrap.mjs init|claim|status|recover-owner [flags]");
   } finally {
-    await sql.end({ timeout: 5 });
+    await sql.close({ timeout: 5 });
   }
 }
 

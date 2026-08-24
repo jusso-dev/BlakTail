@@ -1,9 +1,9 @@
+import { SQL } from "bun";
 import { createHmac } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import postgres from "postgres";
 import {
   bootstrapStatus,
   claimBootstrap,
@@ -79,10 +79,9 @@ test(
   "concurrent bootstrap claims create one owner, lock once, and reject replay",
   { skip: !TEST_DATABASE_URL },
   async () => {
-    const sql = postgres(TEST_DATABASE_URL, {
+    const sql = new SQL(TEST_DATABASE_URL, {
       max: 10,
       prepare: false,
-      onnotice: () => {},
     });
     const coordinatorRequests = [];
     let expireNextClaim = false;
@@ -269,7 +268,7 @@ test(
       await new Promise((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );
-      await sql.end({ timeout: 5 });
+      await sql.close({ timeout: 5 });
     }
   },
 );
@@ -278,10 +277,9 @@ test(
   "migration locks existing owners and reports ownerless organisations",
   { skip: !TEST_DATABASE_URL },
   async () => {
-    const sql = postgres(TEST_DATABASE_URL, {
+    const sql = new SQL(TEST_DATABASE_URL, {
       max: 1,
       prepare: false,
-      onnotice: () => {},
     });
     try {
       await resetThrough(sql, migrations.slice(0, 3));
@@ -335,7 +333,7 @@ test(
       const repairedStatus = await bootstrapStatus(sql);
       assert.equal(repairedStatus.status, "locked");
     } finally {
-      await sql.end({ timeout: 5 });
+      await sql.close({ timeout: 5 });
     }
   },
 );
@@ -344,10 +342,9 @@ test(
   "bootstrap claim attempts are rate limited before secret verification",
   { skip: !TEST_DATABASE_URL },
   async () => {
-    const sql = postgres(TEST_DATABASE_URL, {
+    const sql = new SQL(TEST_DATABASE_URL, {
       max: 1,
       prepare: false,
-      onnotice: () => {},
     });
     try {
       await resetThrough(sql, migrations);
@@ -373,7 +370,7 @@ test(
         /too many bootstrap claim attempts/u,
       );
     } finally {
-      await sql.end({ timeout: 5 });
+      await sql.close({ timeout: 5 });
     }
   },
 );

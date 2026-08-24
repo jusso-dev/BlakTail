@@ -7,11 +7,18 @@ import {
   revokeInvitation,
 } from "@/lib/invitations";
 import { assertSameOrigin, RequestSecurityError } from "@/lib/request-security";
+import {
+  activeOrganisationIdFromRequest,
+  OrganisationAccessError,
+} from "@/lib/session";
 
 async function context(request: Request) {
   const session = await auth.api.getSession({ headers: request.headers });
   if (!session) return null;
-  return requireConsoleContextFromSession(session);
+  return requireConsoleContextFromSession(
+    session,
+    activeOrganisationIdFromRequest(request),
+  );
 }
 
 function errorResponse(error: unknown): Response {
@@ -20,6 +27,9 @@ function errorResponse(error: unknown): Response {
   }
   if (error instanceof InvitationError) {
     return Response.json({ error: error.message }, { status: error.status });
+  }
+  if (error instanceof OrganisationAccessError) {
+    return Response.json({ error: error.message }, { status: 403 });
   }
   console.error("Invitation request failed", error);
   return Response.json({ error: "Invitation request failed." }, { status: 500 });
