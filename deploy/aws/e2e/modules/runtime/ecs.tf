@@ -56,41 +56,64 @@ resource "aws_ecs_task_definition" "console" {
     cpu_architecture        = "ARM64"
   }
 
-  container_definitions = jsonencode([{
-    name                   = "console"
-    image                  = var.console_image
-    essential              = true
-    command                = ["./node_modules/.bin/next", "start", "-p", "3000"]
-    readonlyRootFilesystem = true
-    portMappings = [{
-      name          = "console-http"
-      containerPort = 3000
-      hostPort      = 3000
-      protocol      = "tcp"
-    }]
-    environment = [
-      { name = "BLAKTAIL_REGION", value = var.region },
-      { name = "BETTER_AUTH_URL", value = local.public_url },
-      { name = "BETTER_AUTH_TRUSTED_ORIGINS", value = local.public_url },
-      { name = "COORD_BASE_URL", value = local.public_url },
-    ]
-    secrets = [
-      { name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.console.arn}:DATABASE_URL::" },
-      { name = "BETTER_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.console.arn}:BETTER_AUTH_SECRET::" },
-      { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.console.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
-    ]
-    mountPoints = [
-      { sourceVolume = "console-cache", containerPath = "/app/.next/cache", readOnly = false },
-      { sourceVolume = "console-tmp", containerPath = "/tmp", readOnly = false },
-    ]
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = merge(local.log_options, {
-        awslogs-group         = aws_cloudwatch_log_group.service["console"].name
-        awslogs-stream-prefix = "console"
-      })
-    }
-  }])
+  container_definitions = jsonencode([
+    {
+      name                   = "console-volumes"
+      image                  = var.console_image
+      essential              = false
+      user                   = "0"
+      readonlyRootFilesystem = true
+      entryPoint             = ["/bin/sh", "-c"]
+      command                = ["chown blaktail:blaktail /tmp /app/.next/cache && chmod 0700 /tmp /app/.next/cache"]
+      mountPoints = [
+        { sourceVolume = "console-cache", containerPath = "/app/.next/cache", readOnly = false },
+        { sourceVolume = "console-tmp", containerPath = "/tmp", readOnly = false },
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = merge(local.log_options, {
+          awslogs-group         = aws_cloudwatch_log_group.service["console"].name
+          awslogs-stream-prefix = "console-volumes"
+        })
+      }
+    },
+    {
+      name                   = "console"
+      image                  = var.console_image
+      essential              = true
+      command                = ["./node_modules/.bin/next", "start", "-p", "3000"]
+      readonlyRootFilesystem = true
+      dependsOn              = [{ containerName = "console-volumes", condition = "SUCCESS" }]
+      portMappings = [{
+        name          = "console-http"
+        containerPort = 3000
+        hostPort      = 3000
+        protocol      = "tcp"
+      }]
+      environment = [
+        { name = "BLAKTAIL_REGION", value = var.region },
+        { name = "BETTER_AUTH_URL", value = local.public_url },
+        { name = "BETTER_AUTH_TRUSTED_ORIGINS", value = local.public_url },
+        { name = "COORD_BASE_URL", value = local.public_url },
+      ]
+      secrets = [
+        { name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.console.arn}:DATABASE_URL::" },
+        { name = "BETTER_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.console.arn}:BETTER_AUTH_SECRET::" },
+        { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.console.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
+      ]
+      mountPoints = [
+        { sourceVolume = "console-cache", containerPath = "/app/.next/cache", readOnly = false },
+        { sourceVolume = "console-tmp", containerPath = "/tmp", readOnly = false },
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = merge(local.log_options, {
+          awslogs-group         = aws_cloudwatch_log_group.service["console"].name
+          awslogs-stream-prefix = "console"
+        })
+      }
+    },
+  ])
 
   tags = var.tags
 

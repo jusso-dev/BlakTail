@@ -74,6 +74,10 @@ grep -q 'BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE", value = "true"' \
   "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
 grep -q 'readonlyRootFilesystem = true' \
   "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
+grep -q 'containerName = "console-volumes", condition = "SUCCESS"' \
+  "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
+grep -q 'chown blaktail:blaktail /tmp /app/.next/cache' \
+  "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
 grep -q 'bootstrap.mjs init' "$SCRIPT_DIR/bootstrap-owner.sh"
 grep -q 'bootstrap.mjs claim' "$SCRIPT_DIR/bootstrap-owner.sh"
 grep -q 'supported_bootstrap:true' "$SCRIPT_DIR/bootstrap-owner.sh"
