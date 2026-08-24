@@ -9,9 +9,10 @@ Australian organisations. It connects laptops, field devices, servers, and sites
 with encrypted WireGuard links while keeping control of identity, policy, keys,
 and operational data with the organisation.
 
-Built by Indigenous Australians for Indigenous Australian organisations. The
-project is designed for onshore operation, organisation control, and public-code
-transparency.
+> Built by Indigenous Australians for Indigenous Australian organisations. Data stays onshore, Indigenous Australian organisations stay in control, and the code stays public.
+
+The project is designed for onshore operation, organisation control, and
+public-code transparency.
 
 The idea is closer to a **BlakPath** than a generic VPN: a trusted path between
 the people, devices, services, and places an organisation already manages. The

@@ -3,9 +3,7 @@
 import { useRouter, useSearchParams } from "next/navigation";
 import { FormEvent, Suspense, useEffect, useState, useTransition } from "react";
 import { authClient } from "@/lib/auth-client";
-
-const TAGLINE =
-  "Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.";
+import { TAGLINE } from "@/lib/tagline";
 
 function DesktopAuthInner() {
   const router = useRouter();

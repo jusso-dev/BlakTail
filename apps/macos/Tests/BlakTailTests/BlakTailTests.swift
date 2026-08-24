@@ -76,10 +76,10 @@ final class JoinKeySafetyTests: XCTestCase {
 }
 
 final class TaglineTests: XCTestCase {
-    func testLockedTagline() {
+    func testSharedProjectMission() {
         XCTAssertEqual(
             Tagline.text,
-            "Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency."
+            "Built by Indigenous Australians for Indigenous Australian organisations. Data stays onshore, Indigenous Australian organisations stay in control, and the code stays public."
         )
     }
 }

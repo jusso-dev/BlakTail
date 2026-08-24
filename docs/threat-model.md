@@ -1,8 +1,8 @@
 # Threat model
 
-Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.
+Built by Indigenous Australians for Indigenous Australian organisations. Data stays onshore, Indigenous Australian organisations stay in control, and the code stays public.
 
-That sentence is a product constraint. This document says what we protect, what we do not, and what an operator does when something goes wrong. It is not an IRAP package and does not claim one.
+That mission is a product constraint. This document says what we protect, what we do not, and what an operator does when something goes wrong. It is not an IRAP package and does not claim one.
 
 BlakTail is a WireGuard mesh. Devices join an organisation tailnet, talk peer to peer, and fall back through a relay the organisation runs. The organisation holds the keys. The coordination server and relays stay in Australia. The code is public; the secrets are not.
 

@@ -50,9 +50,9 @@ the app menu-bar-first.
 7. **Quit** clears transient UI state. It does not leave the join key in argv, environment,
    or UserDefaults. The session token may remain in Keychain until **Sign out**.
 
-About BlakTail shows the locked product tagline unchanged:
+About BlakTail shows the shared project mission:
 
-> Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.
+> Built by Indigenous Australians for Indigenous Australian organisations. Data stays onshore, Indigenous Australian organisations stay in control, and the code stays public.
 
 ## Australian English
 

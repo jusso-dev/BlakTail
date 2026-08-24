@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-TAGLINE="Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency."
+MISSION="Built by Indigenous Australians for Indigenous Australian organisations. Data stays onshore, Indigenous Australian organisations stay in control, and the code stays public."
 
 fail() { echo "validate-macos-desktop: $*" >&2; exit 1; }
 
@@ -19,12 +19,12 @@ test -f docs/macos-desktop.md || fail "missing desktop docs"
 test -f apps/console/src/app/desktop/auth/page.tsx || fail "missing desktop auth page"
 test -f apps/console/src/app/api/desktop/join-key/route.ts || fail "missing join-key route"
 
-grep -Fq "$TAGLINE" apps/macos/Sources/BlakTailCore/Support/Tagline.swift \
-  || fail "Tagline.swift does not contain the locked tagline"
-grep -Fq "$TAGLINE" docs/macos-desktop.md \
-  || fail "docs must quote the locked tagline context via About or README"
-grep -Fq "$TAGLINE" README.md \
-  || fail "README must keep the locked tagline"
+grep -Fq "$MISSION" apps/macos/Sources/BlakTailCore/Support/Tagline.swift \
+  || fail "Tagline.swift does not contain the shared project mission"
+grep -Fq "$MISSION" docs/macos-desktop.md \
+  || fail "desktop docs must quote the shared project mission"
+grep -Fq "$MISSION" README.md \
+  || fail "README must keep the shared project mission"
 
 grep -Fq "Notarisation" docs/macos-desktop.md \
   || fail "docs must cover Notarisation (Australian English)"

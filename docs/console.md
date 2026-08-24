@@ -6,14 +6,14 @@ tailnet authorisation.
 
 ## Pages
 
-- `/sign-in` — email and password; shows the locked product tagline
+- `/sign-in` — email and password; shows the shared project mission
 - `/privacy` — public software data-handling and retention statement
 - `/devices` — give active nodes friendly names, approve routes, and revoke access
 - `/join-keys` — mint join keys (owner/admin)
 - `/acls` — read and edit ACL JSON (owner/admin write)
 - `/audit` — latest actor-attributed security and administration changes
 - `/status` — coordinator health and region
-- `/settings` — account details and the locked tagline
+- `/settings` — account details and the shared project mission
 
 ## Auth flow
 

@@ -1,7 +1,7 @@
 import Foundation
 
-/// Locked product tagline. Do not rewrite.
+/// Shared project mission shown in operator-facing clients.
 public enum Tagline {
     public static let text =
-        "Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency."
+        "Built by Indigenous Australians for Indigenous Australian organisations. Data stays onshore, Indigenous Australian organisations stay in control, and the code stays public."
 }
