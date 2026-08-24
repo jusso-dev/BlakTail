@@ -163,6 +163,30 @@ grep -q '^USER blaktail$' "$repo_root/deploy/docker/relay.Dockerfile" || \
   die "relay image is not non-root"
 grep -q '^USER blaktail$' "$repo_root/apps/console/Dockerfile" || \
   die "console image is not non-root"
+grep -q '^FROM oven/bun:1[.]4[.]0-slim' "$repo_root/apps/console/Dockerfile" || \
+  die "console image is not pinned to Bun 1.4.0"
+if grep -q '^FROM node:' "$repo_root/apps/console/Dockerfile"; then
+  die "console image still includes a Node.js runtime"
+fi
+grep -q '^CMD \["bun", "run", "start"\]$' "$repo_root/apps/console/Dockerfile" || \
+  die "console image does not start through Bun"
+grep -q 'bun ci --production' "$repo_root/apps/console/Dockerfile" || \
+  die "console image still includes build-only dependencies"
+grep -q 'drizzle-orm/bun-sql' "$repo_root/apps/console/src/lib/db/client.ts" || \
+  die "console database adapter is not Bun SQL"
+grep -q 'drizzle-orm/bun-sql/migrator' \
+  "$repo_root/apps/console/scripts/migrate.mjs" || \
+  die "console migrations do not use Bun SQL"
+if grep -q '"postgres"[[:space:]]*:' "$repo_root/apps/console/package.json"; then
+  die "console still depends on the standalone postgres client"
+fi
+if grep -Eq 'awscli|postgresql-client|\bcurl\b' "$repo_root/apps/console/Dockerfile"; then
+  die "console image still includes replaceable runtime tools"
+fi
+if grep -R -q 'drizzle-kit migrate' \
+  "$repo_root/compose.yaml" "$repo_root/scripts/aws-e2e/migrate-console.sh"; then
+  die "runtime migration still requires the Drizzle CLI"
+fi
 grep -q 'readonlyRootFilesystem = true' \
   "$repo_root/deploy/aws/e2e/modules/runtime/ecs.tf" || die "Fargate read-only root missing"
 grep -q 'read_only: true' "$repo_root/compose.yaml" || die "Compose read-only root missing"

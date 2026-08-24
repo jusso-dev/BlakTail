@@ -5,26 +5,28 @@ Deployment paths:
 | Path | Shape | Scales | Best for |
 | --- | --- | --- | --- |
 | **Single host (EC2)** | `compose.yaml` + Docker on one box | Vertical only | Pilots, self-hosted demos |
-| **Isolated AWS E2E (`deploy/aws/e2e`)** | Fargate services + RDS + EFS + API Gateway/ALB/NLB + two private agents | Run-scoped | Disposable proof |
-| **Legacy AWS root (`deploy/aws`)** | Fargate services + RDS + EFS + ALB/NLB | Blocked by #27 | Not supported persistently |
+| **Isolated AWS E2E (`deploy/aws/e2e`)** | Two coordinator Fargate replicas + console/relay + Multi-AZ RDS + API Gateway/ALB/NLB + two private agents | Run-scoped | Disposable HA proof |
+| **Legacy AWS root (`deploy/aws`)** | Fargate services + shared RDS + ALB/NLB | Reference only | Requires DNS/TLS/network hardening before persistent use |
 
 Everything is pinned to Sydney (`ap-southeast-2`); the relay binary refuses other regions by design (onshore data rule).
 
-## Legacy root architecture (blocked for persistent use)
+## Legacy root architecture (reference only)
 
 | Component | Runs as | Scaling | Data store |
 | --- | --- | --- | --- |
 | Console (Next.js + Better Auth) | Fargate service behind an ALB | 2–6 tasks, CPU target tracking | RDS Postgres (`db.t4g.medium`, Multi-AZ optional) |
-| Coordinator (`blaktail-coord`) | Fargate service behind a TCP pass-through NLB :443 | **1 task** (SQLite single-writer) | SQLite on EFS access point |
+| Coordinator (`blaktail-coord`) | Fargate service behind a TCP pass-through NLB :443 | 0 for migration, then 2–6 tasks | RDS PostgreSQL through SQLx |
 | Relay (`blaktail-relay`) | Fargate service behind a UDP NLB :3478 | **1 task** until relay sharding lands | In-memory registration map |
 
 Notes:
 
 * The coord NLB is pass-through, so the Rust binary keeps terminating TLS itself; its certificate and key travel through Secrets Manager into env vars and are materialised at `/tmp` by the container entrypoint.
-* Coordinator and relay are intentionally pinned at one task. SQLite keeps coordinator single-writer; relay registrations currently live in one process.
-* Schema-v1 validation rejects SQLite on EFS in a production profile. The
-  isolated E2E root names and acknowledges this unsafe smoke exception; do not
-  deploy the legacy root persistently until #27 replaces coordinator storage.
+* Coordinator service startup never migrates. First apply with
+  `coord_desired_count=0`, run the task definition once with command `migrate`,
+  then apply `coord_desired_count=2` or higher. PostgreSQL migration jobs are
+  serialised with an advisory lock.
+* Coordinator replicas share RDS and can run concurrently. Relay remains one task
+  because registrations currently live in one process.
 * Secrets (`DATABASE_URL`, `BETTER_AUTH_SECRET`, `BLAKTAIL_AUTH_HMAC_SECRET`, dedicated `BLAKTAIL_RELAY_AUTH_SECRET`, coord TLS material) live in Secrets Manager and are injected by ECS; nothing lands in the image or task definition.
 * Logs go to CloudWatch (`/ecs/blaktail/{console,coord,relay}`, 30-day retention).
 * ECS Container Insights is enabled by Terraform for task-level CPU, memory,
@@ -59,8 +61,8 @@ chmod 600 owner-password
 docker compose run --rm \
   -v "$PWD/owner-password:/run/secrets/owner-password:ro" \
   console sh -ceu '
-    node scripts/bootstrap.mjs init --token-file /tmp/bootstrap-token
-    node scripts/bootstrap.mjs claim \
+    bun scripts/bootstrap.mjs init --token-file /tmp/bootstrap-token
+    bun scripts/bootstrap.mjs claim \
       --token-file /tmp/bootstrap-token \
       --password-file /run/secrets/owner-password \
       --email owner@example.org.au \
@@ -94,7 +96,7 @@ scripts/aws-e2e/preflight.sh
 
 Follow the guarded stages in `.github/workflows/aws-e2e.yml`. Before services
 start, a dedicated coordinator task validates schema v1, stores a redacted
-effective dump in run evidence, and applies SQLite migrations; a separate console
+effective dump in run evidence, and applies PostgreSQL migrations; a separate console
 task does the same for Drizzle. Normal task commands never migrate.
 
 ```sh
@@ -120,9 +122,8 @@ the password, session body, or cookie jar to evidence. Successful teardown remov
 the local password, cookie, enrollment URLs, Terraform state and state backup after
 AWS absence checks pass.
 
-Requirements before a persistent AWS deployment:
+Requirements before treating either root as a persistent AWS deployment:
 
-* Complete #27 and remove the guarded SQLite/EFS smoke exception.
 * ACM certificate for the console: `-var="console_acm_certificate_arn=arn:aws:acm:..."` plus a Route53 alias; then set `-var="better_auth_url=https://your-domain"`.
 * Replace the default VPC with a dedicated VPC, private subnets, and NAT gateways.
 * Coordinate certificate: a publicly trusted cert (e.g. Let's Encrypt DNS-01 for your coord hostname) works best; agents must trust whatever chain coord presents.
@@ -134,6 +135,8 @@ Requirements before a persistent AWS deployment:
 
 ## Scaling limits and next steps
 
-* Coordinator: SQLite is single-writer. Porting `blaktail-coord` to Postgres unlocks multi-task coord behind the existing NLB target group — tracked separately.
+* Coordinator: SQLx supports single-box SQLite and multi-replica PostgreSQL. The
+  isolated harness starts two tasks; persistent operators must also prove load
+  balancer failover and snapshot restore in their account.
 * Relay: one task per advertised endpoint. Horizontal scale needs explicit relay sharding/discovery so communicating nodes select the same registration map.
 * Console: stateless; scale-out is bounded only by RDS capacity.

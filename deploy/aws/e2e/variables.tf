@@ -62,6 +62,17 @@ variable "console_desired_count" {
   }
 }
 
+variable "coord_desired_count" {
+  description = "Coordinator replicas to run against the shared PostgreSQL database after migration."
+  type        = number
+  default     = 2
+
+  validation {
+    condition     = var.coord_desired_count >= 0 && var.coord_desired_count <= 2 && floor(var.coord_desired_count) == var.coord_desired_count
+    error_message = "coord_desired_count must be an integer from zero to two."
+  }
+}
+
 variable "console_image" {
   description = "ARM64 console image pinned by sha256 digest."
   type        = string

@@ -68,10 +68,16 @@ grep -q 'assignPublicIp:"DISABLED"' "$SCRIPT_DIR/migrate-console.sh"
 grep -q 'coord_migration' "$SCRIPT_DIR/migrate-console.sh"
 grep -q 'dump-config --service console --redacted' "$SCRIPT_DIR/migrate-console.sh"
 grep -q 'config-validation.log' "$SCRIPT_DIR/collect-evidence.sh"
-grep -q 'BLAKTAIL_DATABASE_STORAGE", value = "efs"' \
+grep -q 'BLAKTAIL_DATABASE_BACKEND", value = "postgres"' \
   "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
-grep -q 'BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE", value = "true"' \
+grep -q 'BLAKTAIL_DATABASE_STORAGE", value = "network"' \
   "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
+grep -q 'BLAKTAIL_DATABASE_URL.*valueFrom' \
+  "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
+if grep -q 'BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE' \
+  "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"; then
+  die "AWS E2E coordinator must not use unsafe SQLite/EFS"
+fi
 grep -q 'readonlyRootFilesystem = true' \
   "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
 grep -q 'containerName = "console-volumes", condition = "SUCCESS"' \

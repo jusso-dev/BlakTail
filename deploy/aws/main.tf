@@ -81,6 +81,7 @@ resource "aws_secretsmanager_secret_version" "coord_env" {
   secret_string = jsonencode({
     BLAKTAIL_AUTH_HMAC_SECRET  = random_password.auth_hmac_secret.result
     BLAKTAIL_RELAY_AUTH_SECRET = random_password.relay_auth_secret.result
+    BLAKTAIL_DATABASE_URL      = "postgres://blaktail:${random_password.db.result}@${aws_db_instance.postgres.endpoint}/blaktail?sslmode=require"
     BLAKTAIL_TLS_CERT_PEM      = var.coord_tls_cert_pem
     BLAKTAIL_TLS_KEY_PEM       = var.coord_tls_key_pem
   })

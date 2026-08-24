@@ -62,14 +62,17 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 ## What works today
 
 - Browser-based device enrolment without copying a join key
-- Organisation device inventory with stable technical identity and editable,
-  audited friendly names
+- One login across multiple organisation workspaces, with an all-networks machine
+  inventory and instant workspace switching instead of logout/login churn
+- Stable device identity with editable, audited friendly names
 - Join-key enrolment for automation, tags, route approval, ACLs, and revocation
-- Next.js 16.3 console: Drizzle ORM, Better Auth, talks to the Rust control plane for auth and ACLs
+- Bun 1.4-hosted Next.js 16.3 console: Bun SQL, Drizzle ORM, Better Auth, and
+  the Rust control plane for auth and ACLs
 - WireGuard agents for Linux and macOS; Windows is not implemented
 - A macOS desktop app that drives the local agent; Windows and Linux desktop apps
   are not implemented
 - Coordination server and AU relay the org runs
+- SQLx coordinator storage: SQLite for a single host or PostgreSQL for concurrent replicas
 - MagicDNS-style names and tag ACLs (office, ranger, store)
 - Owner-approved Linux subnet routers and opt-in IPv4 exit nodes
 - Dual-stack tailnets with an organisation ULA `/64` and one `/128` per node
@@ -87,13 +90,15 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 
 ## Console
 
-Operator UI lives in `apps/console` (Next.js 16.3, Better Auth, Drizzle, onshore Postgres).
+Operator UI lives in `apps/console` (Bun 1.4, Next.js 16.3, Better Auth,
+Drizzle over Bun's native SQL client, onshore Postgres).
 See [docs/console.md](docs/console.md).
 
 Fresh deployments use one explicit, time-limited first-owner ceremony from the
 console host. Public Better Auth sign-up is disabled at the HTTP endpoint. After
-bootstrap locks, owners add people with one-use, organisation-bound invitations;
-lost sole-owner access requires an audited on-host recovery. See
+bootstrap locks, owners add people with one-use, organisation-bound invitations.
+An existing account can join more workspaces without creating another login or
+ending its current session; lost sole-owner access requires an audited on-host recovery. See
 [First owner and invitations](docs/console.md#first-owner-and-invitations).
 
 Metrics, audit coverage, and alert examples: [docs/observability.md](docs/observability.md).
@@ -124,9 +129,10 @@ Host it yourself on one box, or run the isolated AWS proof harness:
 - **Disposable AWS E2E:** guarded Terraform in `deploy/aws/e2e` runs ARM64 Fargate
   console/coordinator/relay tasks plus two private agent hosts, all pinned to Sydney.
   Images are immutable digest references built by `scripts/aws-e2e/build-images.sh`.
-- **Persistent AWS:** blocked on [#27](https://github.com/jusso-dev/BlakTail/issues/27).
-  The legacy `deploy/aws` coordinator declares its SQLite-on-EFS shape and now
-  fails schema validation instead of presenting that unsafe store as production.
+- **Persistent AWS:** the coordinator now has a PostgreSQL HA path, but the legacy
+  root remains a reference until operators complete its DNS/TLS, private-network,
+  failover, backup-restore, and release-artifact gates. The disposable root runs
+  two coordinator replicas against Multi-AZ RDS and contains no SQLite/EFS exception.
 
 All services share schema-v1 TOML plus deterministic environment overrides.
 `blaktail-config` validates offline, prints only redacted effective config, previews
@@ -174,7 +180,9 @@ restart cases, and a published agent package remain open acceptance work.
 
 - Rust workspace: `blaktaild` (node agent), `blaktail-coord`, `blaktail-relay`
 - WireGuard: userspace on macOS first, kernel WG on Linux, userspace on Windows
-- Console: Next.js 16.3, Drizzle, Better Auth, Postgres onshore. Auth sessions are issued in the console and verified by Rust
+- Console: Bun 1.4 runtime/package manager and native SQL client, Next.js 16.3,
+  Drizzle, Better Auth, Postgres onshore. Auth sessions are issued in the console
+  and verified by Rust
 - Desktop: Mac app first (SwiftUI wrapping the LaunchDaemon agent). Windows and Linux follow
 - CI on GitHub-hosted runners: `ubuntu-latest` for Rust, console, and security jobs; `macos-latest` for the Swift desktop app
 - Apache-2.0

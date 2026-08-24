@@ -23,7 +23,12 @@ struct Cli {
     #[arg(long, global = true)]
     allow_public_metrics: bool,
     #[arg(long, global = true)]
+    database_backend: Option<String>,
+    #[arg(long, global = true)]
     database: Option<PathBuf>,
+    /// PostgreSQL URL file. Secret values are never accepted on argv.
+    #[arg(long, global = true)]
+    database_url_file: Option<PathBuf>,
     #[arg(long, global = true)]
     database_storage: Option<String>,
     #[arg(long, global = true)]
@@ -64,7 +69,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if matches!(cli.command, Some(Command::Migrate)) {
-        Store::open(&loaded.config.coordinator.database)?;
+        let config = &loaded.config.coordinator;
+        match config.database_backend.as_str() {
+            "sqlite" => {
+                Store::open(&config.database).await?;
+            }
+            "postgres" => {
+                let reference = config
+                    .database_url
+                    .as_ref()
+                    .expect("validated coordinator PostgreSQL URL");
+                let database_url = loaded
+                    .secret(reference, "coordinator.database_url")?
+                    .as_str("coordinator.database_url")?
+                    .to_owned();
+                Store::migrate_postgres(&database_url).await?;
+            }
+            _ => unreachable!("validated coordinator database backend"),
+        }
         info!(
             schema_version = blaktail_coord::CURRENT_SCHEMA_VERSION,
             "coordinator database migration complete"
@@ -165,10 +187,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         None => None,
     };
+    let database_url = match config.database_url.as_ref() {
+        Some(reference) => Some(
+            loaded
+                .secret(reference, "coordinator.database_url")?
+                .as_str("coordinator.database_url")?
+                .to_owned(),
+        ),
+        None => None,
+    };
     drop(loaded);
 
     let tls = RustlsConfig::from_pem_file(&config.tls_cert, tls_key).await?;
-    let store = Store::open_existing(&config.database)?;
+    let store = match config.database_backend.as_str() {
+        "sqlite" => Store::open_existing(&config.database).await?,
+        "postgres" => {
+            Store::open_existing_postgres(
+                database_url
+                    .as_deref()
+                    .expect("validated coordinator PostgreSQL URL"),
+            )
+            .await?
+        }
+        _ => unreachable!("validated coordinator database backend"),
+    };
     let metrics = Arc::new(CoordMetrics::default());
     let metrics_listener = tokio::net::TcpListener::bind(metrics_bind).await?;
     let metrics_router =
@@ -249,8 +291,14 @@ fn load_effective(cli: &Cli) -> Result<LoadedConfig, blaktail_config::ConfigErro
     if cli.allow_public_metrics {
         config.allow_public_metrics = true;
     }
+    if let Some(value) = &cli.database_backend {
+        config.database_backend = value.clone();
+    }
     if let Some(value) = &cli.database {
         config.database = value.clone();
+    }
+    if let Some(value) = &cli.database_url_file {
+        config.database_url = Some(SecretRef::file(value));
     }
     if let Some(value) = &cli.database_storage {
         config.database_storage = value.clone();

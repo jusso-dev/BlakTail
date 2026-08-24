@@ -81,7 +81,7 @@ resource "aws_ecs_task_definition" "console" {
       name                   = "console"
       image                  = var.console_image
       essential              = true
-      command                = ["./node_modules/.bin/next", "start", "-p", "3000"]
+      command                = ["bun", "--bun", "next", "start", "-p", "3000"]
       readonlyRootFilesystem = true
       dependsOn              = [{ containerName = "console-volumes", condition = "SUCCESS" }]
       portMappings = [{
@@ -166,19 +166,6 @@ resource "aws_ecs_task_definition" "coord" {
   }
 
   volume {
-    name = "coord-data"
-    efs_volume_configuration {
-      file_system_id     = aws_efs_file_system.coord.id
-      root_directory     = "/"
-      transit_encryption = "ENABLED"
-      authorization_config {
-        access_point_id = aws_efs_access_point.coord.id
-        iam             = "DISABLED"
-      }
-    }
-  }
-
-  volume {
     name = "coord-tls"
   }
 
@@ -218,9 +205,8 @@ resource "aws_ecs_task_definition" "coord" {
         { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
         { name = "BLAKTAIL_COORD_METRICS_BIND", value = "0.0.0.0:9701" },
         { name = "BLAKTAIL_COORD_ALLOW_PUBLIC_METRICS", value = "true" },
-        { name = "BLAKTAIL_DATABASE", value = "/data/blaktail-coord.sqlite3" },
-        { name = "BLAKTAIL_DATABASE_STORAGE", value = "efs" },
-        { name = "BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE", value = "true" },
+        { name = "BLAKTAIL_DATABASE_BACKEND", value = "postgres" },
+        { name = "BLAKTAIL_DATABASE_STORAGE", value = "network" },
         { name = "BLAKTAIL_RELAYS", value = local.relay_endpoint },
         { name = "BLAKTAIL_CONSOLE_URL", value = local.public_url },
         { name = "BLAKTAIL_TLS_CERT", value = "/tls/tls.crt" },
@@ -230,9 +216,9 @@ resource "aws_ecs_task_definition" "coord" {
         { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
         { name = "BLAKTAIL_RELAY_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_RELAY_AUTH_SECRET::" },
         { name = "BLAKTAIL_COORD_DIAGNOSTICS_TOKEN", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_DIAGNOSTICS_TOKEN::" },
+        { name = "BLAKTAIL_DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_DATABASE_URL::" },
       ]
       mountPoints = [
-        { sourceVolume = "coord-data", containerPath = "/data", readOnly = false },
         { sourceVolume = "coord-tls", containerPath = "/tls", readOnly = true },
       ]
       portMappings = [
@@ -292,19 +278,6 @@ resource "aws_ecs_task_definition" "coord_migration" {
   }
 
   volume {
-    name = "coord-data"
-    efs_volume_configuration {
-      file_system_id     = aws_efs_file_system.coord.id
-      root_directory     = "/"
-      transit_encryption = "ENABLED"
-      authorization_config {
-        access_point_id = aws_efs_access_point.coord.id
-        iam             = "DISABLED"
-      }
-    }
-  }
-
-  volume {
     name = "coord-tls"
   }
 
@@ -347,9 +320,8 @@ resource "aws_ecs_task_definition" "coord_migration" {
         { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
         { name = "BLAKTAIL_COORD_METRICS_BIND", value = "0.0.0.0:9701" },
         { name = "BLAKTAIL_COORD_ALLOW_PUBLIC_METRICS", value = "true" },
-        { name = "BLAKTAIL_DATABASE", value = "/data/blaktail-coord.sqlite3" },
-        { name = "BLAKTAIL_DATABASE_STORAGE", value = "efs" },
-        { name = "BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE", value = "true" },
+        { name = "BLAKTAIL_DATABASE_BACKEND", value = "postgres" },
+        { name = "BLAKTAIL_DATABASE_STORAGE", value = "network" },
         { name = "BLAKTAIL_RELAYS", value = local.relay_endpoint },
         { name = "BLAKTAIL_CONSOLE_URL", value = local.public_url },
         { name = "BLAKTAIL_TLS_CERT", value = "/tls/tls.crt" },
@@ -359,9 +331,9 @@ resource "aws_ecs_task_definition" "coord_migration" {
         { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
         { name = "BLAKTAIL_RELAY_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_RELAY_AUTH_SECRET::" },
         { name = "BLAKTAIL_COORD_DIAGNOSTICS_TOKEN", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_DIAGNOSTICS_TOKEN::" },
+        { name = "BLAKTAIL_DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_DATABASE_URL::" },
       ]
       mountPoints = [
-        { sourceVolume = "coord-data", containerPath = "/data", readOnly = false },
         { sourceVolume = "coord-tls", containerPath = "/tls", readOnly = true },
       ]
       logConfiguration = {
@@ -376,14 +348,14 @@ resource "aws_ecs_task_definition" "coord_migration" {
 
   tags = var.tags
 
-  depends_on = [aws_secretsmanager_secret_version.control_plane, aws_efs_mount_target.coord]
+  depends_on = [aws_secretsmanager_secret_version.control_plane]
 }
 
 resource "aws_ecs_service" "coord" {
   name                   = "${var.name_prefix}-coord"
   cluster                = aws_ecs_cluster.this.id
   task_definition        = aws_ecs_task_definition.coord.arn
-  desired_count          = var.deploy_services ? 1 : 0
+  desired_count          = var.deploy_services ? var.coord_desired_count : 0
   launch_type            = "FARGATE"
   platform_version       = "LATEST"
   enable_execute_command = true
@@ -407,7 +379,7 @@ resource "aws_ecs_service" "coord" {
 
   tags = var.tags
 
-  depends_on = [aws_lb_listener_rule.coord, aws_efs_mount_target.coord, aws_route_table_association.tasks]
+  depends_on = [aws_lb_listener_rule.coord, aws_route_table_association.tasks]
 }
 
 resource "aws_ecs_task_definition" "relay" {

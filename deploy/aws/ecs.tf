@@ -56,6 +56,10 @@ resource "aws_ecs_task_definition" "console" {
   cpu                      = 512
   memory                   = 1024
   execution_role_arn       = aws_iam_role.execution.arn
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
   container_definitions = jsonencode([{
     name         = "console"
     image        = local.console_image
@@ -117,7 +121,6 @@ resource "aws_ecs_service" "console" {
   tags       = local.tags
 }
 
-# Coord is pinned to one task: SQLite stays single-writer on EFS.
 resource "aws_ecs_task_definition" "coord" {
   family                   = "${var.name}-coord"
   requires_compatibilities = ["FARGATE"]
@@ -125,17 +128,9 @@ resource "aws_ecs_task_definition" "coord" {
   cpu                      = 512
   memory                   = 1024
   execution_role_arn       = aws_iam_role.execution.arn
-  volume {
-    name = "data"
-    efs_volume_configuration {
-      file_system_id     = aws_efs_file_system.coord.id
-      root_directory     = "/"
-      transit_encryption = "ENABLED"
-      authorization_config {
-        access_point_id = aws_efs_access_point.coord.id
-        iam             = "DISABLED"
-      }
-    }
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
   }
   container_definitions = jsonencode([{
     name         = "coord"
@@ -144,18 +139,18 @@ resource "aws_ecs_task_definition" "coord" {
     environment = [
       { name = "BLAKTAIL_REGION", value = var.region },
       { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
-      { name = "BLAKTAIL_DATABASE", value = "/data/blaktail-coord.sqlite3" },
-      { name = "BLAKTAIL_DATABASE_STORAGE", value = "efs" },
+      { name = "BLAKTAIL_DATABASE_BACKEND", value = "postgres" },
+      { name = "BLAKTAIL_DATABASE_STORAGE", value = "network" },
       { name = "BLAKTAIL_RELAYS", value = "${aws_lb.relay.dns_name}:3478" },
       { name = "BLAKTAIL_CONSOLE_URL", value = local.better_auth_url },
     ]
     secrets = [
       { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
       { name = "BLAKTAIL_RELAY_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_RELAY_AUTH_SECRET::" },
+      { name = "BLAKTAIL_DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_DATABASE_URL::" },
       { name = "BLAKTAIL_TLS_CERT_PEM", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_TLS_CERT_PEM::" },
       { name = "BLAKTAIL_TLS_KEY_PEM", valueFrom = "${aws_secretsmanager_secret.coord_env.arn}:BLAKTAIL_TLS_KEY_PEM::" },
     ]
-    mountPoints = [{ sourceVolume = "data", containerPath = "/data" }]
     logConfiguration = {
       logDriver = "awslogs"
       options = {
@@ -178,7 +173,7 @@ resource "aws_ecs_service" "coord" {
   name            = "coord"
   cluster         = aws_ecs_cluster.this.id
   task_definition = aws_ecs_task_definition.coord.arn
-  desired_count   = 1
+  desired_count   = var.coord_desired_count
   launch_type     = "FARGATE"
 
   network_configuration {
@@ -209,6 +204,10 @@ resource "aws_ecs_task_definition" "relay" {
   cpu                      = 256
   memory                   = 512
   execution_role_arn       = aws_iam_role.execution.arn
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
   container_definitions = jsonencode([{
     name         = "relay"
     image        = local.relay_image

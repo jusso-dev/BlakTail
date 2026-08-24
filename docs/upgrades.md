@@ -13,7 +13,7 @@ not force IPv6 routes onto older agents.
 
 Upgrade in this order:
 
-1. Back up Postgres, coordinator SQLite, configuration, and TLS material.
+1. Back up console Postgres, the configured coordinator store, configuration, and TLS material.
 2. Run `blaktail-config check-config` and `dump-config --redacted`. Preview the
    reload plan; stop if any undocumented field or deprecation appears.
 3. Run `blaktail-coord migrate` as a separate stopped-service gate, then upgrade
@@ -38,9 +38,10 @@ On macOS, install the pinned package, then restart the existing LaunchDaemon and
 check status. Enrollment state remains under `/var/lib/blaktail` and is not part of
 the package.
 
-Coordinator SQLite migrations run only through `blaktail-coord migrate`, use one
-transaction per schema step, and advance `PRAGMA user_version`. Normal `serve`
-startup never migrates and refuses missing, older, or newer schema state.
+Coordinator migrations run only through `blaktail-coord migrate`. SQLite uses one
+transaction per schema step and `PRAGMA user_version`; PostgreSQL uses one
+transaction, an advisory lock, and `coordinator_schema_migrations`. Normal `serve`
+startup never migrates and refuses missing, older, newer, or gapped schema state.
 Database downgrade is unsupported: restore the pre-upgrade snapshot with the old
 binary. Agent rollback is supported only when that release's notes confirm its state
 format is compatible.

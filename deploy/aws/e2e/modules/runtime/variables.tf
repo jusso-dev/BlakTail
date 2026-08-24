@@ -56,3 +56,7 @@ variable "deploy_services" {
 variable "console_desired_count" {
   type = number
 }
+
+variable "coord_desired_count" {
+  type = number
+}

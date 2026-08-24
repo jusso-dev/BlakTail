@@ -16,12 +16,14 @@ blaktail-coord --config /etc/blaktail/config.toml serve
 ```
 
 The default database is `blaktail-coord.sqlite3`, suitable for a single office
-box. SQLite WAL mode and foreign keys are enabled. PostgreSQL is not implemented
-in v1; it can later be added behind the store interface without changing the API.
+box. SQLite WAL mode and foreign keys are enabled. Multi-replica deployments use
+the SQLx PostgreSQL backend: set `database_backend = "postgres"`,
+`database_storage = "network"`, and provide `database_url` as a secret file or
+environment reference. The URL is never accepted as a command-line value.
 Set `RUST_LOG=info` for startup, registration, and revocation events. Startup logs
 include the configured region; public health responses contain status only.
 
-## SQLite migrations and rollback
+## Migrations, backups, and recovery
 
 The coordinator records an ordered schema version in SQLite's
 `PRAGMA user_version`. `blaktail-coord migrate` advances a version-zero or older
@@ -42,6 +44,42 @@ coordinator and inspect `/livez`, `/readyz`, and its startup log. Database downg
 is unsupported; restore the snapshot before starting the old binary. Future schema
 changes must append an ordered migration and advance `CURRENT_SCHEMA_VERSION`, not
 add an unconditional startup mutation.
+
+PostgreSQL records the same ordered versions in
+`coordinator_schema_migrations`. `blaktail-coord migrate` holds a transaction-level
+advisory lock, so two deployment jobs can be started safely; one applies each
+migration and the other observes the committed versions. Normal replicas call
+`serve`, verify every version is present and contiguous, and refuse traffic for an
+old, future, or gapped schema.
+
+Use a protected libpq service/password file or cloud-native database identity for
+operator commands; do not put a URL containing credentials in shell history. A
+portable backup/restore drill is:
+
+```sh
+# PGHOST, PGDATABASE, PGUSER and PGPASSFILE point at the active database.
+pg_dump --format=custom --no-owner --no-acl \
+  --file coordinator-$(date -u +%Y%m%dT%H%M%SZ).dump
+pg_restore --list coordinator-*.dump >/dev/null
+
+# Restore into a new, empty recovery database; never over the active database.
+createdb blaktail_coord_recovery
+pg_restore --exit-on-error --no-owner --no-acl \
+  --dbname blaktail_coord_recovery coordinator-*.dump
+```
+
+Point a one-off coordinator at the restored database with a protected
+`database_url` reference. `serve` must reach `/readyz`; confirm organisation, node,
+ACL, nonce, and audit-event counts before promoting it. On RDS, enable automated
+backups/Multi-AZ, restore a snapshot to a new instance, run the same readiness and
+count checks from a private task, then delete the recovery instance. Never test
+recovery by overwriting the source instance. Database downgrade is restore-only.
+
+The repository exercises legacy SQLite fixtures on every Rust test run and a
+dedicated PostgreSQL database when `BLAKTAIL_COORD_TEST_DATABASE_URL` is set. That
+integration test starts two independent pools, races concurrent migrations and a
+single-use registration, proves cross-replica reads, closes one replica, and
+rechecks the survivor.
 
 ## HTTP API
 
@@ -73,7 +111,7 @@ add an unconditional startup mutation.
 - `GET /v1/orgs/{org_id}/acl` — any org user session
 - `PUT /v1/orgs/{org_id}/acl` — owner/admin only
 - `GET /livez` — status-only process liveness
-- `GET /readyz` — status-only SQLite readiness
+- `GET /readyz` — status-only database connectivity plus exact schema readiness
 - `GET /health` — compatibility alias for readiness
 
 Prometheus metrics are served as plain HTTP on the separate
@@ -117,7 +155,7 @@ The current HMAC keyring contains one key, so rotation needs a brief management
 outage: stop console traffic, wait 65 seconds for every old assertion to expire,
 replace `BLAKTAIL_AUTH_HMAC_SECRET` with the same new random value on coordinator
 and console, restart coordinator then console, and verify one read plus one audited
-write. Never rotate only one side. Already consumed nonces remain hashed in SQLite
+write. Never rotate only one side. Already consumed nonces remain hashed in the selected database
 until their expiry cleanup; restarting either service does not make a captured
 assertion reusable.
 
@@ -138,7 +176,7 @@ They also include a node-reported relay-socket candidate only while its coordina
 timestamp is less than 180 seconds old. Agents use that candidate for a bounded,
 nonce-confirmed UDP hole punch while keeping relayed WireGuard traffic available.
 
-## SQLite schema dump
+## Storage schemas
 
 The canonical current schema is [`blaktail-coord/schema.sql`](../blaktail-coord/schema.sql).
 It is applied only through the versioned migration runner. Its principal tables are:
@@ -176,3 +214,6 @@ CREATE TABLE pending_bootstrap_orgs (id TEXT PRIMARY KEY,
 ```
 
 The full schema includes foreign keys, JSON checks, uniqueness constraints, and indexes.
+PostgreSQL uses the matching ordered files in
+[`blaktail-coord/migrations/postgres`](../blaktail-coord/migrations/postgres); IDs
+and JSON remain text at the storage boundary so both backends share one query path.

@@ -12,7 +12,10 @@ region = "ap-southeast-2"
 bind = "0.0.0.0:8443"
 metrics_bind = "127.0.0.1:9701"
 allow_public_metrics = false
+database_backend = "sqlite"
 database = "/var/lib/blaktail-coord/coordinator.sqlite3"
+# For HA, use database_backend = "postgres", database_storage = "network",
+# and a secret reference such as database_url = "file:/run/credentials/blaktail-coord.service/database-url".
 database_storage = "local"
 allow_unsafe_efs_sqlite = false
 tls_mode = "files"

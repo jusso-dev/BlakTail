@@ -61,4 +61,5 @@ module "runtime" {
   coord_proxy_image     = var.coord_proxy_image
   deploy_services       = var.deploy_services
   console_desired_count = var.console_desired_count
+  coord_desired_count   = var.coord_desired_count
 }

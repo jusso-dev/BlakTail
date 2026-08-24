@@ -41,8 +41,10 @@ value. Defaults apply when a section or field is absent.
 | `coordinator.metrics_bind` | `127.0.0.1:9701` | Loopback unless exposure acknowledged |
 | `coordinator.allow_public_metrics` | `false` | Non-loopback acknowledgement |
 | `coordinator.diagnostics_token` | Required for acknowledged exposure | Secret reference, at least 32 bytes |
-| `coordinator.database` | `blaktail-coord.sqlite3` | Non-empty SQLite path; systemd example uses isolated `/var/lib/blaktail-coord` |
-| `coordinator.database_storage` | `local` | `local`, or guarded E2E-only `efs` |
+| `coordinator.database_backend` | `sqlite` | `sqlite` for one coordinator, or `postgres` for concurrent replicas |
+| `coordinator.database` | `blaktail-coord.sqlite3` | Non-empty path when the backend is SQLite; systemd example uses isolated `/var/lib/blaktail-coord` |
+| `coordinator.database_url` | Required for PostgreSQL | Secret reference containing a `postgres://` or `postgresql://` URL; never accepted on argv |
+| `coordinator.database_storage` | `local` | `local` or guarded E2E-only `efs` for SQLite; `network` for PostgreSQL |
 | `coordinator.allow_unsafe_efs_sqlite` | `false` | Valid only with E2E profile and EFS storage |
 | `coordinator.tls_mode` | `files` | Only file-backed TLS exists in schema v1 |
 | `coordinator.tls_cert` | Required | Readable certificate path |
@@ -133,12 +135,12 @@ checks:
 - relay endpoint host/port form and rate/idle ranges;
 - absolute state paths, WireGuard interface length, polling range, and IPv4/IPv6
   advertised CIDRs;
-- PostgreSQL console URLs without printing their contents;
+- PostgreSQL console and coordinator URLs without printing their contents;
 - SQLite storage safety. `database_storage = "efs"` is rejected except for an
   explicitly labelled `e2e` profile with `allow_unsafe_efs_sqlite = true`.
 
-That EFS exception is smoke-only. Persistent AWS deployments must use the durable
-backend tracked by #27; labelling a long-lived deployment `e2e` is not supported.
+That EFS exception is smoke-only. Persistent multi-replica deployments use the
+PostgreSQL backend; labelling a long-lived deployment `e2e` is not supported.
 MagicDNS suffixes remain coordinator-derived and are not operator-configurable in
 schema v1, preventing split suffix state.
 
@@ -159,7 +161,7 @@ Coordinator public endpoints expose no region, version, path, database error,
 organisation, or peer data:
 
 - `/livez`: process liveness;
-- `/readyz`: required SQLite query readiness;
+- `/readyz`: required database query and exact schema-version readiness;
 - `/health`: compatibility alias for readiness.
 
 Relay exposes minimal `/livez` and `/readyz` responses on its metrics listener.
@@ -208,9 +210,11 @@ Lists are comma-separated. Boolean values accept `true`/`false`, `yes`/`no`, or
 | `BLAKTAIL_COORD_METRICS_BIND` | `coordinator.metrics_bind` | Loopback by default |
 | `BLAKTAIL_COORD_ALLOW_PUBLIC_METRICS` | `coordinator.allow_public_metrics` | Requires diagnostics token |
 | `BLAKTAIL_COORD_DIAGNOSTICS_TOKEN` / `BLAKTAIL_COORD_DIAGNOSTICS_TOKEN_FILE` | `coordinator.diagnostics_token` | Secret pair |
+| `BLAKTAIL_DATABASE_BACKEND` | `coordinator.database_backend` | `sqlite` or `postgres` |
 | `BLAKTAIL_DATABASE` | `coordinator.database` | Canonical path |
 | `BLAKTAIL_DB_PATH` | `coordinator.database` | Deprecated schema-v1 alias; conflicts with canonical variable |
-| `BLAKTAIL_DATABASE_STORAGE` | `coordinator.database_storage` | `local` or guarded `efs` smoke mode |
+| `BLAKTAIL_DATABASE_URL` / `BLAKTAIL_DATABASE_URL_FILE` | `coordinator.database_url` | Secret pair for the PostgreSQL backend |
+| `BLAKTAIL_DATABASE_STORAGE` | `coordinator.database_storage` | SQLite `local`/guarded `efs`, or PostgreSQL `network` |
 | `BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE` | `coordinator.allow_unsafe_efs_sqlite` | E2E-only acknowledgement |
 | `BLAKTAIL_TLS_MODE` | `coordinator.tls_mode` | `files` only in v1 |
 | `BLAKTAIL_TLS_CERT` | `coordinator.tls_cert` | Certificate path |

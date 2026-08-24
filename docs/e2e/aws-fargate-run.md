@@ -1,5 +1,11 @@
 # AWS Fargate smoke runs — 23–24 August 2026
 
+The archived runs below used the coordinator storage shape recorded in each run.
+The current harness has since replaced SQLite/EFS with two coordinator tasks on
+Multi-AZ RDS PostgreSQL. That change has local SQLx cross-replica evidence but is
+not attributed to these older AWS screenshots; a new run must append its own task,
+failover, snapshot-restore, and teardown identifiers.
+
 ## Operator configuration and portal rerun — `20260824i41a`
 
 Run `20260824i41a` exercised the schema-v1 configuration, hardened container, and

@@ -28,7 +28,7 @@ Coordinator metrics:
 - `blaktail_coord_request_duration_seconds` — cumulative latency histogram for
   those operations
 - `blaktail_coord_active_nodes` — unrevoked nodes whose credentials have not
-  expired, calculated from SQLite at scrape time
+  expired, calculated from the configured coordinator database at scrape time
 
 Relay metrics:
 
@@ -39,7 +39,7 @@ Relay metrics:
   and oversized packets
 
 Coordinator public `/livez`, `/readyz`, and `/health` responses contain status
-only; readiness performs a required SQLite query. Relay `/livez` and `/readyz`
+only; readiness probes the configured store and exact schema version. Relay `/livez` and `/readyz`
 are status-only on its private HTTP listener. `/metrics` and
 `/diagnostics/readiness` require bearer authentication whenever a non-loopback
 metrics bind is enabled. Network isolation remains mandatory.
@@ -49,7 +49,7 @@ metrics bind is enabled. Network isolation remains mandatory.
 The coordinator's `audit_events` table is append-only through the application.
 Each event records organisation, signed actor id/name/email/role, action, target,
 non-secret JSON details, and a UTC Unix timestamp. The event is inserted in the
-same SQLite transaction as its mutation, so a change cannot commit without its
+same database transaction as its mutation, so a change cannot commit without its
 audit record.
 
 Audited actions are:
@@ -66,8 +66,8 @@ Organisation members can inspect the latest 100 events in Console → Audit log.
 The coordinator API supports `GET /v1/orgs/{org_id}/audit?limit=200`; it enforces
 the signed organisation boundary. Secret join keys, node tokens, raw device
 codes, and ACL bodies are omitted. ACL events store only rule count and SHA-256.
-Database administrators can still alter SQLite directly, so ship the database
-and process logs to separately controlled backup/log storage when tamper evidence
+Database administrators can still alter the underlying store directly, so ship database
+audit records and process logs to separately controlled backup/log storage when tamper evidence
 is required.
 
 ## Alert baseline

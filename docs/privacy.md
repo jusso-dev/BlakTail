@@ -13,7 +13,7 @@ local process for access, correction, export, and deletion requests.
   organisation membership and role, hashed invitation/bootstrap credentials,
   invitation status/expiry, and actor-attributed console audit events. Raw
   bootstrap and invitation credentials are shown once and are not stored.
-- Coordinator SQLite holds organisation and node identifiers, device names,
+- The coordinator's SQLite or PostgreSQL store holds organisation and node identifiers, device names,
   WireGuard public keys, tailnet addresses, advertised endpoints/routes, ACLs,
   hashed join/node credentials, credential expiry, and actor-attributed audit events.
 - A relay keeps node identifiers and public socket addresses in memory. Registrations
@@ -32,8 +32,8 @@ protect the console. The macOS desktop stores its session token in Keychain.
 The data is used only to authenticate operators, authorise and configure the
 organisation's tailnet, route encrypted packets, diagnose availability, and record
 security administration. The software is designed for Australian/onshore hosting,
-but source code cannot enforce the location of an operator's Postgres database,
-SQLite/EFS volume, TLS proxy, logs, backups, DNS, or support tooling. Operators must
+but source code cannot enforce the location of an operator's databases,
+TLS proxy, logs, backups, DNS, or support tooling. Operators must
 verify every runtime and backup destination. Hosting providers selected by the
 operator may process infrastructure metadata under their own terms.
 
@@ -45,12 +45,12 @@ security incident.
 
 Expired browser authorisations are removed by the coordinator, and relay state is
 short-lived in memory. Current coordinator node, join-key, and audit rows otherwise
-have no automatic retention job; revoked and expired records can remain in SQLite.
+have no automatic retention job; revoked and expired records can remain in the coordinator store.
 Console account, session, invitation, bootstrap-state, rate-limit, and audit
 retention follows Better Auth plus the operator's database procedures. Used,
 expired, and revoked invitation rows are not currently purged automatically. Logs
-and backups follow deployment policy (the included AWS example uses
-30-day CloudWatch log retention).
+and backups follow deployment policy (the disposable AWS harness uses one-day
+CloudWatch retention; the legacy reference root uses 30 days).
 
 Operators must choose and publish retention periods, test deletion across live
 databases and backups, and preserve audit data only as long as their security and

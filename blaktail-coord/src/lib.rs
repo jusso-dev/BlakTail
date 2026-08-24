@@ -14,13 +14,16 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use sqlx::{
+    any::{install_default_drivers, AnyPoolOptions},
+    AnyConnection, AnyPool, AssertSqlSafe, Row,
+};
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Instant,
 };
 use thiserror::Error;
@@ -42,8 +45,19 @@ const CONSOLE_ASSERTION_AUDIENCE: &str = "blaktail-coord";
 const MAX_CONSOLE_ASSERTION_LIFETIME_SECS: i64 = 60;
 const CONSOLE_ASSERTION_CLOCK_SKEW_SECS: i64 = 5;
 const BOOTSTRAP_RESERVATION_TTL_SECS: i64 = 60 * 60;
+const POSTGRES_MIGRATION_LOCK: i64 = 0x424c_414b_5441_494c;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseBackend {
+    Sqlite,
+    Postgres,
+}
+
 #[derive(Clone)]
-pub struct Store(Arc<Mutex<Connection>>);
+pub struct Store {
+    pool: AnyPool,
+    backend: DatabaseBackend,
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -53,77 +67,184 @@ pub enum StoreError {
     UnsupportedSchema { found: i64, supported: i64 },
     #[error("invalid coordinator migration plan: expected version {expected}, found {found}")]
     InvalidMigrationPlan { expected: i64, found: i64 },
+    #[error("invalid SQLite database path: {0}")]
+    InvalidDatabasePath(String),
     #[error(transparent)]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] sqlx::Error),
 }
 
 struct Migration {
     version: i64,
     name: &'static str,
-    apply: fn(&Connection) -> Result<(), rusqlite::Error>,
+    postgres_sql: &'static str,
 }
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
-        name: "consolidated SQLite baseline",
-        apply: migrate_to_v1,
+        name: "consolidated baseline",
+        postgres_sql: include_str!("../migrations/postgres/0001_baseline.sql"),
     },
     Migration {
         version: 2,
         name: "friendly device names",
-        apply: migrate_to_v2,
+        postgres_sql: include_str!("../migrations/postgres/0002_friendly_device_names.sql"),
     },
     Migration {
         version: 3,
         name: "console assertion replay protection",
-        apply: migrate_to_v3,
+        postgres_sql: include_str!("../migrations/postgres/0003_console_assertion_nonces.sql"),
     },
     Migration {
         version: 4,
         name: "bootstrap reservations and device poll throttling",
-        apply: migrate_to_v4,
+        postgres_sql: include_str!("../migrations/postgres/0004_bootstrap_and_poll_throttling.sql"),
     },
 ];
 
 impl Store {
     /// Opens a database and applies pending migrations. Operator-controlled
     /// migration commands use this; service startup must use `open_existing`.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let mut db = Connection::open(path)?;
-        db.execute_batch("PRAGMA foreign_keys=ON;")?;
-        apply_migrations(&mut db)?;
-        db.execute_batch("PRAGMA journal_mode=WAL;")?;
-        Ok(Self(Arc::new(Mutex::new(db))))
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let pool = connect_sqlite(path.as_ref(), true).await?;
+        apply_sqlite_migrations(&pool).await?;
+        configure_sqlite(&pool).await?;
+        Ok(Self {
+            pool,
+            backend: DatabaseBackend::Sqlite,
+        })
     }
 
     /// Opens an already-migrated database without creating or changing schema.
-    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let db = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        db.execute_batch("PRAGMA foreign_keys=ON;")?;
-        validate_schema_version(&db)?;
-        db.execute_batch("PRAGMA journal_mode=WAL;")?;
-        Ok(Self(Arc::new(Mutex::new(db))))
+    pub async fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let pool = connect_sqlite(path.as_ref(), false).await?;
+        validate_schema_version(&pool, DatabaseBackend::Sqlite).await?;
+        configure_sqlite(&pool).await?;
+        Ok(Self {
+            pool,
+            backend: DatabaseBackend::Sqlite,
+        })
     }
 
-    pub fn readiness(&self) -> Result<(), StoreError> {
-        self.0
-            .lock()
-            .expect("coordinator database lock poisoned")
-            .query_row("SELECT COUNT(*) FROM orgs", [], |row| row.get::<_, i64>(0))?;
+    /// Applies PostgreSQL migrations under an advisory lock so multiple
+    /// deployment jobs cannot race schema changes.
+    pub async fn migrate_postgres(database_url: &str) -> Result<Self, StoreError> {
+        let pool = connect_postgres(database_url).await?;
+        apply_postgres_migrations(&pool).await?;
+        Ok(Self {
+            pool,
+            backend: DatabaseBackend::Postgres,
+        })
+    }
+
+    /// Opens PostgreSQL without mutating schema. Service replicas use this.
+    pub async fn open_existing_postgres(database_url: &str) -> Result<Self, StoreError> {
+        let pool = connect_postgres(database_url).await?;
+        validate_schema_version(&pool, DatabaseBackend::Postgres).await?;
+        Ok(Self {
+            pool,
+            backend: DatabaseBackend::Postgres,
+        })
+    }
+
+    pub async fn readiness(&self) -> Result<(), StoreError> {
+        validate_schema_version(&self.pool, self.backend).await?;
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM orgs")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(())
     }
 
-    pub fn memory() -> Result<Self, StoreError> {
-        Self::open(":memory:")
+    pub async fn memory() -> Result<Self, StoreError> {
+        install_default_drivers();
+        let pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await?;
+        apply_sqlite_migrations(&pool).await?;
+        configure_sqlite(&pool).await?;
+        Ok(Self {
+            pool,
+            backend: DatabaseBackend::Sqlite,
+        })
     }
 }
 
-fn validate_schema_version(db: &Connection) -> Result<(), StoreError> {
-    let found = db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+async fn connect_sqlite(path: &Path, create: bool) -> Result<AnyPool, StoreError> {
+    install_default_drivers();
+    let absolute = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        std::env::current_dir().map_err(sqlx::Error::Io)?.join(path)
+    };
+    let file_url = url::Url::from_file_path(&absolute)
+        .map_err(|_| StoreError::InvalidDatabasePath(absolute.display().to_string()))?;
+    let suffix = file_url
+        .as_str()
+        .strip_prefix("file://")
+        .expect("file URL has file scheme");
+    let mode = if create { "rwc" } else { "rw" };
+    let url = format!("sqlite://{suffix}?mode={mode}");
+    Ok(AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?)
+}
+
+async fn connect_postgres(database_url: &str) -> Result<AnyPool, StoreError> {
+    install_default_drivers();
+    Ok(AnyPoolOptions::new()
+        .max_connections(10)
+        .connect(database_url)
+        .await?)
+}
+
+async fn configure_sqlite(pool: &AnyPool) -> Result<(), StoreError> {
+    sqlx::raw_sql("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+async fn schema_version(pool: &AnyPool, backend: DatabaseBackend) -> Result<i64, StoreError> {
+    match backend {
+        DatabaseBackend::Sqlite => Ok(sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(pool)
+            .await?),
+        DatabaseBackend::Postgres => Ok(sqlx::query_scalar(
+            "SELECT COALESCE(MAX(version),0) FROM coordinator_schema_migrations",
+        )
+        .fetch_one(pool)
+        .await?),
+    }
+}
+
+async fn validate_schema_version(
+    pool: &AnyPool,
+    backend: DatabaseBackend,
+) -> Result<(), StoreError> {
+    let found = if backend == DatabaseBackend::Postgres {
+        let rows =
+            sqlx::query("SELECT version FROM coordinator_schema_migrations ORDER BY version")
+                .fetch_all(pool)
+                .await?;
+        let versions = rows
+            .iter()
+            .map(|row| row.try_get::<i64, _>(0))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (index, version) in versions.iter().enumerate() {
+            let expected = index as i64 + 1;
+            if *version != expected {
+                return Err(StoreError::InvalidMigrationPlan {
+                    expected,
+                    found: *version,
+                });
+            }
+        }
+        versions.last().copied().unwrap_or(0)
+    } else {
+        schema_version(pool, backend).await?
+    };
     if found > CURRENT_SCHEMA_VERSION {
         return Err(StoreError::UnsupportedSchema {
             found,
@@ -139,8 +260,10 @@ fn validate_schema_version(db: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn apply_migrations(db: &mut Connection) -> Result<(), StoreError> {
-    let found = db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
+    let found: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(pool)
+        .await?;
     if found > CURRENT_SCHEMA_VERSION {
         return Err(StoreError::UnsupportedSchema {
             found,
@@ -160,10 +283,27 @@ fn apply_migrations(db: &mut Connection) -> Result<(), StoreError> {
                 found: migration.version,
             });
         }
-        let tx = db.transaction()?;
-        (migration.apply)(&tx)?;
-        tx.pragma_update(None, "user_version", migration.version)?;
-        tx.commit()?;
+        let mut tx = pool.begin().await?;
+        match migration.version {
+            1 => migrate_sqlite_to_v1(&mut tx).await?,
+            2 => migrate_sqlite_to_v2(&mut tx).await?,
+            3 => migrate_sqlite_to_v3(&mut tx).await?,
+            4 => migrate_sqlite_to_v4(&mut tx).await?,
+            found => {
+                return Err(StoreError::InvalidMigrationPlan { expected, found });
+            }
+        }
+        let version_sql = match migration.version {
+            1 => "PRAGMA user_version=1",
+            2 => "PRAGMA user_version=2",
+            3 => "PRAGMA user_version=3",
+            4 => "PRAGMA user_version=4",
+            found => {
+                return Err(StoreError::InvalidMigrationPlan { expected, found });
+            }
+        };
+        sqlx::raw_sql(version_sql).execute(&mut *tx).await?;
+        tx.commit().await?;
         info!(
             version = migration.version,
             name = migration.name,
@@ -180,66 +320,158 @@ fn apply_migrations(db: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn migrate_to_v1(db: &Connection) -> Result<(), rusqlite::Error> {
-    db.execute_batch(SCHEMA)?;
-    // Version zero includes every pre-runner database. These guarded additions
-    // consolidate that historical schema into the version-one baseline.
-    ensure_column(db, "join_keys", "user_id", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(
-        db,
-        "join_keys",
-        "user_role",
-        "TEXT NOT NULL DEFAULT 'owner'",
-    )?;
-    ensure_column(db, "join_keys", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
-    ensure_column(db, "nodes", "user_id", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(db, "nodes", "user_role", "TEXT NOT NULL DEFAULT 'owner'")?;
-    ensure_column(db, "nodes", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
-    ensure_column(db, "nodes", "dns_name", "TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(
-        db,
-        "nodes",
-        "advertised_routes_json",
-        "TEXT NOT NULL DEFAULT '[]'",
-    )?;
-    ensure_column(
-        db,
-        "nodes",
-        "approved_routes_json",
-        "TEXT NOT NULL DEFAULT '[]'",
-    )?;
-    ensure_column(db, "nodes", "relay_endpoint", "TEXT")?;
-    ensure_column(db, "nodes", "relay_endpoint_updated_at", "INTEGER")?;
-    ensure_column(
-        db,
-        "orgs",
-        "node_key_ttl_seconds",
-        "INTEGER NOT NULL DEFAULT 7776000",
-    )?;
-    ensure_column(
-        db,
-        "nodes",
-        "credential_expires_at",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    db.execute(
-        "UPDATE nodes SET credential_expires_at=CAST(created_at AS INTEGER)+(SELECT node_key_ttl_seconds FROM orgs WHERE orgs.id=nodes.org_id) WHERE credential_expires_at=0",
-        [],
-    )?;
-    normalise_dns_names(db)?;
-    backfill_ipv6_addresses(db)?;
-    db.execute_batch(
-        "CREATE UNIQUE INDEX IF NOT EXISTS nodes_dns_name_org_idx ON nodes(org_id,dns_name) WHERE dns_name<>''",
-    )?;
+async fn apply_postgres_migrations(pool: &AnyPool) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(POSTGRES_MIGRATION_LOCK)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS coordinator_schema_migrations (
+            version BIGINT PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at BIGINT NOT NULL
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let rows = sqlx::query("SELECT version FROM coordinator_schema_migrations ORDER BY version")
+        .fetch_all(&mut *tx)
+        .await?;
+    let versions = rows
+        .iter()
+        .map(|row| row.try_get::<i64, _>(0))
+        .collect::<Result<Vec<_>, _>>()?;
+    for (index, version) in versions.iter().enumerate() {
+        let expected = index as i64 + 1;
+        if *version != expected {
+            return Err(StoreError::InvalidMigrationPlan {
+                expected,
+                found: *version,
+            });
+        }
+    }
+    let found = versions.last().copied().unwrap_or(0);
+    if found > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    let mut applied = found;
+    for migration in MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > found)
+    {
+        let expected = applied + 1;
+        if migration.version != expected {
+            return Err(StoreError::InvalidMigrationPlan {
+                expected,
+                found: migration.version,
+            });
+        }
+        sqlx::raw_sql(migration.postgres_sql)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO coordinator_schema_migrations(version,name,applied_at) VALUES($1,$2,$3)",
+        )
+        .bind(migration.version)
+        .bind(migration.name)
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+        info!(
+            version = migration.version,
+            name = migration.name,
+            "coordinator database migration applied"
+        );
+        applied = migration.version;
+    }
+    if applied != CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidMigrationPlan {
+            expected: CURRENT_SCHEMA_VERSION,
+            found: applied,
+        });
+    }
+    tx.commit().await?;
     Ok(())
 }
 
-fn migrate_to_v2(db: &Connection) -> Result<(), rusqlite::Error> {
-    ensure_column(db, "nodes", "display_name", "TEXT")
+async fn migrate_sqlite_to_v1(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(SCHEMA).execute(&mut **tx).await?;
+    // Version zero includes every pre-runner database. These guarded additions
+    // consolidate that historical schema into the version-one baseline.
+    ensure_column(tx, "join_keys", "user_id", "TEXT NOT NULL DEFAULT ''").await?;
+    ensure_column(
+        tx,
+        "join_keys",
+        "user_role",
+        "TEXT NOT NULL DEFAULT 'owner'",
+    )
+    .await?;
+    ensure_column(tx, "join_keys", "tags_json", "TEXT NOT NULL DEFAULT '[]'").await?;
+    ensure_column(tx, "nodes", "user_id", "TEXT NOT NULL DEFAULT ''").await?;
+    ensure_column(tx, "nodes", "user_role", "TEXT NOT NULL DEFAULT 'owner'").await?;
+    ensure_column(tx, "nodes", "tags_json", "TEXT NOT NULL DEFAULT '[]'").await?;
+    ensure_column(tx, "nodes", "dns_name", "TEXT NOT NULL DEFAULT ''").await?;
+    ensure_column(
+        tx,
+        "nodes",
+        "advertised_routes_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    ensure_column(
+        tx,
+        "nodes",
+        "approved_routes_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    ensure_column(tx, "nodes", "relay_endpoint", "TEXT").await?;
+    ensure_column(tx, "nodes", "relay_endpoint_updated_at", "INTEGER").await?;
+    ensure_column(
+        tx,
+        "orgs",
+        "node_key_ttl_seconds",
+        "INTEGER NOT NULL DEFAULT 7776000",
+    )
+    .await?;
+    ensure_column(
+        tx,
+        "nodes",
+        "credential_expires_at",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE nodes SET credential_expires_at=CAST(created_at AS INTEGER)+(SELECT node_key_ttl_seconds FROM orgs WHERE orgs.id=nodes.org_id) WHERE credential_expires_at=0",
+    )
+    .execute(&mut **tx)
+    .await?;
+    normalise_dns_names(tx).await?;
+    backfill_ipv6_addresses(tx).await?;
+    sqlx::raw_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS nodes_dns_name_org_idx ON nodes(org_id,dns_name) WHERE dns_name<>''",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
-fn migrate_to_v3(db: &Connection) -> Result<(), rusqlite::Error> {
-    db.execute_batch(
+async fn migrate_sqlite_to_v2(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    ensure_column(tx, "nodes", "display_name", "TEXT").await
+}
+
+async fn migrate_sqlite_to_v3(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS console_assertion_nonces (
             jti_hash TEXT PRIMARY KEY,
             expires_at INTEGER NOT NULL
@@ -247,11 +479,16 @@ fn migrate_to_v3(db: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS console_assertion_nonces_expiry_idx
             ON console_assertion_nonces(expires_at);",
     )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
-fn migrate_to_v4(db: &Connection) -> Result<(), rusqlite::Error> {
-    ensure_column(db, "device_authorizations", "last_polled_at", "INTEGER")?;
-    db.execute_batch(
+async fn migrate_sqlite_to_v4(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    ensure_column(tx, "device_authorizations", "last_polled_at", "INTEGER").await?;
+    sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS pending_bootstrap_orgs (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL UNIQUE,
@@ -263,26 +500,22 @@ fn migrate_to_v4(db: &Connection) -> Result<(), rusqlite::Error> {
         CREATE INDEX IF NOT EXISTS pending_bootstrap_orgs_expiry_idx
             ON pending_bootstrap_orgs(expires_at);",
     )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
-fn normalise_dns_names(db: &Connection) -> Result<(), rusqlite::Error> {
-    let rows = {
-        let mut query =
-            db.prepare("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")?;
-        let collected = query
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        collected
-    };
+async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
+    let rows =
+        sqlx::query("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")
+            .fetch_all(&mut **tx)
+            .await?;
     let mut used = std::collections::HashSet::new();
-    for (id, org_id, name, current) in rows {
+    for row in rows {
+        let id: String = row.try_get(0)?;
+        let org_id: String = row.try_get(1)?;
+        let name: String = row.try_get(2)?;
+        let current: String = row.try_get(3)?;
         let base = magic_dns_name(&name, &org_id);
         let mut desired = base.clone();
         if used.contains(&(org_id.clone(), desired.clone())) {
@@ -303,30 +536,26 @@ fn normalise_dns_names(db: &Connection) -> Result<(), rusqlite::Error> {
         }
         used.insert((org_id, desired.clone()));
         if current != desired {
-            db.execute(
-                "UPDATE nodes SET dns_name=?1 WHERE id=?2",
-                params![desired, id],
-            )?;
+            sqlx::query("UPDATE nodes SET dns_name=$1 WHERE id=$2")
+                .bind(desired)
+                .bind(id)
+                .execute(&mut **tx)
+                .await?;
         }
     }
     Ok(())
 }
 
-fn backfill_ipv6_addresses(db: &Connection) -> Result<(), rusqlite::Error> {
-    let rows = {
-        let mut query = db.prepare("SELECT id,org_id,allowed_ips_json FROM nodes")?;
-        let collected = query
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        collected
-    };
-    for (node_id, org_id, addresses_json) in rows {
+async fn backfill_ipv6_addresses(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    let rows = sqlx::query("SELECT id,org_id,allowed_ips_json FROM nodes")
+        .fetch_all(&mut **tx)
+        .await?;
+    for row in rows {
+        let node_id: String = row.try_get(0)?;
+        let org_id: String = row.try_get(1)?;
+        let addresses_json: String = row.try_get(2)?;
         let mut addresses: Vec<String> = serde_json::from_str(&addresses_json).unwrap_or_default();
         if addresses.iter().any(|address| address.contains(':')) {
             continue;
@@ -335,27 +564,34 @@ fn backfill_ipv6_addresses(db: &Connection) -> Result<(), rusqlite::Error> {
             continue;
         };
         addresses.push(org_ula_address(&org_id, host));
-        db.execute(
-            "UPDATE nodes SET allowed_ips_json=?1 WHERE id=?2",
-            params![serde_json::to_string(&addresses).unwrap(), node_id],
-        )?;
+        sqlx::query("UPDATE nodes SET allowed_ips_json=$1 WHERE id=$2")
+            .bind(serde_json::to_string(&addresses).unwrap())
+            .bind(node_id)
+            .execute(&mut **tx)
+            .await?;
     }
     Ok(())
 }
-fn ensure_column(
-    db: &Connection,
+async fn ensure_column(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
     table: &str,
     column: &str,
     definition: &str,
-) -> Result<(), rusqlite::Error> {
-    let mut statement = db.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names = statement
-        .query_map([], |row| row.get::<_, String>(1))?
+) -> Result<(), sqlx::Error> {
+    // Every identifier and definition comes from the static migration plan.
+    let rows = sqlx::query(AssertSqlSafe(format!("PRAGMA table_info({table})")))
+        .fetch_all(&mut **tx)
+        .await?;
+    let names = rows
+        .iter()
+        .map(|row| row.try_get::<String, _>(1))
         .collect::<Result<Vec<_>, _>>()?;
     if !names.iter().any(|name| name == column) {
-        db.execute_batch(&format!(
+        sqlx::raw_sql(AssertSqlSafe(format!(
             "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        ))?;
+        )))
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(())
 }
@@ -512,11 +748,12 @@ async fn prometheus_metrics(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require_diagnostics_authorization(&headers, &state.diagnostics_token)?;
-    let active_nodes: i64 = state.store.0.lock().unwrap().query_row(
-        "SELECT COUNT(*) FROM nodes WHERE revoked_at IS NULL AND credential_expires_at>?1",
-        params![now()],
-        |row| row.get(0),
-    )?;
+    let active_nodes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM nodes WHERE revoked_at IS NULL AND credential_expires_at>$1",
+    )
+    .bind(now())
+    .fetch_one(&state.store.pool)
+    .await?;
     Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         state.metrics.render(active_nodes.max(0) as u64),
@@ -528,7 +765,11 @@ async fn private_readiness(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
     require_diagnostics_authorization(&headers, &state.diagnostics_token)?;
-    state.store.readiness().map_err(|_| ApiError::Unavailable)?;
+    state
+        .store
+        .readiness()
+        .await
+        .map_err(|_| ApiError::Unavailable)?;
     Ok(Json(serde_json::json!({
         "status": "ready",
         "database": "ok",
@@ -599,7 +840,9 @@ enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("database error")]
-    Database(#[from] rusqlite::Error),
+    Database(#[from] sqlx::Error),
+    #[error("database contains invalid application data")]
+    CorruptData,
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -613,7 +856,7 @@ impl IntoResponse for ApiError {
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Database(_) | Self::CorruptData => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, Json(serde_json::json!({"error":self.to_string()}))).into_response()
     }
@@ -627,7 +870,7 @@ async fn liveness() -> Json<Health> {
 }
 
 async fn readiness(State(state): State<AppState>) -> Response {
-    match state.store.readiness() {
+    match state.store.readiness().await {
         Ok(()) => (StatusCode::OK, Json(Health { status: "ready" })).into_response(),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -720,16 +963,16 @@ async fn create_device_authorization(
 
     let created_at = now();
     let expires_at = created_at + DEVICE_AUTH_TTL_SECS;
-    let db = s.store.0.lock().unwrap();
-    db.execute(
-        "DELETE FROM device_authorizations WHERE expires_at<=?1",
-        params![created_at],
-    )?;
-    let pending: i64 = db.query_row(
-        "SELECT COUNT(*) FROM device_authorizations WHERE approved_at IS NULL AND expires_at>?1",
-        params![created_at],
-        |row| row.get(0),
-    )?;
+    sqlx::query("DELETE FROM device_authorizations WHERE expires_at<=$1")
+        .bind(created_at)
+        .execute(&s.store.pool)
+        .await?;
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM device_authorizations WHERE approved_at IS NULL AND expires_at>$1",
+    )
+    .bind(created_at)
+    .fetch_one(&s.store.pool)
+    .await?;
     if pending >= MAX_PENDING_DEVICE_AUTHS {
         return Err(ApiError::TooManyRequests);
     }
@@ -737,17 +980,19 @@ async fn create_device_authorization(
     for _ in 0..5 {
         let device_code = secret("btd");
         let user_code = user_code();
-        let result = db.execute(
-            "INSERT INTO device_authorizations(id,device_code_hash,user_code_hash,requested_name,wg_public_key,expires_at) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![
-                Uuid::new_v4().to_string(),
-                hash(&device_code),
-                hash(&normalise_user_code(&user_code).expect("generated user code is valid")),
-                name,
-                public_key,
-                expires_at,
-            ],
-        );
+        let result = sqlx::query(
+            "INSERT INTO device_authorizations(id,device_code_hash,user_code_hash,requested_name,wg_public_key,expires_at) VALUES($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(hash(&device_code))
+        .bind(hash(
+            &normalise_user_code(&user_code).expect("generated user code is valid"),
+        ))
+        .bind(name)
+        .bind(public_key)
+        .bind(expires_at)
+        .execute(&s.store.pool)
+        .await;
         match result {
             Ok(_) => {
                 return Ok((
@@ -761,7 +1006,7 @@ async fn create_device_authorization(
                     }),
                 ));
             }
-            Err(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == 2067 => {}
+            Err(ref error) if is_unique_violation(error) => {}
             Err(error) => return Err(ApiError::Database(error)),
         }
     }
@@ -774,22 +1019,22 @@ async fn poll_device_authorization(
     State(s): State<AppState>,
     UrlPath(device_code): UrlPath<String>,
 ) -> Result<Response, ApiError> {
-    let db = s.store.0.lock().unwrap();
-    let row: Option<DeviceAuthorizationPollRow> = db
-        .query_row(
-            "SELECT expires_at,approved_at,consumed_at,last_polled_at
-             FROM device_authorizations WHERE device_code_hash=?1",
-            params![hash(device_code.trim())],
-            |row| {
-                Ok(DeviceAuthorizationPollRow {
-                    expires_at: row.get(0)?,
-                    approved_at: row.get(1)?,
-                    consumed_at: row.get(2)?,
-                    last_polled_at: row.get(3)?,
-                })
-            },
-        )
-        .optional()?;
+    let row = sqlx::query(
+        "SELECT expires_at,approved_at,consumed_at,last_polled_at
+             FROM device_authorizations WHERE device_code_hash=$1",
+    )
+    .bind(hash(device_code.trim()))
+    .fetch_optional(&s.store.pool)
+    .await?
+    .map(|row| {
+        Ok::<_, sqlx::Error>(DeviceAuthorizationPollRow {
+            expires_at: row.try_get(0)?,
+            approved_at: row.try_get(1)?,
+            consumed_at: row.try_get(2)?,
+            last_polled_at: row.try_get(3)?,
+        })
+    })
+    .transpose()?;
     let row = row.ok_or(ApiError::Unauthorized)?;
     let current_time = now();
     if row.expires_at <= current_time || row.consumed_at.is_some() {
@@ -809,10 +1054,11 @@ async fn poll_device_authorization(
         )
             .into_response());
     }
-    db.execute(
-        "UPDATE device_authorizations SET last_polled_at=?1 WHERE device_code_hash=?2",
-        params![current_time, hash(device_code.trim())],
-    )?;
+    sqlx::query("UPDATE device_authorizations SET last_polled_at=$1 WHERE device_code_hash=$2")
+        .bind(current_time)
+        .bind(hash(device_code.trim()))
+        .execute(&s.store.pool)
+        .await?;
     let (status, state) = if row.approved_at.is_some() {
         (StatusCode::OK, "approved")
     } else {
@@ -833,25 +1079,25 @@ async fn get_device_authorization(
     UrlPath((org_id, user_code)): UrlPath<(Uuid, String)>,
     headers: HeaderMap,
 ) -> Result<Json<DeviceAuthorizationPreview>, ApiError> {
-    console_session(&s, &headers, org_id)?;
+    console_session(&s, &headers, org_id).await?;
     let code = normalise_user_code(&user_code)
         .ok_or_else(|| ApiError::BadRequest("device code must contain eight characters".into()))?;
-    let db = s.store.0.lock().unwrap();
-    let row: Option<DeviceAuthorizationPreviewRow> = db
-        .query_row(
-            "SELECT requested_name,wg_public_key,expires_at,approved_at,org_id FROM device_authorizations WHERE user_code_hash=?1",
-            params![hash(&code)],
-            |row| {
-                Ok(DeviceAuthorizationPreviewRow {
-                    name: row.get(0)?,
-                    public_key: row.get(1)?,
-                    expires_at: row.get(2)?,
-                    approved_at: row.get(3)?,
-                    approved_org: row.get(4)?,
-                })
-            },
+    let row = sqlx::query(
+            "SELECT requested_name,wg_public_key,expires_at,approved_at,org_id FROM device_authorizations WHERE user_code_hash=$1",
         )
-        .optional()?;
+        .bind(hash(&code))
+        .fetch_optional(&s.store.pool)
+        .await?
+        .map(|row| {
+            Ok::<_, sqlx::Error>(DeviceAuthorizationPreviewRow {
+                name: row.try_get(0)?,
+                public_key: row.try_get(1)?,
+                expires_at: row.try_get(2)?,
+                approved_at: row.try_get(3)?,
+                approved_org: row.try_get(4)?,
+            })
+        })
+        .transpose()?;
     let row = row.ok_or(ApiError::NotFound)?;
     if row.expires_at <= now() {
         return Err(ApiError::Gone);
@@ -877,7 +1123,7 @@ async fn approve_device_authorization(
     headers: HeaderMap,
     Json(input): Json<ApproveDeviceAuthorization>,
 ) -> Result<Json<DeviceAuthorizationApproval>, ApiError> {
-    let session = console_session(&s, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id).await?;
     let code = normalise_user_code(&user_code)
         .ok_or_else(|| ApiError::BadRequest("device code must contain eight characters".into()))?;
     let tags = if session.role == Role::Member {
@@ -885,24 +1131,26 @@ async fn approve_device_authorization(
     } else {
         canonical_tags(input.tags)
     };
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
-    let row: Option<DeviceAuthorizationApprovalRow> = tx
-        .query_row(
-            "SELECT id,device_code_hash,expires_at,approved_at,org_id,user_id FROM device_authorizations WHERE user_code_hash=?1",
-            params![hash(&code)],
-            |row| {
-                Ok(DeviceAuthorizationApprovalRow {
-                    id: row.get(0)?,
-                    device_code_hash: row.get(1)?,
-                    expires_at: row.get(2)?,
-                    approved_at: row.get(3)?,
-                    approved_org: row.get(4)?,
-                    approved_user: row.get(5)?,
-                })
-            },
-        )
-        .optional()?;
+    let mut tx = s.store.pool.begin().await?;
+    let approval_query = match s.store.backend {
+        DatabaseBackend::Sqlite => "SELECT id,device_code_hash,expires_at,approved_at,org_id,user_id FROM device_authorizations WHERE user_code_hash=$1",
+        DatabaseBackend::Postgres => "SELECT id,device_code_hash,expires_at,approved_at,org_id,user_id FROM device_authorizations WHERE user_code_hash=$1 FOR UPDATE",
+    };
+    let row = sqlx::query(approval_query)
+        .bind(hash(&code))
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| {
+            Ok::<_, sqlx::Error>(DeviceAuthorizationApprovalRow {
+                id: row.try_get(0)?,
+                device_code_hash: row.try_get(1)?,
+                expires_at: row.try_get(2)?,
+                approved_at: row.try_get(3)?,
+                approved_org: row.try_get(4)?,
+                approved_user: row.try_get(5)?,
+            })
+        })
+        .transpose()?;
     let row = row.ok_or(ApiError::NotFound)?;
     if row.expires_at <= now() {
         return Err(ApiError::Gone);
@@ -922,42 +1170,43 @@ async fn approve_device_authorization(
     }
     let join_key_id = Uuid::new_v4();
     let tags_json = serde_json::to_string(&tags).unwrap();
-    let inserted = tx
-        .execute(
-        "INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT ?1,id,?2,?3,1,?4,?5,?6,?7 FROM orgs WHERE id=?8",
-        params![
-            join_key_id.to_string(),
-            row.device_code_hash,
-            row.expires_at,
-            now(),
-            session.user_id,
-            session.role.as_str(),
-            tags_json,
-            org_id.to_string(),
-        ],
+    let inserted = sqlx::query(
+        "INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT $1,id,$2,$3,1,$4,$5,$6,$7 FROM orgs WHERE id=$8",
     )
-        .map_err(conflict("device authorization was already approved"))?;
+    .bind(join_key_id.to_string())
+    .bind(&row.device_code_hash)
+    .bind(row.expires_at)
+    .bind(now())
+    .bind(&session.user_id)
+    .bind(session.role.as_str())
+    .bind(tags_json)
+    .bind(org_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(conflict("device authorization was already approved"))?
+    .rows_affected();
     if inserted != 1 {
         return Err(ApiError::NotFound);
     }
-    let changed = tx.execute(
-        "UPDATE device_authorizations SET approved_at=?1,org_id=?2,user_id=?3,user_role=?4,tags_json=?5 WHERE user_code_hash=?6 AND approved_at IS NULL",
-        params![
-            now(),
-            org_id.to_string(),
-            session.user_id,
-            session.role.as_str(),
-            serde_json::to_string(&tags).unwrap(),
-            hash(&code),
-        ],
-    )?;
+    let changed = sqlx::query(
+        "UPDATE device_authorizations SET approved_at=$1,org_id=$2,user_id=$3,user_role=$4,tags_json=$5 WHERE user_code_hash=$6 AND approved_at IS NULL",
+    )
+    .bind(now())
+    .bind(org_id.to_string())
+    .bind(&session.user_id)
+    .bind(session.role.as_str())
+    .bind(serde_json::to_string(&tags).unwrap())
+    .bind(hash(&code))
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     if changed != 1 {
         return Err(ApiError::Conflict(
             "device authorization was already approved".into(),
         ));
     }
     append_audit(
-        &tx,
+        &mut tx,
         org_id,
         &session,
         "join_key.minted",
@@ -969,17 +1218,19 @@ async fn approve_device_authorization(
             "source": "browser_enrollment",
             "tags": tags,
         }),
-    )?;
+    )
+    .await?;
     append_audit(
-        &tx,
+        &mut tx,
         org_id,
         &session,
         "device_authorization.approved",
         "device_authorization",
         Some(&row.id),
         &serde_json::json!({"join_key_id": join_key_id}),
-    )?;
-    tx.commit()?;
+    )
+    .await?;
+    tx.commit().await?;
     info!(%org_id, user_id = %session.user_id, "device authorization approved");
     Ok(Json(DeviceAuthorizationApproval {
         status: "approved".into(),
@@ -1013,7 +1264,7 @@ async fn prepare_org(
     headers: HeaderMap,
     Json(input): Json<CreateOrg>,
 ) -> Result<(StatusCode, Json<OrgResponse>), ApiError> {
-    service_session(&s, &headers, input.id, "bootstrap.prepare")?;
+    service_session(&s, &headers, input.id, "bootstrap.prepare").await?;
     let name = input.name.trim();
     if name.is_empty() {
         return Err(ApiError::BadRequest("org name must not be empty".into()));
@@ -1024,18 +1275,16 @@ async fn prepare_org(
     acl.validate()?;
     let acl_json = input.acl.to_string();
     let current_time = now();
-    let db = s.store.0.lock().unwrap();
-    db.execute(
-        "DELETE FROM pending_bootstrap_orgs WHERE expires_at<=?1",
-        params![current_time],
-    )?;
-    let active: Option<(String, i64)> = db
-        .query_row(
-            "SELECT name,node_key_ttl_seconds FROM orgs WHERE id=?1",
-            params![input.id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+    sqlx::query("DELETE FROM pending_bootstrap_orgs WHERE expires_at<=$1")
+        .bind(current_time)
+        .execute(&s.store.pool)
+        .await?;
+    let active = sqlx::query("SELECT name,node_key_ttl_seconds FROM orgs WHERE id=$1")
+        .bind(input.id.to_string())
+        .fetch_optional(&s.store.pool)
+        .await?
+        .map(|row| Ok::<_, sqlx::Error>((row.try_get(0)?, row.try_get(1)?)))
+        .transpose()?;
     if let Some((existing_name, existing_ttl)) = active {
         if existing_name != name || existing_ttl != input.node_key_ttl_seconds {
             return Err(ApiError::Conflict(
@@ -1051,13 +1300,20 @@ async fn prepare_org(
             }),
         ));
     }
-    let pending: Option<(String, String, i64)> = db
-        .query_row(
-            "SELECT name,acl_json,node_key_ttl_seconds FROM pending_bootstrap_orgs WHERE id=?1",
-            params![input.id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
+    let pending = sqlx::query(
+        "SELECT name,acl_json,node_key_ttl_seconds FROM pending_bootstrap_orgs WHERE id=$1",
+    )
+    .bind(input.id.to_string())
+    .fetch_optional(&s.store.pool)
+    .await?
+    .map(|row| {
+        Ok::<_, sqlx::Error>((
+            row.try_get::<String, _>(0)?,
+            row.try_get::<String, _>(1)?,
+            row.try_get::<i64, _>(2)?,
+        ))
+    })
+    .transpose()?;
     if let Some((existing_name, existing_acl, existing_ttl)) = pending {
         if existing_name != name
             || existing_acl != acl_json
@@ -1076,18 +1332,18 @@ async fn prepare_org(
             }),
         ));
     }
-    db.execute(
+    sqlx::query(
         "INSERT INTO pending_bootstrap_orgs(id,name,acl_json,node_key_ttl_seconds,created_at,expires_at)
-         VALUES(?1,?2,?3,?4,?5,?6)",
-        params![
-            input.id.to_string(),
-            name,
-            acl_json,
-            input.node_key_ttl_seconds,
-            current_time,
-            current_time + BOOTSTRAP_RESERVATION_TTL_SECS,
-        ],
+         VALUES($1,$2,$3,$4,$5,$6)",
     )
+    .bind(input.id.to_string())
+    .bind(name)
+    .bind(acl_json)
+    .bind(input.node_key_ttl_seconds)
+    .bind(current_time)
+    .bind(current_time + BOOTSTRAP_RESERVATION_TTL_SECS)
+    .execute(&s.store.pool)
+    .await
     .map_err(conflict("org name already exists"))?;
     Ok((
         StatusCode::ACCEPTED,
@@ -1104,15 +1360,13 @@ async fn commit_org(
     UrlPath(org_id): UrlPath<Uuid>,
     headers: HeaderMap,
 ) -> Result<(StatusCode, Json<OrgResponse>), ApiError> {
-    let service = service_session(&s, &headers, org_id, "bootstrap.commit")?;
-    let mut db = s.store.0.lock().unwrap();
-    let active: Option<(String, i64)> = db
-        .query_row(
-            "SELECT name,node_key_ttl_seconds FROM orgs WHERE id=?1",
-            params![org_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+    let service = service_session(&s, &headers, org_id, "bootstrap.commit").await?;
+    let active = sqlx::query("SELECT name,node_key_ttl_seconds FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&s.store.pool)
+        .await?
+        .map(|row| Ok::<_, sqlx::Error>((row.try_get(0)?, row.try_get(1)?)))
+        .transpose()?;
     if let Some((name, node_key_ttl_seconds)) = active {
         return Ok((
             StatusCode::OK,
@@ -1124,53 +1378,61 @@ async fn commit_org(
         ));
     }
     let current_time = now();
-    let pending: Option<(String, String, i64, i64)> = db
-        .query_row(
-            "SELECT name,acl_json,node_key_ttl_seconds,expires_at
-             FROM pending_bootstrap_orgs WHERE id=?1",
-            params![org_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
+    let pending = sqlx::query(
+        "SELECT name,acl_json,node_key_ttl_seconds,expires_at
+         FROM pending_bootstrap_orgs WHERE id=$1",
+    )
+    .bind(org_id.to_string())
+    .fetch_optional(&s.store.pool)
+    .await?
+    .map(|row| {
+        Ok::<_, sqlx::Error>((
+            row.try_get::<String, _>(0)?,
+            row.try_get::<String, _>(1)?,
+            row.try_get::<i64, _>(2)?,
+            row.try_get::<i64, _>(3)?,
+        ))
+    })
+    .transpose()?;
     let (name, acl_json, node_key_ttl_seconds, expires_at) = pending.ok_or(ApiError::NotFound)?;
     if expires_at <= current_time {
-        db.execute(
-            "DELETE FROM pending_bootstrap_orgs WHERE id=?1",
-            params![org_id.to_string()],
-        )?;
+        sqlx::query("DELETE FROM pending_bootstrap_orgs WHERE id=$1")
+            .bind(org_id.to_string())
+            .execute(&s.store.pool)
+            .await?;
         return Err(ApiError::Gone);
     }
-    let tx = db.transaction()?;
-    tx.execute(
+    let mut tx = s.store.pool.begin().await?;
+    sqlx::query(
         "INSERT INTO orgs(id,name,acl_json,created_at,node_key_ttl_seconds)
-         VALUES(?1,?2,?3,?4,?5)",
-        params![
-            org_id.to_string(),
-            name,
-            acl_json,
-            current_time,
-            node_key_ttl_seconds,
-        ],
+         VALUES($1,$2,$3,$4,$5)",
     )
+    .bind(org_id.to_string())
+    .bind(&name)
+    .bind(acl_json)
+    .bind(current_time)
+    .bind(node_key_ttl_seconds)
+    .execute(&mut *tx)
+    .await
     .map_err(conflict("org name already exists"))?;
-    tx.execute(
+    sqlx::query(
         "INSERT INTO audit_events(id,org_id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at)
-         VALUES(?1,?2,?3,?4,?5,'service','bootstrap.completed','organisation',?2,?6,?7)",
-        params![
-            Uuid::new_v4().to_string(),
-            org_id.to_string(),
-            service.user_id,
-            service.name,
-            service.email,
-            serde_json::json!({"source":"operator_channel","result":"success"}).to_string(),
-            current_time,
-        ],
-    )?;
-    tx.execute(
-        "DELETE FROM pending_bootstrap_orgs WHERE id=?1",
-        params![org_id.to_string()],
-    )?;
-    tx.commit()?;
+         VALUES($1,$2,$3,$4,$5,'service','bootstrap.completed','organisation',$2,$6,$7)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(org_id.to_string())
+    .bind(service.user_id)
+    .bind(service.name)
+    .bind(service.email)
+    .bind(serde_json::json!({"source":"operator_channel","result":"success"}).to_string())
+    .bind(current_time)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM pending_bootstrap_orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok((
         StatusCode::CREATED,
         Json(OrgResponse {
@@ -1194,12 +1456,19 @@ fn validate_node_key_ttl(seconds: i64) -> Result<(), ApiError> {
     }
     Ok(())
 }
-fn conflict(message: &'static str) -> impl FnOnce(rusqlite::Error) -> ApiError {
-    move |e| match e {
-        rusqlite::Error::SqliteFailure(ref c, _) if c.extended_code == 2067 => {
+fn is_unique_violation(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .is_some_and(|error| error.is_unique_violation())
+}
+
+fn conflict(message: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
+    move |error| {
+        if is_unique_violation(&error) {
             ApiError::Conflict(message.into())
+        } else {
+            ApiError::Database(error)
         }
-        other => ApiError::Database(other),
     }
 }
 
@@ -1231,7 +1500,7 @@ async fn mint_join_key(
     headers: HeaderMap,
     Json(input): Json<MintJoinKey>,
 ) -> Result<(StatusCode, Json<JoinKeyResponse>), ApiError> {
-    let session = console_session(&s, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id).await?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
@@ -1244,14 +1513,25 @@ async fn mint_join_key(
     let id = Uuid::new_v4();
     let expires_at = now() + input.expires_in_seconds;
     let tags = canonical_tags(input.tags);
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
-    let changed=tx.execute("INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT ?1,id,?2,?3,?4,?5,?6,?7,?8 FROM orgs WHERE id=?9",params![id.to_string(),hash(&key),expires_at,input.single_use,now(),session.user_id,session.role.as_str(),serde_json::to_string(&tags).unwrap(),org_id.to_string()])?;
+    let mut tx = s.store.pool.begin().await?;
+    let changed = sqlx::query("INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT $1,id,$2,$3,$4,$5,$6,$7,$8 FROM orgs WHERE id=$9")
+        .bind(id.to_string())
+        .bind(hash(&key))
+        .bind(expires_at)
+        .bind(i64::from(input.single_use))
+        .bind(now())
+        .bind(&session.user_id)
+        .bind(session.role.as_str())
+        .bind(serde_json::to_string(&tags).unwrap())
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
     append_audit(
-        &tx,
+        &mut tx,
         org_id,
         &session,
         "join_key.minted",
@@ -1263,8 +1543,9 @@ async fn mint_join_key(
             "source": "console",
             "tags": tags,
         }),
-    )?;
-    tx.commit()?;
+    )
+    .await?;
+    tx.commit().await?;
     Ok((
         StatusCode::CREATED,
         Json(JoinKeyResponse {
@@ -1374,10 +1655,32 @@ async fn register_node(
         ));
     }
     let advertised_routes = validate_advertised_routes(input.advertised_routes)?;
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
+    let mut tx = s.store.pool.begin().await?;
     let input_key_hash = hash(&input.join_key);
-    let grant: Option<RegistrationGrant> = tx.query_row("SELECT k.id,k.org_id,k.single_use,k.used_at IS NOT NULL,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds,d.requested_name,d.wg_public_key FROM join_keys k JOIN orgs o ON o.id=k.org_id LEFT JOIN device_authorizations d ON d.device_code_hash=k.key_hash WHERE k.key_hash=?1 AND k.revoked_at IS NULL AND k.expires_at>?2",params![input_key_hash,now()],|r|Ok(RegistrationGrant { key_id: r.get(0)?, org_id: r.get(1)?, single_use: r.get(2)?, used: r.get(3)?, user_id: r.get(4)?, user_role: r.get(5)?, tags_json: r.get(6)?, node_key_ttl: r.get(7)?, bound_name: r.get(8)?, bound_wg_public_key: r.get(9)? })).optional()?;
+    let registration_query = match s.store.backend {
+        DatabaseBackend::Sqlite => "SELECT k.id,k.org_id,k.single_use,CASE WHEN k.used_at IS NULL THEN 0 ELSE 1 END,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds,d.requested_name,d.wg_public_key FROM join_keys k JOIN orgs o ON o.id=k.org_id LEFT JOIN device_authorizations d ON d.device_code_hash=k.key_hash WHERE k.key_hash=$1 AND k.revoked_at IS NULL AND k.expires_at>$2",
+        DatabaseBackend::Postgres => "SELECT k.id,k.org_id,k.single_use,CASE WHEN k.used_at IS NULL THEN 0 ELSE 1 END,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds,d.requested_name,d.wg_public_key FROM join_keys k JOIN orgs o ON o.id=k.org_id LEFT JOIN device_authorizations d ON d.device_code_hash=k.key_hash WHERE k.key_hash=$1 AND k.revoked_at IS NULL AND k.expires_at>$2 FOR UPDATE OF k",
+    };
+    let grant = sqlx::query(registration_query)
+        .bind(&input_key_hash)
+        .bind(now())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| {
+            Ok::<_, sqlx::Error>(RegistrationGrant {
+                key_id: row.try_get(0)?,
+                org_id: row.try_get(1)?,
+                single_use: row.try_get::<i64, _>(2)? != 0,
+                used: row.try_get::<i64, _>(3)? != 0,
+                user_id: row.try_get(4)?,
+                user_role: row.try_get(5)?,
+                tags_json: row.try_get(6)?,
+                node_key_ttl: row.try_get(7)?,
+                bound_name: row.try_get(8)?,
+                bound_wg_public_key: row.try_get(9)?,
+            })
+        })
+        .transpose()?;
     let grant = grant.ok_or(ApiError::Unauthorized)?;
     if grant.single_use && grant.used {
         return Err(ApiError::Unauthorized);
@@ -1398,23 +1701,42 @@ async fn register_node(
     }
     let id = Uuid::new_v4();
     let token = secret("btn");
-    let allowed_ips = allocate_ips(&tx, &grant.org_id)?;
+    let allowed_ips = allocate_ips(&mut tx, &grant.org_id).await?;
     let assigned_ip = allowed_ips[0].clone();
     let dns_name = magic_dns_name(input.name.trim(), &grant.org_id);
     let registered_at = now();
     let credential_expires_at = registered_at + grant.node_key_ttl;
-    tx.execute("INSERT INTO nodes(id,org_id,name,wg_public_key,endpoint,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,advertised_routes_json,approved_routes_json,credential_expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'[]',?14)",params![id.to_string(),grant.org_id,input.name.trim(),input.wg_public_key.trim(),input.endpoint,serde_json::to_string(&allowed_ips).unwrap(),hash(&token),registered_at,grant.user_id,grant.user_role,grant.tags_json,dns_name,serde_json::to_string(&advertised_routes).unwrap(),credential_expires_at]).map_err(conflict("node name, DNS name, public key, or address already exists in org"))?;
+    sqlx::query("INSERT INTO nodes(id,org_id,name,wg_public_key,endpoint,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,advertised_routes_json,approved_routes_json,credential_expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'[]',$14)")
+        .bind(id.to_string())
+        .bind(&grant.org_id)
+        .bind(input.name.trim())
+        .bind(input.wg_public_key.trim())
+        .bind(input.endpoint)
+        .bind(serde_json::to_string(&allowed_ips).unwrap())
+        .bind(hash(&token))
+        .bind(registered_at)
+        .bind(&grant.user_id)
+        .bind(&grant.user_role)
+        .bind(&grant.tags_json)
+        .bind(&dns_name)
+        .bind(serde_json::to_string(&advertised_routes).unwrap())
+        .bind(credential_expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(conflict("node name, DNS name, public key, or address already exists in org"))?;
     if grant.single_use {
-        tx.execute(
-            "UPDATE join_keys SET used_at=?1 WHERE id=?2",
-            params![now(), grant.key_id],
-        )?;
+        sqlx::query("UPDATE join_keys SET used_at=$1 WHERE id=$2")
+            .bind(now())
+            .bind(&grant.key_id)
+            .execute(&mut *tx)
+            .await?;
     }
-    tx.execute(
-        "UPDATE device_authorizations SET consumed_at=?1 WHERE device_code_hash=?2",
-        params![now(), input_key_hash],
-    )?;
-    tx.commit()?;
+    sqlx::query("UPDATE device_authorizations SET consumed_at=$1 WHERE device_code_hash=$2")
+        .bind(now())
+        .bind(input_key_hash)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     info!(node_id=%id, org_id=%grant.org_id, "node registered");
     let (relay_token, relay_expires_at) = relay_credentials(&s, id);
     Ok((
@@ -1454,14 +1776,18 @@ async fn update_advertised_routes(
 ) -> Result<StatusCode, ApiError> {
     let routes = validate_advertised_routes(input.advertised_routes)?;
     let token = bearer(&headers)?;
-    let db = s.store.0.lock().unwrap();
-    let row: Option<(i64, String)> = db
-        .query_row(
-            "SELECT credential_expires_at,approved_routes_json FROM nodes WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL",
-            params![node_id.to_string(), token],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+    let row = sqlx::query("SELECT credential_expires_at,approved_routes_json FROM nodes WHERE id=$1 AND token_hash=$2 AND revoked_at IS NULL")
+        .bind(node_id.to_string())
+        .bind(token)
+        .fetch_optional(&s.store.pool)
+        .await?
+        .map(|row| {
+            Ok::<_, sqlx::Error>((
+                row.try_get::<i64, _>(0)?,
+                row.try_get::<String, _>(1)?,
+            ))
+        })
+        .transpose()?;
     let (credential_expires_at, approved_json) = row.ok_or(ApiError::Unauthorized)?;
     if credential_expires_at <= now() {
         return Err(ApiError::CredentialExpired);
@@ -1471,14 +1797,12 @@ async fn update_advertised_routes(
         .into_iter()
         .filter(|route| routes.contains(route))
         .collect();
-    db.execute(
-        "UPDATE nodes SET advertised_routes_json=?1,approved_routes_json=?2 WHERE id=?3",
-        params![
-            serde_json::to_string(&routes).unwrap(),
-            serde_json::to_string(&retained_approvals).unwrap(),
-            node_id.to_string(),
-        ],
-    )?;
+    sqlx::query("UPDATE nodes SET advertised_routes_json=$1,approved_routes_json=$2 WHERE id=$3")
+        .bind(serde_json::to_string(&routes).unwrap())
+        .bind(serde_json::to_string(&retained_approvals).unwrap())
+        .bind(node_id.to_string())
+        .execute(&s.store.pool)
+        .await?;
     info!(%node_id, routes = routes.len(), "node route advertisements updated");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1489,21 +1813,28 @@ async fn approve_node_routes(
     headers: HeaderMap,
     Json(input): Json<ApprovedRoutesUpdate>,
 ) -> Result<StatusCode, ApiError> {
-    let session = console_session(&s, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id).await?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
     let approved = validate_advertised_routes(input.approved_routes)?;
     let approval_time = now();
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
-    let advertised_row: Option<(String, String, i64)> = tx
-        .query_row(
-            "SELECT advertised_routes_json,approved_routes_json,credential_expires_at FROM nodes WHERE id=?1 AND org_id=?2 AND revoked_at IS NULL",
-            params![node_id.to_string(), org_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
+    let mut tx = s.store.pool.begin().await?;
+    let advertised_row = sqlx::query(
+        "SELECT advertised_routes_json,approved_routes_json,credential_expires_at FROM nodes WHERE id=$1 AND org_id=$2 AND revoked_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(org_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|row| {
+        Ok::<_, sqlx::Error>((
+            row.try_get::<String, _>(0)?,
+            row.try_get::<String, _>(1)?,
+            row.try_get::<i64, _>(2)?,
+        ))
+    })
+    .transpose()?;
     let (advertised_json, current_approved_json, credential_expires_at) =
         advertised_row.ok_or(ApiError::NotFound)?;
     let current_approved: Vec<String> =
@@ -1523,18 +1854,17 @@ async fn approve_node_routes(
             "approved routes must be a subset of the node's advertisements".into(),
         ));
     }
-    let mut query = tx.prepare(
-        "SELECT id,credential_expires_at,approved_routes_json FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL",
-    )?;
-    let other_nodes = query
-        .query_map(params![org_id.to_string(), node_id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = sqlx::query(
+        "SELECT id,credential_expires_at,approved_routes_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL",
+    )
+    .bind(org_id.to_string())
+    .bind(node_id.to_string())
+    .fetch_all(&mut *tx)
+    .await?;
+    let other_nodes = rows
+        .iter()
+        .map(|row| Ok::<_, sqlx::Error>((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)))
+        .collect::<Result<Vec<(String, i64, String)>, _>>()?;
     let other_routes = other_nodes
         .iter()
         .filter(|(_, expires_at, _)| *expires_at > approval_time)
@@ -1551,7 +1881,6 @@ async fn approve_node_routes(
             "route {route} overlaps another approved subnet router"
         )));
     }
-    drop(query);
     let approved_subnets: Vec<_> = approved
         .iter()
         .filter(|route| route.as_str() != "0.0.0.0/0")
@@ -1569,30 +1898,30 @@ async fn approve_node_routes(
                     .any(|approved| ipv4_routes_overlap(route, approved))
         });
         if routes.len() != original_len {
-            tx.execute(
-                "UPDATE nodes SET approved_routes_json=?1 WHERE id=?2",
-                params![serde_json::to_string(&routes).unwrap(), other_id],
-            )?;
+            sqlx::query("UPDATE nodes SET approved_routes_json=$1 WHERE id=$2")
+                .bind(serde_json::to_string(&routes).unwrap())
+                .bind(other_id)
+                .execute(&mut *tx)
+                .await?;
         }
     }
-    tx.execute(
-        "UPDATE nodes SET approved_routes_json=?1 WHERE id=?2 AND org_id=?3",
-        params![
-            serde_json::to_string(&approved).unwrap(),
-            node_id.to_string(),
-            org_id.to_string(),
-        ],
-    )?;
+    sqlx::query("UPDATE nodes SET approved_routes_json=$1 WHERE id=$2 AND org_id=$3")
+        .bind(serde_json::to_string(&approved).unwrap())
+        .bind(node_id.to_string())
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?;
     append_audit(
-        &tx,
+        &mut tx,
         org_id,
         &session,
         "node.routes_updated",
         "node",
         Some(&node_id.to_string()),
         &serde_json::json!({"approved_routes": approved}),
-    )?;
-    tx.commit()?;
+    )
+    .await?;
+    tx.commit().await?;
     info!(%node_id, %org_id, routes = approved.len(), "node routes approved");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1616,23 +1945,37 @@ async fn reauth_node(
     Json(input): Json<ReauthNode>,
 ) -> Result<Json<ReauthResponse>, ApiError> {
     let old_token_hash = bearer(&headers)?;
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
-    let org_id: String = tx
-        .query_row(
-            "SELECT org_id FROM nodes WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL",
-            params![node_id.to_string(), old_token_hash],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or(ApiError::Unauthorized)?;
-    let join: Option<(String, bool, bool, String, String, String, i64)> = tx
-        .query_row(
-            "SELECT k.id,k.single_use,k.used_at IS NOT NULL,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds FROM join_keys k JOIN orgs o ON o.id=k.org_id WHERE k.key_hash=?1 AND k.org_id=?2 AND k.revoked_at IS NULL AND k.expires_at>?3 AND NOT EXISTS(SELECT 1 FROM device_authorizations d WHERE d.device_code_hash=k.key_hash)",
-            params![hash(&input.join_key), org_id, now()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
-        )
-        .optional()?;
+    let mut tx = s.store.pool.begin().await?;
+    let org_id: String = sqlx::query_scalar(
+        "SELECT org_id FROM nodes WHERE id=$1 AND token_hash=$2 AND revoked_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(old_token_hash)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::Unauthorized)?;
+    let reauth_query = match s.store.backend {
+        DatabaseBackend::Sqlite => "SELECT k.id,k.single_use,CASE WHEN k.used_at IS NULL THEN 0 ELSE 1 END,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds FROM join_keys k JOIN orgs o ON o.id=k.org_id WHERE k.key_hash=$1 AND k.org_id=$2 AND k.revoked_at IS NULL AND k.expires_at>$3 AND NOT EXISTS(SELECT 1 FROM device_authorizations d WHERE d.device_code_hash=k.key_hash)",
+        DatabaseBackend::Postgres => "SELECT k.id,k.single_use,CASE WHEN k.used_at IS NULL THEN 0 ELSE 1 END,k.user_id,k.user_role,k.tags_json,o.node_key_ttl_seconds FROM join_keys k JOIN orgs o ON o.id=k.org_id WHERE k.key_hash=$1 AND k.org_id=$2 AND k.revoked_at IS NULL AND k.expires_at>$3 AND NOT EXISTS(SELECT 1 FROM device_authorizations d WHERE d.device_code_hash=k.key_hash) FOR UPDATE OF k",
+    };
+    let join = sqlx::query(reauth_query)
+        .bind(hash(&input.join_key))
+        .bind(&org_id)
+        .bind(now())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|row| {
+            Ok::<_, sqlx::Error>((
+                row.try_get::<String, _>(0)?,
+                row.try_get::<i64, _>(1)? != 0,
+                row.try_get::<i64, _>(2)? != 0,
+                row.try_get::<String, _>(3)?,
+                row.try_get::<String, _>(4)?,
+                row.try_get::<String, _>(5)?,
+                row.try_get::<i64, _>(6)?,
+            ))
+        })
+        .transpose()?;
     let (join_id, single_use, used, user_id, user_role, tags_json, ttl) =
         join.ok_or(ApiError::Unauthorized)?;
     if single_use && used {
@@ -1640,17 +1983,25 @@ async fn reauth_node(
     }
     let node_token = secret("btn");
     let credential_expires_at = now() + ttl;
-    tx.execute(
-        "UPDATE nodes SET token_hash=?1,credential_expires_at=?2,user_id=?3,user_role=?4,tags_json=?5 WHERE id=?6",
-        params![hash(&node_token), credential_expires_at, user_id, user_role, tags_json, node_id.to_string()],
-    )?;
+    sqlx::query(
+        "UPDATE nodes SET token_hash=$1,credential_expires_at=$2,user_id=$3,user_role=$4,tags_json=$5 WHERE id=$6",
+    )
+    .bind(hash(&node_token))
+    .bind(credential_expires_at)
+    .bind(user_id)
+    .bind(user_role)
+    .bind(tags_json)
+    .bind(node_id.to_string())
+    .execute(&mut *tx)
+    .await?;
     if single_use {
-        tx.execute(
-            "UPDATE join_keys SET used_at=?1 WHERE id=?2",
-            params![now(), join_id],
-        )?;
+        sqlx::query("UPDATE join_keys SET used_at=$1 WHERE id=$2")
+            .bind(now())
+            .bind(join_id)
+            .execute(&mut *tx)
+            .await?;
     }
-    tx.commit()?;
+    tx.commit().await?;
     info!(%node_id, "node credential renewed");
     Ok(Json(ReauthResponse {
         node_token,
@@ -1701,66 +2052,69 @@ async fn list_peers(
     headers: HeaderMap,
 ) -> Result<Json<PeersResponse>, ApiError> {
     let token = bearer(&headers)?;
-    let db = s.store.0.lock().unwrap();
-    let (org, source_role, source_tags, acl_json, credential_expires_at, dns_name, source_addresses): (String,String,String,String,i64,String,String) = db
-        .query_row(
-            "SELECT n.org_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=?1 AND n.token_hash=?2 AND n.revoked_at IS NULL",
-            params![node_id.to_string(), token],
-            |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)),
-        )
-        .optional()?
+    let source_row = sqlx::query("SELECT n.org_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=$1 AND n.token_hash=$2 AND n.revoked_at IS NULL")
+        .bind(node_id.to_string())
+        .bind(token)
+        .fetch_optional(&s.store.pool)
+        .await?
         .ok_or(ApiError::Unauthorized)?;
+    let org: String = source_row.try_get(0)?;
+    let source_role: String = source_row.try_get(1)?;
+    let source_tags: String = source_row.try_get(2)?;
+    let acl_json: String = source_row.try_get(3)?;
+    let credential_expires_at: i64 = source_row.try_get(4)?;
+    let dns_name: String = source_row.try_get(5)?;
+    let source_addresses: String = source_row.try_get(6)?;
     if credential_expires_at <= now() {
         return Err(ApiError::CredentialExpired);
     }
     let source = Subject {
-        role: source_role
-            .parse()
-            .map_err(|_| ApiError::Database(rusqlite::Error::InvalidQuery))?,
+        role: source_role.parse().map_err(|_| ApiError::CorruptData)?,
         tags: serde_json::from_str(&source_tags).unwrap_or_default(),
     };
-    let acl: Acl = serde_json::from_str(&acl_json)
-        .map_err(|_| ApiError::Database(rusqlite::Error::InvalidQuery))?;
+    let acl: Acl = serde_json::from_str(&acl_json).map_err(|_| ApiError::CorruptData)?;
     let requested_exit = selection
         .exit_node
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let mut q=db.prepare("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>?3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=?1 AND id!=?2 AND revoked_at IS NULL AND credential_expires_at>?4 ORDER BY name")?;
-    let candidates = q
-        .query_map(
-            params![
-                org,
-                node_id.to_string(),
-                now() - RELAY_ENDPOINT_FRESH_SECS,
-                now()
-            ],
-            |r| {
-                let id: String = r.get(0)?;
-                let ips: String = r.get(4)?;
-                let tags: Vec<DeviceTag> =
-                    serde_json::from_str(&r.get::<_, String>(7)?).unwrap_or_default();
-                let approved: Vec<String> =
-                    serde_json::from_str(&r.get::<_, String>(9)?).unwrap_or_default();
-                Ok((
-                    Peer {
-                        id: Uuid::parse_str(&id).unwrap(),
-                        name: r.get(1)?,
-                        wg_public_key: r.get(2)?,
-                        endpoint: r.get(3)?,
-                        allowed_ips: serde_json::from_str(&ips).unwrap(),
-                        dns_name: r.get(5)?,
-                        tags: tags.clone(),
-                        relay_endpoint: r.get(8)?,
-                    },
-                    Subject {
-                        role: r.get::<_, String>(6)?.parse().unwrap(),
-                        tags,
-                    },
-                    approved,
-                ))
-            },
-        )?
+    let rows = sqlx::query("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>$3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL AND credential_expires_at>$4 ORDER BY name")
+        .bind(org)
+        .bind(node_id.to_string())
+        .bind(now() - RELAY_ENDPOINT_FRESH_SECS)
+        .bind(now())
+        .fetch_all(&s.store.pool)
+        .await?;
+    let candidates = rows
+        .into_iter()
+        .map(|row| {
+            let id: String = row.try_get(0)?;
+            let ips: String = row.try_get(4)?;
+            let tags: Vec<DeviceTag> =
+                serde_json::from_str(&row.try_get::<String, _>(7)?).unwrap_or_default();
+            let approved: Vec<String> =
+                serde_json::from_str(&row.try_get::<String, _>(9)?).unwrap_or_default();
+            Ok::<_, ApiError>((
+                Peer {
+                    id: Uuid::parse_str(&id).map_err(|_| ApiError::CorruptData)?,
+                    name: row.try_get(1)?,
+                    wg_public_key: row.try_get(2)?,
+                    endpoint: row.try_get(3)?,
+                    allowed_ips: serde_json::from_str(&ips).map_err(|_| ApiError::CorruptData)?,
+                    dns_name: row.try_get(5)?,
+                    tags: tags.clone(),
+                    relay_endpoint: row.try_get(8)?,
+                },
+                Subject {
+                    role: row
+                        .try_get::<String, _>(6)?
+                        .parse()
+                        .map_err(|_| ApiError::CorruptData)?,
+                    tags,
+                },
+                approved,
+            ))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let mut exit_node_active = false;
     let peers = candidates
@@ -1830,22 +2184,23 @@ async fn update_relay_endpoint(
         ));
     }
     let token = bearer(&headers)?;
-    let db = s.store.0.lock().unwrap();
-    let expires_at: i64 = db
-        .query_row(
-            "SELECT credential_expires_at FROM nodes WHERE id=?1 AND token_hash=?2 AND revoked_at IS NULL",
-            params![node_id.to_string(), token],
-            |row| row.get(0),
-        )
-        .optional()?
+    let expires_at: i64 = sqlx::query_scalar(
+        "SELECT credential_expires_at FROM nodes WHERE id=$1 AND token_hash=$2 AND revoked_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(token)
+    .fetch_optional(&s.store.pool)
+    .await?
         .ok_or(ApiError::Unauthorized)?;
     if expires_at <= now() {
         return Err(ApiError::CredentialExpired);
     }
-    db.execute(
-        "UPDATE nodes SET relay_endpoint=?1,relay_endpoint_updated_at=?2 WHERE id=?3",
-        params![endpoint.to_string(), now(), node_id.to_string()],
-    )?;
+    sqlx::query("UPDATE nodes SET relay_endpoint=$1,relay_endpoint_updated_at=$2 WHERE id=$3")
+        .bind(endpoint.to_string())
+        .bind(now())
+        .bind(node_id.to_string())
+        .execute(&s.store.pool)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1873,12 +2228,18 @@ fn relay_capability(secret: &[u8], node_id: Uuid, expires_at_unix: u64) -> Strin
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn allocate_ips(tx: &rusqlite::Transaction<'_>, org_id: &str) -> Result<Vec<String>, ApiError> {
+async fn allocate_ips(
+    connection: &mut AnyConnection,
+    org_id: &str,
+) -> Result<Vec<String>, ApiError> {
     let mut used = std::collections::HashSet::new();
-    let mut query = tx.prepare("SELECT allowed_ips_json FROM nodes WHERE org_id=?1")?;
-    let rows = query.query_map([org_id], |row| row.get::<_, String>(0))?;
+    let rows =
+        sqlx::query_scalar::<_, String>("SELECT allowed_ips_json FROM nodes WHERE org_id=$1")
+            .bind(org_id)
+            .fetch_all(connection)
+            .await?;
     for row in rows {
-        for ip in serde_json::from_str::<Vec<String>>(&row?).unwrap_or_default() {
+        for ip in serde_json::from_str::<Vec<String>>(&row).unwrap_or_default() {
             used.insert(ip);
         }
     }
@@ -2024,10 +2385,15 @@ async fn revoke_node(
     UrlPath(node_id): UrlPath<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let changed = s.store.0.lock().unwrap().execute(
-        "UPDATE nodes SET revoked_at=?1 WHERE id=?2 AND token_hash=?3 AND revoked_at IS NULL",
-        params![now(), node_id.to_string(), bearer(&headers)?],
-    )?;
+    let changed = sqlx::query(
+        "UPDATE nodes SET revoked_at=$1 WHERE id=$2 AND token_hash=$3 AND revoked_at IS NULL",
+    )
+    .bind(now())
+    .bind(node_id.to_string())
+    .bind(bearer(&headers)?)
+    .execute(&s.store.pool)
+    .await?
+    .rows_affected();
     if changed == 0 {
         return Err(ApiError::Unauthorized);
     }
@@ -2061,39 +2427,42 @@ async fn list_nodes(
     UrlPath(org_id): UrlPath<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<NodeRow>>, ApiError> {
-    console_session(&s, &headers, org_id)?;
-    let db = s.store.0.lock().unwrap();
-    let mut query = db.prepare(
-        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,credential_expires_at,credential_expires_at<=?2,credential_expires_at<=?3,revoked_at IS NOT NULL,advertised_routes_json,approved_routes_json,display_name FROM nodes WHERE org_id=?1 ORDER BY COALESCE(NULLIF(TRIM(display_name),''),name) COLLATE NOCASE,name",
-    )?;
-    let rows = query
-        .query_map(
-            params![org_id.to_string(), now(), now() + 14 * 24 * 60 * 60],
-            |r| {
-                let created_raw: String = r.get(9)?;
-                Ok(NodeRow {
-                    id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap(),
-                    name: r.get(1)?,
-                    display_name: r.get(16)?,
-                    wg_public_key: r.get(2)?,
-                    endpoint: r.get(3)?,
-                    allowed_ips: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
-                    advertised_routes: serde_json::from_str(&r.get::<_, String>(14)?)
-                        .unwrap_or_default(),
-                    approved_routes: serde_json::from_str(&r.get::<_, String>(15)?)
-                        .unwrap_or_default(),
-                    dns_name: r.get(5)?,
-                    user_id: r.get(6)?,
-                    user_role: r.get(7)?,
-                    tags: serde_json::from_str(&r.get::<_, String>(8)?).unwrap_or_default(),
-                    created_at: created_raw.parse::<i64>().unwrap_or(0),
-                    credential_expires_at: r.get(10)?,
-                    expired: r.get(11)?,
-                    expires_soon: r.get(12)?,
-                    revoked: r.get(13)?,
-                })
-            },
-        )?
+    console_session(&s, &headers, org_id).await?;
+    let rows = sqlx::query(
+        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CAST(created_at AS BIGINT),credential_expires_at,CASE WHEN credential_expires_at<=$2 THEN 1 ELSE 0 END,CASE WHEN credential_expires_at<=$3 THEN 1 ELSE 0 END,CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END,advertised_routes_json,approved_routes_json,display_name FROM nodes WHERE org_id=$1 ORDER BY LOWER(COALESCE(NULLIF(TRIM(display_name),''),name)),name",
+    )
+    .bind(org_id.to_string())
+    .bind(now())
+    .bind(now() + 14 * 24 * 60 * 60)
+    .fetch_all(&s.store.pool)
+    .await?;
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            let id: String = row.try_get(0)?;
+            Ok::<_, ApiError>(NodeRow {
+                id: Uuid::parse_str(&id).map_err(|_| ApiError::CorruptData)?,
+                name: row.try_get(1)?,
+                display_name: row.try_get(16)?,
+                wg_public_key: row.try_get(2)?,
+                endpoint: row.try_get(3)?,
+                allowed_ips: serde_json::from_str(&row.try_get::<String, _>(4)?)
+                    .unwrap_or_default(),
+                advertised_routes: serde_json::from_str(&row.try_get::<String, _>(14)?)
+                    .unwrap_or_default(),
+                approved_routes: serde_json::from_str(&row.try_get::<String, _>(15)?)
+                    .unwrap_or_default(),
+                dns_name: row.try_get(5)?,
+                user_id: row.try_get(6)?,
+                user_role: row.try_get(7)?,
+                tags: serde_json::from_str(&row.try_get::<String, _>(8)?).unwrap_or_default(),
+                created_at: row.try_get(9)?,
+                credential_expires_at: row.try_get(10)?,
+                expired: row.try_get::<i64, _>(11)? != 0,
+                expires_soon: row.try_get::<i64, _>(12)? != 0,
+                revoked: row.try_get::<i64, _>(13)? != 0,
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(rows))
 }
@@ -2128,30 +2497,38 @@ async fn update_node_friendly_name(
     headers: HeaderMap,
     Json(input): Json<FriendlyNameUpdate>,
 ) -> Result<StatusCode, ApiError> {
-    let session = console_session(&s, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id).await?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
     let friendly_name = normalise_friendly_name(&input.friendly_name)?;
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
-    let current: Option<(String, Option<String>)> = tx
-        .query_row(
-            "SELECT name,display_name FROM nodes WHERE id=?1 AND org_id=?2 AND revoked_at IS NULL",
-            params![node_id.to_string(), org_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?;
+    let mut tx = s.store.pool.begin().await?;
+    let current = sqlx::query(
+        "SELECT name,display_name FROM nodes WHERE id=$1 AND org_id=$2 AND revoked_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(org_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|row| {
+        Ok::<_, sqlx::Error>((
+            row.try_get::<String, _>(0)?,
+            row.try_get::<Option<String>, _>(1)?,
+        ))
+    })
+    .transpose()?;
     let (technical_name, previous_friendly_name) = current.ok_or(ApiError::NotFound)?;
     if previous_friendly_name == friendly_name {
         return Ok(StatusCode::NO_CONTENT);
     }
-    tx.execute(
-        "UPDATE nodes SET display_name=?1 WHERE id=?2 AND org_id=?3",
-        params![friendly_name, node_id.to_string(), org_id.to_string()],
-    )?;
+    sqlx::query("UPDATE nodes SET display_name=$1 WHERE id=$2 AND org_id=$3")
+        .bind(&friendly_name)
+        .bind(node_id.to_string())
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?;
     append_audit(
-        &tx,
+        &mut tx,
         org_id,
         &session,
         "node.friendly_name_updated",
@@ -2162,8 +2539,9 @@ async fn update_node_friendly_name(
             "previous_friendly_name": previous_friendly_name,
             "technical_name": technical_name,
         }),
-    )?;
-    tx.commit()?;
+    )
+    .await?;
+    tx.commit().await?;
     info!(%node_id, %org_id, "node friendly name updated");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2173,29 +2551,34 @@ async fn admin_revoke_node(
     UrlPath((org_id, node_id)): UrlPath<(Uuid, Uuid)>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let session = console_session(&s, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id).await?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
-    let changed = tx.execute(
-        "UPDATE nodes SET revoked_at=?1 WHERE id=?2 AND org_id=?3 AND revoked_at IS NULL",
-        params![now(), node_id.to_string(), org_id.to_string()],
-    )?;
+    let mut tx = s.store.pool.begin().await?;
+    let changed = sqlx::query(
+        "UPDATE nodes SET revoked_at=$1 WHERE id=$2 AND org_id=$3 AND revoked_at IS NULL",
+    )
+    .bind(now())
+    .bind(node_id.to_string())
+    .bind(org_id.to_string())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
     append_audit(
-        &tx,
+        &mut tx,
         org_id,
         &session,
         "node.revoked",
         "node",
         Some(&node_id.to_string()),
         &serde_json::json!({}),
-    )?;
-    tx.commit()?;
+    )
+    .await?;
+    tx.commit().await?;
     info!(%node_id, %org_id, "node revoked by console");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2205,20 +2588,15 @@ async fn get_acl(
     UrlPath(org_id): UrlPath<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    console_session(&s, &headers, org_id)?;
-    let acl: String = s
-        .store
-        .0
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT acl_json FROM orgs WHERE id=?1",
-            params![org_id.to_string()],
-            |r| r.get(0),
-        )
-        .optional()?
+    console_session(&s, &headers, org_id).await?;
+    let acl: String = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&s.store.pool)
+        .await?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(serde_json::from_str(&acl).unwrap()))
+    Ok(Json(
+        serde_json::from_str(&acl).map_err(|_| ApiError::CorruptData)?,
+    ))
 }
 async fn put_acl(
     State(s): State<AppState>,
@@ -2226,24 +2604,25 @@ async fn put_acl(
     headers: HeaderMap,
     Json(value): Json<serde_json::Value>,
 ) -> Result<StatusCode, ApiError> {
-    let session = console_session(&s, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id).await?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
     let acl: Acl = serde_json::from_value(value.clone())
         .map_err(|e| ApiError::BadRequest(format!("invalid ACL: {e}")))?;
     acl.validate()?;
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
-    let changed = tx.execute(
-        "UPDATE orgs SET acl_json=?1 WHERE id=?2",
-        params![value.to_string(), org_id.to_string()],
-    )?;
+    let mut tx = s.store.pool.begin().await?;
+    let changed = sqlx::query("UPDATE orgs SET acl_json=$1 WHERE id=$2")
+        .bind(value.to_string())
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
     append_audit(
-        &tx,
+        &mut tx,
         org_id,
         &session,
         "acl.updated",
@@ -2253,8 +2632,9 @@ async fn put_acl(
             "rule_count": acl.rules.len(),
             "sha256": hash(&value.to_string()),
         }),
-    )?;
-    tx.commit()?;
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2263,19 +2643,13 @@ async fn get_security_policy(
     UrlPath(org_id): UrlPath<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<SecurityPolicy>, ApiError> {
-    console_session(&s, &headers, org_id)?;
-    let node_key_ttl_seconds = s
-        .store
-        .0
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT node_key_ttl_seconds FROM orgs WHERE id=?1",
-            params![org_id.to_string()],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or(ApiError::NotFound)?;
+    console_session(&s, &headers, org_id).await?;
+    let node_key_ttl_seconds =
+        sqlx::query_scalar("SELECT node_key_ttl_seconds FROM orgs WHERE id=$1")
+            .bind(org_id.to_string())
+            .fetch_optional(&s.store.pool)
+            .await?
+            .ok_or(ApiError::NotFound)?;
     Ok(Json(SecurityPolicy {
         node_key_ttl_seconds,
     }))
@@ -2287,30 +2661,29 @@ async fn put_security_policy(
     headers: HeaderMap,
     Json(policy): Json<SecurityPolicy>,
 ) -> Result<StatusCode, ApiError> {
-    let session = console_session(&s, &headers, org_id)?;
+    let session = console_session(&s, &headers, org_id).await?;
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
     validate_node_key_ttl(policy.node_key_ttl_seconds)?;
-    let mut db = s.store.0.lock().unwrap();
-    let tx = db.transaction()?;
-    let previous: Option<i64> = tx
-        .query_row(
-            "SELECT node_key_ttl_seconds FROM orgs WHERE id=?1",
-            params![org_id.to_string()],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let mut tx = s.store.pool.begin().await?;
+    let previous: Option<i64> =
+        sqlx::query_scalar("SELECT node_key_ttl_seconds FROM orgs WHERE id=$1")
+            .bind(org_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
     let previous = previous.ok_or(ApiError::NotFound)?;
-    let changed = tx.execute(
-        "UPDATE orgs SET node_key_ttl_seconds=?1 WHERE id=?2",
-        params![policy.node_key_ttl_seconds, org_id.to_string()],
-    )?;
+    let changed = sqlx::query("UPDATE orgs SET node_key_ttl_seconds=$1 WHERE id=$2")
+        .bind(policy.node_key_ttl_seconds)
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
     append_audit(
-        &tx,
+        &mut tx,
         org_id,
         &session,
         "security.updated",
@@ -2320,8 +2693,9 @@ async fn put_security_policy(
             "node_key_ttl_seconds": policy.node_key_ttl_seconds,
             "previous_node_key_ttl_seconds": previous,
         }),
-    )?;
-    tx.commit()?;
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2350,34 +2724,38 @@ async fn list_audit_events(
     headers: HeaderMap,
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEvent>>, ApiError> {
-    console_session(&s, &headers, org_id)?;
+    console_session(&s, &headers, org_id).await?;
     let limit = i64::from(query.limit.unwrap_or(100).clamp(1, 200));
-    let db = s.store.0.lock().unwrap();
-    let mut statement = db.prepare(
-        "SELECT id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at FROM audit_events WHERE org_id=?1 ORDER BY created_at DESC,id DESC LIMIT ?2",
-    )?;
-    let events = statement
-        .query_map(params![org_id.to_string(), limit], |row| {
-            let details_json: String = row.get(8)?;
-            Ok(AuditEvent {
-                id: row.get(0)?,
-                actor_user_id: row.get(1)?,
-                actor_name: row.get(2)?,
-                actor_email: row.get(3)?,
-                actor_role: row.get(4)?,
-                action: row.get(5)?,
-                target_type: row.get(6)?,
-                target_id: row.get(7)?,
+    let rows = sqlx::query(
+        "SELECT id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at FROM audit_events WHERE org_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2",
+    )
+    .bind(org_id.to_string())
+    .bind(limit)
+    .fetch_all(&s.store.pool)
+    .await?;
+    let events = rows
+        .into_iter()
+        .map(|row| {
+            let details_json: String = row.try_get(8)?;
+            Ok::<_, sqlx::Error>(AuditEvent {
+                id: row.try_get(0)?,
+                actor_user_id: row.try_get(1)?,
+                actor_name: row.try_get(2)?,
+                actor_email: row.try_get(3)?,
+                actor_role: row.try_get(4)?,
+                action: row.try_get(5)?,
+                target_type: row.try_get(6)?,
+                target_id: row.try_get(7)?,
                 details: serde_json::from_str(&details_json).unwrap_or_default(),
-                created_at: row.get(9)?,
+                created_at: row.try_get(9)?,
             })
-        })?
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(events))
 }
 
-fn append_audit(
-    db: &Connection,
+async fn append_audit(
+    connection: &mut AnyConnection,
     org_id: Uuid,
     session: &Session,
     action: &str,
@@ -2385,22 +2763,22 @@ fn append_audit(
     target_id: Option<&str>,
     details: &serde_json::Value,
 ) -> Result<(), ApiError> {
-    db.execute(
-        "INSERT INTO audit_events(id,org_id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-        params![
-            Uuid::new_v4().to_string(),
-            org_id.to_string(),
-            session.user_id,
-            session.name,
-            session.email,
-            session.role.as_str(),
-            action,
-            target_type,
-            target_id,
-            details.to_string(),
-            now(),
-        ],
-    )?;
+    sqlx::query(
+        "INSERT INTO audit_events(id,org_id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(org_id.to_string())
+    .bind(&session.user_id)
+    .bind(&session.name)
+    .bind(&session.email)
+    .bind(session.role.as_str())
+    .bind(action)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(details.to_string())
+    .bind(now())
+    .execute(connection)
+    .await?;
     Ok(())
 }
 
@@ -2431,12 +2809,12 @@ struct Session {
     email: String,
 }
 
-fn console_session(
+async fn console_session(
     state: &AppState,
     headers: &HeaderMap,
     org_id: Uuid,
 ) -> Result<Session, ApiError> {
-    let claims = verified_console_assertion(state, headers, org_id)?;
+    let claims = verified_console_assertion(state, headers, org_id).await?;
     if claims.action.is_some() {
         return Err(ApiError::Unauthorized);
     }
@@ -2449,20 +2827,20 @@ fn console_session(
     })
 }
 
-fn service_session(
+async fn service_session(
     state: &AppState,
     headers: &HeaderMap,
     org_id: Uuid,
     action: &str,
 ) -> Result<AssertionClaims, ApiError> {
-    let claims = verified_console_assertion(state, headers, org_id)?;
+    let claims = verified_console_assertion(state, headers, org_id).await?;
     if claims.role != "service" || claims.action.as_deref() != Some(action) {
         return Err(ApiError::Forbidden);
     }
     Ok(claims)
 }
 
-fn verified_console_assertion(
+async fn verified_console_assertion(
     state: &AppState,
     headers: &HeaderMap,
     org_id: Uuid,
@@ -2500,21 +2878,22 @@ fn verified_console_assertion(
     {
         return Err(ApiError::Unauthorized);
     }
-    let db = state.store.0.lock().unwrap();
-    db.execute(
-        "DELETE FROM console_assertion_nonces WHERE expires_at<=?1",
-        params![current_time],
-    )?;
-    db.execute(
-        "INSERT INTO console_assertion_nonces(jti_hash,expires_at) VALUES(?1,?2)",
-        params![hash(&claims.jti), claims.exp],
-    )
-    .map_err(|error| match error {
-        rusqlite::Error::SqliteFailure(ref code, _) if code.extended_code == 1555 => {
-            ApiError::Unauthorized
-        }
-        other => ApiError::Database(other),
-    })?;
+    sqlx::query("DELETE FROM console_assertion_nonces WHERE expires_at<=$1")
+        .bind(current_time)
+        .execute(&state.store.pool)
+        .await?;
+    sqlx::query("INSERT INTO console_assertion_nonces(jti_hash,expires_at) VALUES($1,$2)")
+        .bind(hash(&claims.jti))
+        .bind(claims.exp)
+        .execute(&state.store.pool)
+        .await
+        .map_err(|error| {
+            if is_unique_violation(&error) {
+                ApiError::Unauthorized
+            } else {
+                ApiError::Database(error)
+            }
+        })?;
     Ok(claims)
 }
 
@@ -2851,9 +3230,121 @@ mod tests {
         body(response).await
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_replicas_share_state_and_serialize_single_use_keys() {
+        let Ok(database_url) = std::env::var("BLAKTAIL_COORD_TEST_DATABASE_URL") else {
+            return;
+        };
+        assert!(
+            database_url.contains("/blaktail_coord_test"),
+            "PostgreSQL integration tests require a dedicated blaktail_coord_test database"
+        );
+
+        let cleanup = connect_postgres(&database_url).await.unwrap();
+        sqlx::raw_sql(
+            "DROP TABLE IF EXISTS pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
+        )
+        .execute(&cleanup)
+        .await
+        .unwrap();
+        cleanup.close().await;
+
+        let (first_migration, second_migration) = tokio::join!(
+            Store::migrate_postgres(&database_url),
+            Store::migrate_postgres(&database_url)
+        );
+        first_migration.unwrap().pool.close().await;
+        second_migration.unwrap().pool.close().await;
+
+        let first = Store::open_existing_postgres(&database_url).await.unwrap();
+        let second = Store::open_existing_postgres(&database_url).await.unwrap();
+        let first_router = app(first.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let second_router = app(second.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&first_router, "postgres-ha-org").await;
+        let owner = signed_session(org.id, "owner-ha", Role::Owner, now() + 60);
+        let join_key: JoinKeyResponse = body(
+            call(
+                &first_router,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", org.id),
+                serde_json::json!({"expires_in_seconds":60,"single_use":true}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+
+        let first_registration = call(
+            &first_router,
+            Method::POST,
+            "/v1/nodes/register",
+            serde_json::json!({
+                "join_key":join_key.key,
+                "name":"postgres-node-a",
+                "wg_public_key":"postgres-key-a"
+            }),
+            None,
+        );
+        let second_registration = call(
+            &second_router,
+            Method::POST,
+            "/v1/nodes/register",
+            serde_json::json!({
+                "join_key":join_key.key,
+                "name":"postgres-node-b",
+                "wg_public_key":"postgres-key-b"
+            }),
+            None,
+        );
+        let (first_response, second_response) =
+            tokio::join!(first_registration, second_registration);
+        let mut statuses = [first_response.status(), second_response.status()];
+        statuses.sort();
+        assert_eq!(statuses, [StatusCode::CREATED, StatusCode::UNAUTHORIZED]);
+
+        let nodes: Vec<NodeRow> = body(
+            call(
+                &second_router,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(nodes.len(), 1);
+
+        drop(first_router);
+        first.pool.close().await;
+        assert_eq!(
+            call(
+                &second_router,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        drop(second_router);
+        second.pool.close().await;
+        let cleanup = connect_postgres(&database_url).await.unwrap();
+        sqlx::raw_sql(
+            "DROP TABLE IF EXISTS pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
+        )
+        .execute(&cleanup)
+        .await
+        .unwrap();
+        cleanup.close().await;
+    }
+
     #[tokio::test]
     async fn metrics_and_audit_cover_security_mutations() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let metrics = Arc::new(CoordMetrics::default());
         let router = app_with_relays_console_and_metrics(
             store.clone(),
@@ -3001,7 +3492,7 @@ mod tests {
 
     #[tokio::test]
     async fn friendly_names_are_admin_scoped_audited_and_do_not_change_network_identity() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
         let org = create_test_org(&router, "friendly-name-org").await;
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
@@ -3149,7 +3640,7 @@ mod tests {
                 .expect("dual-stack registration includes IPv6")
         }
 
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let org_a = create_test_org(&router, "ipv6-org-a").await;
         let org_b = create_test_org(&router, "ipv6-org-b").await;
@@ -3197,28 +3688,19 @@ mod tests {
         assert_eq!(dual_stack.assigned_ips, node_a.assigned_ips);
         assert_eq!(dual_stack.peers[0].allowed_ips, node_b.assigned_ips);
 
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE nodes SET allowed_ips_json=?1 WHERE id=?2",
-                params![
-                    serde_json::to_string(&vec![node_b.assigned_ip.clone()]).unwrap(),
-                    node_b.id.to_string(),
-                ],
-            )
+        let mut tx = store.pool.begin().await.unwrap();
+        sqlx::query("UPDATE nodes SET allowed_ips_json=$1 WHERE id=$2")
+            .bind(serde_json::to_string(&vec![node_b.assigned_ip.clone()]).unwrap())
+            .bind(node_b.id.to_string())
+            .execute(&mut *tx)
+            .await
             .unwrap();
-        backfill_ipv6_addresses(&store.0.lock().unwrap()).unwrap();
-        let restored: String = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT allowed_ips_json FROM nodes WHERE id=?1",
-                params![node_b.id.to_string()],
-                |row| row.get(0),
-            )
+        backfill_ipv6_addresses(&mut tx).await.unwrap();
+        tx.commit().await.unwrap();
+        let restored: String = sqlx::query_scalar("SELECT allowed_ips_json FROM nodes WHERE id=$1")
+            .bind(node_b.id.to_string())
+            .fetch_one(&store.pool)
+            .await
             .unwrap();
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&restored).unwrap(),
@@ -3228,7 +3710,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_approved_routes_are_distributed_and_exit_nodes_are_opt_in() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let org = create_test_org(&router, "routing-org").await;
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
@@ -3429,14 +3911,11 @@ mod tests {
             .status(),
             StatusCode::NO_CONTENT
         );
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE nodes SET credential_expires_at=?1 WHERE id=?2",
-                params![now() - 1, subnet_router.id.to_string()],
-            )
+        sqlx::query("UPDATE nodes SET credential_expires_at=$1 WHERE id=$2")
+            .bind(now() - 1)
+            .bind(subnet_router.id.to_string())
+            .execute(&store.pool)
+            .await
             .unwrap();
         assert_eq!(
             call(
@@ -3462,25 +3941,18 @@ mod tests {
             .status(),
             StatusCode::NO_CONTENT
         );
-        let expired_approvals: String = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT approved_routes_json FROM nodes WHERE id=?1",
-                [subnet_router.id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let expired_approvals: String =
+            sqlx::query_scalar("SELECT approved_routes_json FROM nodes WHERE id=$1")
+                .bind(subnet_router.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
         assert_eq!(expired_approvals, "[]");
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE nodes SET credential_expires_at=?1 WHERE id=?2",
-                params![now() + 60, subnet_router.id.to_string()],
-            )
+        sqlx::query("UPDATE nodes SET credential_expires_at=$1 WHERE id=$2")
+            .bind(now() + 60)
+            .bind(subnet_router.id.to_string())
+            .execute(&store.pool)
+            .await
             .unwrap();
 
         assert_eq!(
@@ -3516,7 +3988,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_enrollment_is_expiring_single_use_and_bound_to_device() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let r = app_with_relays_and_console(
             store.clone(),
             "ap-southeast-2".into(),
@@ -3636,17 +4108,11 @@ mod tests {
         .await;
         assert_eq!(approval.status, "approved");
         assert_eq!(approval.expires_at, started.expires_at);
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE device_authorizations SET last_polled_at=?1 WHERE device_code_hash=?2",
-                params![
-                    now() - DEVICE_AUTH_POLL_SECS as i64,
-                    hash(&started.device_code)
-                ],
-            )
+        sqlx::query("UPDATE device_authorizations SET last_polled_at=$1 WHERE device_code_hash=$2")
+            .bind(now() - DEVICE_AUTH_POLL_SECS as i64)
+            .bind(hash(&started.device_code))
+            .execute(&store.pool)
+            .await
             .unwrap();
         assert_eq!(
             call(
@@ -3730,38 +4196,37 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
 
-        let db = store.0.lock().unwrap();
-        let (role, tags): (String, String) = db
-            .query_row(
-                "SELECT user_role,tags_json FROM nodes WHERE id=?1",
-                params![registered.id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+        let row = sqlx::query("SELECT user_role,tags_json FROM nodes WHERE id=$1")
+            .bind(registered.id.to_string())
+            .fetch_one(&store.pool)
+            .await
             .unwrap();
+        let role: String = row.try_get(0).unwrap();
+        let tags: String = row.try_get(1).unwrap();
         assert_eq!(role, "member");
         assert_eq!(tags, "[]");
-        let browser_audit = db
-            .prepare("SELECT action FROM audit_events WHERE org_id=?1 ORDER BY action")
-            .unwrap()
-            .query_map(params![org.id.to_string()], |row| row.get::<_, String>(0))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let browser_audit = sqlx::query_scalar::<_, String>(
+            "SELECT action FROM audit_events WHERE org_id=$1 ORDER BY action",
+        )
+        .bind(org.id.to_string())
+        .fetch_all(&store.pool)
+        .await
+        .unwrap();
         assert!(browser_audit.contains(&"device_authorization.approved".into()));
         assert!(browser_audit.contains(&"join_key.minted".into()));
-        let raw_secrets: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM device_authorizations d JOIN join_keys k ON k.key_hash=d.device_code_hash WHERE d.device_code_hash=?1 OR k.key_hash=?1",
-                params![started.device_code],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let raw_secrets: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM device_authorizations d JOIN join_keys k ON k.key_hash=d.device_code_hash WHERE d.device_code_hash=$1 OR k.key_hash=$1",
+        )
+        .bind(started.device_code)
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(raw_secrets, 0);
     }
 
     #[tokio::test]
     async fn expired_browser_enrollment_cannot_be_polled_or_approved() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let org = create_test_org(&r, "expired-browser-org").await;
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
@@ -3776,14 +4241,11 @@ mod tests {
             .await,
         )
         .await;
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE device_authorizations SET expires_at=?1 WHERE device_code_hash=?2",
-                params![now() - 1, hash(&started.device_code)],
-            )
+        sqlx::query("UPDATE device_authorizations SET expires_at=$1 WHERE device_code_hash=$2")
+            .bind(now() - 1)
+            .bind(hash(&started.device_code))
+            .execute(&store.pool)
+            .await
             .unwrap();
         assert_eq!(
             call(
@@ -3816,7 +4278,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_nodes_and_revocation() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let r = app_with_relays(
             store.clone(),
             "ap-southeast-2".into(),
@@ -3981,14 +4443,11 @@ mod tests {
             StatusCode::NO_CONTENT
         );
 
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE nodes SET credential_expires_at=?1 WHERE id=?2",
-                params![now() - 1, ns[0].id.to_string()],
-            )
+        sqlx::query("UPDATE nodes SET credential_expires_at=$1 WHERE id=$2")
+            .bind(now() - 1)
+            .bind(ns[0].id.to_string())
+            .execute(&store.pool)
+            .await
             .unwrap();
         let expired = call(
             &r,
@@ -4068,29 +4527,22 @@ mod tests {
         )
         .await;
         assert_eq!(peers_after_renewal.peers[0].id, ns[0].id);
-        let preserved_ip: String = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT allowed_ips_json FROM nodes WHERE id=?1",
-                params![ns[0].id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let preserved_ip: String =
+            sqlx::query_scalar("SELECT allowed_ips_json FROM nodes WHERE id=$1")
+                .bind(ns[0].id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
         assert_eq!(
             serde_json::from_str::<Vec<String>>(&preserved_ip).unwrap()[0],
             ns[0].assigned_ip
         );
 
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE nodes SET relay_endpoint_updated_at=?1 WHERE id=?2",
-                params![now() - RELAY_ENDPOINT_FRESH_SECS - 1, ns[0].id.to_string()],
-            )
+        sqlx::query("UPDATE nodes SET relay_endpoint_updated_at=$1 WHERE id=$2")
+            .bind(now() - RELAY_ENDPOINT_FRESH_SECS - 1)
+            .bind(ns[0].id.to_string())
+            .execute(&store.pool)
+            .await
             .unwrap();
         let stale: PeersResponse = body(
             call(
@@ -4133,7 +4585,7 @@ mod tests {
     }
     #[tokio::test]
     async fn public_health_is_minimal_and_readiness_checks_database() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let v: serde_json::Value =
             body(call(&r, Method::GET, "/health", serde_json::Value::Null, None).await).await;
@@ -4143,11 +4595,9 @@ mod tests {
             body(call(&r, Method::GET, "/livez", serde_json::Value::Null, None).await).await;
         assert_eq!(live, serde_json::json!({"status":"ok"}));
 
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute_batch("ALTER TABLE orgs RENAME TO orgs_unavailable")
+        sqlx::raw_sql("ALTER TABLE orgs RENAME TO orgs_unavailable")
+            .execute(&store.pool)
+            .await
             .unwrap();
         let response = call(&r, Method::GET, "/readyz", serde_json::Value::Null, None).await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -4166,7 +4616,7 @@ mod tests {
     async fn private_diagnostics_require_bearer_token() {
         const DIAGNOSTICS_TOKEN: &str = "coordinator-diagnostics-token-at-least-32-bytes";
         let router = metrics_app_with_token(
-            Store::memory().unwrap(),
+            Store::memory().await.unwrap(),
             Arc::new(CoordMetrics::default()),
             Some(DIAGNOSTICS_TOKEN.as_bytes().to_vec()),
         );
@@ -4267,7 +4717,7 @@ mod tests {
 
     #[tokio::test]
     async fn organisation_bootstrap_requires_scoped_service_assertion_and_rejects_replay() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let org_id = Uuid::new_v4();
         let request = serde_json::json!({"id":org_id,"name":"bootstrap-auth"});
@@ -4316,17 +4766,15 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
-        let (active, pending): (i64, i64) = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT (SELECT count(*) FROM orgs),
-                    (SELECT count(*) FROM pending_bootstrap_orgs)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let row = sqlx::query(
+            "SELECT (SELECT count(*) FROM orgs),
+                (SELECT count(*) FROM pending_bootstrap_orgs)",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let active: i64 = row.try_get(0).unwrap();
+        let pending: i64 = row.try_get(1).unwrap();
         assert_eq!((active, pending), (0, 1));
 
         let commit_path = format!("/v1/orgs/{org_id}/bootstrap-commit");
@@ -4362,17 +4810,15 @@ mod tests {
             .status(),
             StatusCode::CREATED
         );
-        let (active, pending): (i64, i64) = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT (SELECT count(*) FROM orgs),
-                    (SELECT count(*) FROM pending_bootstrap_orgs)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let row = sqlx::query(
+            "SELECT (SELECT count(*) FROM orgs),
+                (SELECT count(*) FROM pending_bootstrap_orgs)",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let active: i64 = row.try_get(0).unwrap();
+        let pending: i64 = row.try_get(1).unwrap();
         assert_eq!((active, pending), (1, 0));
 
         let commit_retry = signed_service(org_id, "bootstrap.commit");
@@ -4388,17 +4834,14 @@ mod tests {
             .status(),
             StatusCode::OK
         );
-        let completion_events: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT count(*) FROM audit_events
-                 WHERE org_id=?1 AND action='bootstrap.completed'",
-                params![org_id.to_string()],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let completion_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events
+             WHERE org_id=$1 AND action='bootstrap.completed'",
+        )
+        .bind(org_id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(completion_events, 1);
 
         let expired_id = Uuid::new_v4();
@@ -4416,14 +4859,11 @@ mod tests {
             .status(),
             StatusCode::ACCEPTED
         );
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
-                "UPDATE pending_bootstrap_orgs SET expires_at=?1 WHERE id=?2",
-                params![now() - 1, expired_id.to_string()],
-            )
+        sqlx::query("UPDATE pending_bootstrap_orgs SET expires_at=$1 WHERE id=$2")
+            .bind(now() - 1)
+            .bind(expired_id.to_string())
+            .execute(&store.pool)
+            .await
             .unwrap();
         let expired_commit = signed_service(expired_id, "bootstrap.commit");
         assert_eq!(
@@ -4443,7 +4883,7 @@ mod tests {
     #[tokio::test]
     async fn console_auth_fails_closed_for_missing_forged_and_expired_assertions() {
         let r = app(
-            Store::memory().unwrap(),
+            Store::memory().await.unwrap(),
             "ap-southeast-2".into(),
             TEST_SECRET,
         );
@@ -4547,7 +4987,7 @@ mod tests {
     #[tokio::test]
     async fn management_route_permission_matrix_fails_closed() {
         let r = app(
-            Store::memory().unwrap(),
+            Store::memory().await.unwrap(),
             "ap-southeast-2".into(),
             TEST_SECRET,
         );
@@ -4717,7 +5157,7 @@ mod tests {
 
     #[tokio::test]
     async fn deny_rule_removes_matching_node_from_peer_response() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let o = create_test_org(&r, "filtered").await;
         let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
@@ -4754,7 +5194,7 @@ mod tests {
 
     #[tokio::test]
     async fn console_can_list_and_revoke_nodes() {
-        let store = Store::memory().unwrap();
+        let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let o = create_test_org(&r, "console-org").await;
         let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
@@ -4846,156 +5286,150 @@ mod tests {
         assert!(!dns_label(&format!("{}-suffix", "a".repeat(62))).ends_with('-'));
     }
 
-    #[test]
-    fn existing_database_gains_credential_expiry_without_losing_nodes() {
+    #[tokio::test]
+    async fn existing_database_gains_credential_expiry_without_losing_nodes() {
         let path =
             std::env::temp_dir().join(format!("blaktail-migration-{}.sqlite3", Uuid::new_v4()));
         let created_at = now() - 100;
         {
-            let db = Connection::open(&path).unwrap();
-            db.execute_batch(
+            let pool = connect_sqlite(&path, true).await.unwrap();
+            sqlx::raw_sql(
                 "CREATE TABLE orgs(id TEXT PRIMARY KEY,name TEXT NOT NULL UNIQUE,acl_json TEXT NOT NULL,created_at TEXT NOT NULL);
                  CREATE TABLE nodes(id TEXT PRIMARY KEY,org_id TEXT NOT NULL,name TEXT NOT NULL,wg_public_key TEXT NOT NULL,endpoint TEXT,allowed_ips_json TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL,revoked_at TEXT,UNIQUE(org_id,name),UNIQUE(org_id,wg_public_key));",
             )
+            .execute(&pool)
+            .await
             .unwrap();
-            db.execute(
-                "INSERT INTO orgs(id,name,acl_json,created_at) VALUES('org','Org','{\"rules\":[]}',?1)",
-                params![created_at],
+            sqlx::query(
+                "INSERT INTO orgs(id,name,acl_json,created_at) VALUES('org','Org','{\"rules\":[]}',$1)",
             )
+            .bind(created_at)
+            .execute(&pool)
+            .await
             .unwrap();
-            db.execute(
-                "INSERT INTO nodes(id,org_id,name,wg_public_key,allowed_ips_json,token_hash,created_at) VALUES('node','org','Node','key','[\"100.64.0.1/32\"]','hash',?1)",
-                params![created_at],
+            sqlx::query(
+                "INSERT INTO nodes(id,org_id,name,wg_public_key,allowed_ips_json,token_hash,created_at) VALUES('node','org','Node','key','[\"100.64.0.1/32\"]','hash',$1)",
             )
+            .bind(created_at)
+            .execute(&pool)
+            .await
             .unwrap();
-            db.execute(
-                "INSERT INTO nodes(id,org_id,name,wg_public_key,allowed_ips_json,token_hash,created_at) VALUES('node-2','org','Node@','key-2','[\"100.64.0.2/32\"]','hash-2',?1)",
-                params![created_at + 1],
+            sqlx::query(
+                "INSERT INTO nodes(id,org_id,name,wg_public_key,allowed_ips_json,token_hash,created_at) VALUES('node-2','org','Node@','key-2','[\"100.64.0.2/32\"]','hash-2',$1)",
             )
+            .bind(created_at + 1)
+            .execute(&pool)
+            .await
             .unwrap();
+            pool.close().await;
         }
-        let store = Store::open(&path).unwrap();
-        let (ttl, expires): (i64, i64) = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT o.node_key_ttl_seconds,n.credential_expires_at FROM orgs o JOIN nodes n ON n.org_id=o.id WHERE n.id='node'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
+        let store = Store::open(&path).await.unwrap();
+        let row = sqlx::query(
+            "SELECT o.node_key_ttl_seconds,n.credential_expires_at FROM orgs o JOIN nodes n ON n.org_id=o.id WHERE n.id='node'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        let ttl: i64 = row.try_get(0).unwrap();
+        let expires: i64 = row.try_get(1).unwrap();
         assert_eq!(ttl, DEFAULT_NODE_KEY_TTL_SECS);
         assert_eq!(expires, created_at + DEFAULT_NODE_KEY_TTL_SECS);
-        let display_name: Option<String> = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT display_name FROM nodes WHERE id='node'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let display_name: Option<String> =
+            sqlx::query_scalar("SELECT display_name FROM nodes WHERE id='node'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
         assert_eq!(display_name, None);
-        let dns_names = {
-            let db = store.0.lock().unwrap();
-            let mut query = db
-                .prepare("SELECT dns_name FROM nodes ORDER BY id")
-                .unwrap();
-            let collected = query
-                .query_map([], |row| row.get::<_, String>(0))
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            collected
-        };
+        let dns_names = sqlx::query_scalar::<_, String>("SELECT dns_name FROM nodes ORDER BY id")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
         assert_eq!(dns_names.len(), 2);
         assert!(dns_names.iter().all(|name| !name.is_empty()));
         assert_ne!(dns_names[0], dns_names[1]);
-        let version = store
-            .0
-            .lock()
-            .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&store.pool)
+            .await
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
-        drop(store);
+        store.pool.close().await;
 
-        let reopened = Store::open(&path).unwrap();
-        let node_count: i64 = reopened
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))
+        let reopened = Store::open(&path).await.unwrap();
+        let node_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes")
+            .fetch_one(&reopened.pool)
+            .await
             .unwrap();
         assert_eq!(node_count, 2);
-        drop(reopened);
+        reopened.pool.close().await;
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn fresh_database_records_schema_version() {
-        let store = Store::memory().unwrap();
-        let db = store.0.lock().unwrap();
-        let version = db
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+    #[tokio::test]
+    async fn fresh_database_records_schema_version() {
+        let store = Store::memory().await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&store.pool)
+            .await
             .unwrap();
-        let audit_table: String = db
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_events'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let audit_table: String = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='audit_events'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
         assert_eq!(audit_table, "audit_events");
     }
 
-    #[test]
-    fn service_open_refuses_unmigrated_database_without_mutation() {
+    #[tokio::test]
+    async fn service_open_refuses_unmigrated_database_without_mutation() {
         let path =
             std::env::temp_dir().join(format!("blaktail-unmigrated-{}.sqlite3", Uuid::new_v4()));
-        drop(Connection::open(&path).unwrap());
+        connect_sqlite(&path, true).await.unwrap().close().await;
         assert!(matches!(
-            Store::open_existing(&path),
+            Store::open_existing(&path).await,
             Err(StoreError::InvalidMigrationPlan {
                 expected: CURRENT_SCHEMA_VERSION,
                 found: 0,
             })
         ));
-        let db = Connection::open(&path).unwrap();
-        let version = db
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        let pool = connect_sqlite(&path, false).await.unwrap();
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await
             .unwrap();
-        let tables: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let tables: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(version, 0);
         assert_eq!(tables, 0);
-        drop(db);
+        pool.close().await;
 
-        drop(Store::open(&path).unwrap());
-        Store::open_existing(&path).unwrap();
+        Store::open(&path).await.unwrap().pool.close().await;
+        Store::open_existing(&path)
+            .await
+            .unwrap()
+            .pool
+            .close()
+            .await;
         std::fs::remove_file(path).unwrap();
     }
 
-    #[test]
-    fn newer_database_schema_is_rejected_without_mutation() {
+    #[tokio::test]
+    async fn newer_database_schema_is_rejected_without_mutation() {
         let path = std::env::temp_dir().join(format!(
             "blaktail-future-migration-{}.sqlite3",
             Uuid::new_v4()
         ));
-        {
-            let db = Connection::open(&path).unwrap();
-            db.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
-                .unwrap();
-        }
-        let result = Store::open(&path);
+        let pool = connect_sqlite(&path, true).await.unwrap();
+        sqlx::raw_sql("PRAGMA user_version=5")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let result = Store::open(&path).await;
         assert!(matches!(
             result,
             Err(StoreError::UnsupportedSchema {
@@ -5003,16 +5437,14 @@ mod tests {
                 supported
             }) if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION
         ));
-        let db = Connection::open(&path).unwrap();
-        let table_count: i64 = db
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
+        let pool = connect_sqlite(&path, false).await.unwrap();
+        let table_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type='table'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(table_count, 0);
-        drop(db);
+        pool.close().await;
         std::fs::remove_file(path).unwrap();
     }
 }

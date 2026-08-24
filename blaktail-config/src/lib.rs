@@ -167,7 +167,9 @@ pub struct CoordinatorConfig {
     pub metrics_bind: String,
     pub allow_public_metrics: bool,
     pub diagnostics_token: Option<SecretRef>,
+    pub database_backend: String,
     pub database: PathBuf,
+    pub database_url: Option<SecretRef>,
     pub database_storage: String,
     pub allow_unsafe_efs_sqlite: bool,
     pub tls_mode: String,
@@ -187,7 +189,9 @@ impl Default for CoordinatorConfig {
             metrics_bind: "127.0.0.1:9701".into(),
             allow_public_metrics: false,
             diagnostics_token: None,
+            database_backend: "sqlite".into(),
             database: "blaktail-coord.sqlite3".into(),
+            database_url: None,
             database_storage: "local".into(),
             allow_unsafe_efs_sqlite: false,
             tls_mode: "files".into(),
@@ -590,6 +594,7 @@ fn fingerprint_secrets(
 ) {
     if matches!(service, Service::Coordinator | Service::All) {
         fingerprint_secret(&mut config.coordinator.diagnostics_token, environment);
+        fingerprint_secret(&mut config.coordinator.database_url, environment);
         fingerprint_secret(&mut config.coordinator.tls_key, environment);
         fingerprint_secret(&mut config.coordinator.auth_hmac_secret, environment);
         fingerprint_secret(&mut config.coordinator.relay_auth_secret, environment);
@@ -649,6 +654,7 @@ fn take_secret_environment(
 ) -> EnvironmentValues {
     let references = [
         config.coordinator.diagnostics_token.as_ref(),
+        config.coordinator.database_url.as_ref(),
         config.coordinator.tls_key.as_ref(),
         config.coordinator.auth_hmac_secret.as_ref(),
         config.coordinator.relay_auth_secret.as_ref(),
@@ -961,6 +967,13 @@ fn apply_environment(
             "coordinator.diagnostics_token",
             sources,
         )?;
+        set_string(
+            &mut coordinator.database_backend,
+            environment,
+            "BLAKTAIL_DATABASE_BACKEND",
+            "coordinator.database_backend",
+            sources,
+        );
         let canonical_database = env(environment, "BLAKTAIL_DATABASE");
         let deprecated_database = env(environment, "BLAKTAIL_DB_PATH");
         match (canonical_database, deprecated_database) {
@@ -984,6 +997,14 @@ fn apply_environment(
             }
             (None, None) => {}
         }
+        set_secret(
+            &mut coordinator.database_url,
+            environment,
+            "BLAKTAIL_DATABASE_URL",
+            "BLAKTAIL_DATABASE_URL_FILE",
+            "coordinator.database_url",
+            sources,
+        )?;
         set_string(
             &mut coordinator.database_storage,
             environment,
@@ -1279,32 +1300,89 @@ fn validate_coordinator(loaded: &LoadedConfig, violations: &mut Vec<Violation>) 
             violations,
         );
     }
-    if config.database.as_os_str().is_empty() {
-        violation(violations, "coordinator.database", "must not be empty");
-    }
-    match config.database_storage.as_str() {
-        "local" => {
+    match config.database_backend.as_str() {
+        "sqlite" => {
+            if config.database.as_os_str().is_empty() {
+                violation(violations, "coordinator.database", "must not be empty");
+            }
+            if config.database_url.is_some() {
+                violation(
+                    violations,
+                    "coordinator.database_url",
+                    "must not be set when database_backend is sqlite",
+                );
+            }
+            match config.database_storage.as_str() {
+                "local" => {
+                    if config.allow_unsafe_efs_sqlite {
+                        violation(
+                            violations,
+                            "coordinator.allow_unsafe_efs_sqlite",
+                            "must be false when database_storage is local",
+                        );
+                    }
+                }
+                "efs" => {
+                    if loaded.config.deployment.profile != "e2e" || !config.allow_unsafe_efs_sqlite
+                    {
+                        violation(
+                            violations,
+                            "coordinator.database_storage",
+                            "SQLite on EFS is allowed only for the explicit e2e profile with allow_unsafe_efs_sqlite=true; use local durable storage or PostgreSQL",
+                        );
+                    }
+                }
+                _ => violation(
+                    violations,
+                    "coordinator.database_storage",
+                    "must be local or efs when database_backend is sqlite",
+                ),
+            }
+        }
+        "postgres" => {
+            validate_secret(
+                loaded,
+                config.database_url.as_ref(),
+                "coordinator.database_url",
+                12,
+                violations,
+            );
+            if let Some(reference) = config.database_url.as_ref() {
+                if let Ok(value) = loaded.secret(reference, "coordinator.database_url") {
+                    match value.as_str("coordinator.database_url") {
+                        Ok(url)
+                            if url.starts_with("postgres://")
+                                || url.starts_with("postgresql://") => {}
+                        Ok(_) => violation(
+                            violations,
+                            "coordinator.database_url",
+                            "must use a postgres:// or postgresql:// URL",
+                        ),
+                        Err(error) => {
+                            violation(violations, "coordinator.database_url", error.to_string())
+                        }
+                    }
+                }
+            }
+            if config.database_storage != "network" {
+                violation(
+                    violations,
+                    "coordinator.database_storage",
+                    "must be network when database_backend is postgres",
+                );
+            }
             if config.allow_unsafe_efs_sqlite {
                 violation(
                     violations,
                     "coordinator.allow_unsafe_efs_sqlite",
-                    "must be false when database_storage is local",
-                );
-            }
-        }
-        "efs" => {
-            if loaded.config.deployment.profile != "e2e" || !config.allow_unsafe_efs_sqlite {
-                violation(
-                    violations,
-                    "coordinator.database_storage",
-                    "SQLite on EFS is allowed only for the explicit e2e profile with allow_unsafe_efs_sqlite=true; use local durable storage or #27's HA backend",
+                    "must be false when database_backend is postgres",
                 );
             }
         }
         _ => violation(
             violations,
-            "coordinator.database_storage",
-            "must be local or efs",
+            "coordinator.database_backend",
+            "must be sqlite or postgres",
         ),
     }
     if config.tls_mode != "files" {
@@ -1880,9 +1958,19 @@ pub fn reload_plan_for_service(
             candidate.coordinator.diagnostics_token
         );
         restart_if_changed!(
+            "coordinator.database_backend",
+            current.coordinator.database_backend,
+            candidate.coordinator.database_backend
+        );
+        restart_if_changed!(
             "coordinator.database",
             current.coordinator.database,
             candidate.coordinator.database
+        );
+        restart_if_changed!(
+            "coordinator.database_url",
+            current.coordinator.database_url,
+            candidate.coordinator.database_url
         );
         restart_if_changed!(
             "coordinator.database_storage",
@@ -2288,11 +2376,22 @@ pub const ENVIRONMENT_OVERRIDES: &[(&str, &str, bool)] = &[
         "coordinator.diagnostics_token",
         true,
     ),
+    (
+        "BLAKTAIL_DATABASE_BACKEND",
+        "coordinator.database_backend",
+        false,
+    ),
     ("BLAKTAIL_DATABASE", "coordinator.database", false),
     (
         "BLAKTAIL_DB_PATH",
         "coordinator.database (deprecated)",
         false,
+    ),
+    ("BLAKTAIL_DATABASE_URL", "coordinator.database_url", true),
+    (
+        "BLAKTAIL_DATABASE_URL_FILE",
+        "coordinator.database_url",
+        true,
     ),
     (
         "BLAKTAIL_DATABASE_STORAGE",
@@ -2579,6 +2678,42 @@ mod tests {
             .to_string();
         assert!(error.contains("coordinator.database_storage"));
         assert!(error.contains("coordinator.tls_mode"));
+    }
+
+    #[test]
+    fn postgres_coordinator_requires_a_redacted_postgres_secret() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("coord.pem");
+        let private_key = directory.path().join("coord.key");
+        fs::write(&certificate, "test certificate").unwrap();
+        fs::write(&private_key, "test private key").unwrap();
+        let mut environment = valid_environment();
+        let database_url = "postgresql://coord:password@db.example/blaktail";
+        environment.insert(
+            "BLAKTAIL_TLS_CERT".into(),
+            certificate.display().to_string(),
+        );
+        environment.insert("BLAKTAIL_TLS_KEY".into(), private_key.display().to_string());
+        environment.insert("BLAKTAIL_DATABASE_BACKEND".into(), "postgres".into());
+        environment.insert("BLAKTAIL_DATABASE_STORAGE".into(), "network".into());
+        environment.insert("BLAKTAIL_DATABASE_URL".into(), database_url.into());
+        let loaded =
+            LoadedConfig::load_with_environment(None, Service::Coordinator, environment.clone())
+                .unwrap();
+        loaded.validate(Service::Coordinator).unwrap();
+        let dump = loaded.redacted_dump(Service::Coordinator).unwrap();
+        assert!(!dump.contains(database_url));
+        assert!(dump.contains("<redacted:environment>"));
+
+        environment.insert("BLAKTAIL_DATABASE_URL".into(), "sqlite:///tmp/wrong".into());
+        let loaded =
+            LoadedConfig::load_with_environment(None, Service::Coordinator, environment).unwrap();
+        let error = loaded
+            .validate(Service::Coordinator)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("coordinator.database_url"));
+        assert!(!error.contains("sqlite:///tmp/wrong"));
     }
 
     #[test]

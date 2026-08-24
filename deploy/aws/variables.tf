@@ -66,7 +66,18 @@ variable "db_instance_class" {
 variable "db_multi_az" {
   description = "Multi-AZ RDS for production."
   type        = bool
-  default     = false
+  default     = true
+}
+
+variable "coord_desired_count" {
+  description = "Coordinator replicas. Keep zero for the first apply, run the explicit migration task, then set at least two."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.coord_desired_count == 0 || (var.coord_desired_count >= 2 && var.coord_desired_count <= 6 && floor(var.coord_desired_count) == var.coord_desired_count)
+    error_message = "coord_desired_count must be zero for migration or an integer from two to six."
+  }
 }
 
 variable "console_min_tasks" {
