@@ -20,10 +20,11 @@ RUN npm run build
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000
-RUN apk add --no-cache postgresql-client && addgroup -S blaktail && adduser -S blaktail -G blaktail
+RUN apk add --no-cache aws-cli postgresql-client && addgroup -S blaktail && adduser -S blaktail -G blaktail
 COPY --chown=blaktail:blaktail --from=deps /app/node_modules ./node_modules
 COPY --chown=blaktail:blaktail --from=build /app/.next ./.next
 COPY --chown=blaktail:blaktail --from=build /app/public ./public
+COPY --chown=blaktail:blaktail --from=build /app/scripts ./scripts
 COPY --chown=blaktail:blaktail apps/console/package.json apps/console/drizzle.config.ts ./
 COPY --chown=blaktail:blaktail apps/console/drizzle ./drizzle
 USER blaktail

@@ -71,6 +71,13 @@ became unusable when the stack was destroyed. Better Auth created the credential
 a one-shot Fargate task linked that real user to the coordinator organisation as
 owner. A fresh browser then signed in and observed both approved agents.
 
+That paragraph records the historical `3a3be505` flow exactly; direct membership
+linking and public sign-up are not the current supported ceremony. The hardened
+harness now runs the on-host, one-shot bootstrap CLI inside a private Fargate task,
+keeps its bootstrap token inside that task, transfers the owner password through a
+temporary encrypted run-bucket object, deletes that object on exit, and records
+only a redacted `supported_bootstrap` marker.
+
 ![Real email/password sign-in](../images/aws-e2e/sign-in.png)
 
 ![Ubuntu and Amazon Linux agents active after browser approval](../images/aws-e2e/devices.png)
@@ -146,7 +153,9 @@ This run did not prove a published release artifact, forced relay packet flow an
 metric delta, direct-path restoration, Ubuntu reboot persistence, stopping SSM
 during SSH, coordinator/console restart persistence, code reuse/outsider cases,
 revocation, or browser re-enrolment. Coordinator SQLite-on-EFS and generated secrets
-inside protected local Terraform state are smoke-only boundaries. Public signup and
-the unauthenticated coordinator organisation-bootstrap endpoint also need
-production hardening. Cost Explorer data was not yet available. These gaps keep
-#34 open.
+inside protected local Terraform state are smoke-only boundaries. At this run's
+historical commit, public signup and the unauthenticated coordinator
+organisation-bootstrap endpoint still needed production hardening; current code
+disables framework sign-up and requires one-use, action-scoped service assertions
+for staged organisation activation. Cost Explorer data was not yet available.
+The remaining lifecycle gaps keep #34 open.

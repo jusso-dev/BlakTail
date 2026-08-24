@@ -84,6 +84,7 @@ aws_cli ec2 describe-instances --instance-ids $instance_ids --output json | jq -
 
 cp "$IMAGES_TFVARS" "$evidence_dir/image-digests.json"
 cp "$PACKAGE_DIR/SHA256SUMS" "$evidence_dir/agent-package-SHA256SUMS"
+cp "$WORK_DIR/owner-bootstrap.ok" "$evidence_dir/owner-bootstrap.json"
 cp "$WORK_DIR/enrolment-ubuntu.ok" "$evidence_dir/enrolment-ubuntu.txt"
 cp "$WORK_DIR/enrolment-al2023.ok" "$evidence_dir/enrolment-al2023.txt"
 cp "$WORK_DIR/network-proof-ubuntu.ok" "$evidence_dir/network-proof-ubuntu.txt"
@@ -103,7 +104,8 @@ jq -n \
     commit_sha: $commit_sha, public_url: $public_url,
     console_http_status: $console_http_status,
     coordinator_http_status: $coordinator_http_status,
-    assertions: ["manual browser enrollment", "no public agent IP", "no inbound SSH",
+    assertions: ["supported one-shot first-owner bootstrap", "public signup disabled",
+      "manual browser enrollment", "no public agent IP", "no inbound SSH",
       "immutable ARM64 images", "bidirectional IPv4", "bidirectional IPv6",
       "MagicDNS", "relay endpoint configured", "overlay routes", "SSH over BlakTail"]}' >"$evidence_dir/manifest.json"
 

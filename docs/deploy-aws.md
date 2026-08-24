@@ -44,10 +44,36 @@ BLAKTAIL_RELAY_AUTH_SECRET=$BLAKTAIL_RELAY_AUTH_SECRET
 BLAKTAIL_RELAY_ENDPOINT=relay.example.org.au:3478
 BETTER_AUTH_URL=https://console.example.org.au
 EOF
-docker compose up -d --build
+docker compose build
+docker compose up -d postgres coord relay
+docker compose run --rm console npm run db:migrate
+
+umask 077
+openssl rand -base64 32 > owner-password
+chmod 600 owner-password
+docker compose run --rm \
+  -v "$PWD/owner-password:/run/secrets/owner-password:ro" \
+  console sh -ceu '
+    node scripts/bootstrap.mjs init --token-file /tmp/bootstrap-token
+    node scripts/bootstrap.mjs claim \
+      --token-file /tmp/bootstrap-token \
+      --password-file /run/secrets/owner-password \
+      --email owner@example.org.au \
+      --name "First Owner" \
+      --organisation-name "Example Organisation"
+  '
+docker compose up -d console
 ```
 
-Open `http://<ec2-ip>:3000` (put a TLS proxy such as Caddy/nginx in front for production). Security group needs inbound 3000/tcp, 8443/tcp, 3478/udp. Coord state lives in the `coorddata` volume; Postgres in `pgdata`. Compose binds coordinator and relay metrics to host loopback at `127.0.0.1:9701` and `127.0.0.1:9702`; scrape them from the host or a host-networked collector. See [observability.md](observability.md).
+Open `http://<ec2-ip>:3000` and sign in with the example email plus the protected
+`owner-password` file (put a TLS proxy such as Caddy/nginx in front for
+production). Public sign-up is disabled; create later users with owner invitations
+from `/settings`. Security group needs inbound 3000/tcp, 8443/tcp, 3478/udp. Coord
+state lives in the `coorddata` volume; Postgres in `pgdata`. Compose binds
+coordinator and relay metrics to host loopback at `127.0.0.1:9701` and
+`127.0.0.1:9702`; scrape them from the host or a host-networked collector. See
+[console.md](console.md#first-owner-and-invitations) and
+[observability.md](observability.md).
 
 ## Path 2: ECS via Terraform
 
@@ -71,6 +97,14 @@ terraform output console_url     # set BETTER_AUTH_URL / your DNS here
 terraform output coord_endpoint  # agents' --coord value
 terraform output relay_endpoint
 ```
+
+Run console migrations once, then execute the same supported `bootstrap.mjs
+init`/`claim` ceremony in a one-off console task or ECS Exec session. Transfer the
+password through a protected operator channel, never task arguments, Terraform
+variables/state, or CloudWatch output. The disposable isolated harness implements
+this as `scripts/aws-e2e/bootstrap-owner.sh`: it uses a short-lived encrypted S3
+object readable only by the console task role, deletes it on exit, keeps the
+bootstrap token inside the task, and writes a credential-free evidence marker.
 
 Production additions:
 

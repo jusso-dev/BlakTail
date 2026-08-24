@@ -48,6 +48,12 @@ resource "aws_iam_role" "ecs_task" {
   tags               = var.tags
 }
 
+resource "aws_iam_role" "ecs_console_task" {
+  name               = "${var.name_prefix}-console-task"
+  assume_role_policy = local.ecs_assume_role
+  tags               = var.tags
+}
+
 resource "aws_iam_role_policy" "ecs_exec" {
   name = "${var.name_prefix}-ecs-exec"
   role = aws_iam_role.ecs_task.id
@@ -62,6 +68,37 @@ resource "aws_iam_role_policy" "ecs_exec" {
         "ssmmessages:OpenDataChannel",
       ]
       Resource = "*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "ecs_console_exec" {
+  name = "${var.name_prefix}-console-exec"
+  role = aws_iam_role.ecs_console_task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "ecs_bootstrap_credentials" {
+  name = "${var.name_prefix}-bootstrap-credentials"
+  role = aws_iam_role.ecs_console_task.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject"]
+      Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.artifact_bucket}/bootstrap/*"
     }]
   })
 }

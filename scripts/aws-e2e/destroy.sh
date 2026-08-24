@@ -77,6 +77,7 @@ case "$bucket_present" in
       --query 'TagSet[?Key==`RunId`].Value | [0]' --output text)
     [ "$bucket_run_id" = "$RUN_ID" ] || die "artifact bucket RunId mismatch"
     aws_cli s3 rm "s3://$artifact_bucket/$RUN_ID/" --recursive --only-show-errors
+    aws_cli s3 rm "s3://$artifact_bucket/bootstrap/$RUN_ID/" --recursive --only-show-errors
     ;;
   false) ;;
   *) die "could not determine artifact bucket presence" ;;
@@ -211,4 +212,5 @@ if [ -d "$WORK_DIR/evidence" ]; then
   printf 'run_id=%s\nregion=%s\nscoped_residue=0\n' \
     "$RUN_ID" "$AWS_REGION" >"$WORK_DIR/evidence/teardown.txt"
 fi
+rm -f -- "$WORK_DIR/owner-password"
 printf 'destroy complete; no scoped residue: run_id=%s\n' "$RUN_ID"

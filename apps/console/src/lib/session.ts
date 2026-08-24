@@ -1,8 +1,8 @@
-import { createHmac } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { auth } from "./auth";
+import { requireBootstrapLocked } from "./bootstrap-state";
 import { db } from "./db/client";
 import { membership, organisation } from "./db/schema";
 import type { OrgRole } from "./roles";
@@ -14,7 +14,6 @@ export type ConsoleContext = {
   userId: string;
   email: string;
   name: string;
-  coordAssertion: string;
   sessionExpiresAt: Date;
   organisationId: string;
   organisationName: string;
@@ -34,6 +33,7 @@ export async function requireSession() {
 
 export async function requireConsoleContext(): Promise<ConsoleContext> {
   const session = await requireSession();
+  await requireBootstrapLocked();
   const rows = await db()
     .select({
       organisationId: organisation.id,
@@ -54,36 +54,14 @@ export async function requireConsoleContext(): Promise<ConsoleContext> {
   }
 
   const sessionExpiresAt = new Date(session.session.expiresAt);
-  const expiresAt = Math.min(
-    Math.floor(sessionExpiresAt.getTime() / 1000),
-    Math.floor(Date.now() / 1000) + 60,
-  );
-  if (expiresAt <= Math.floor(Date.now() / 1000)) {
+  if (sessionExpiresAt.getTime() <= Date.now()) {
     throw new Error("Session has expired.");
   }
-  const secret = process.env.BLAKTAIL_AUTH_HMAC_SECRET;
-  if (!secret || Buffer.byteLength(secret) < 32) {
-    throw new Error("BLAKTAIL_AUTH_HMAC_SECRET must be at least 32 bytes.");
-  }
-  const payload = Buffer.from(
-    JSON.stringify({
-      sub: session.user.id,
-      org_id: row.coordOrgId,
-      role: row.role,
-      name: session.user.name,
-      email: session.user.email,
-      exp: expiresAt,
-    }),
-  ).toString("base64url");
-  const signature = createHmac("sha256", secret)
-    .update(payload)
-    .digest("base64url");
 
   return {
     userId: session.user.id,
     email: session.user.email,
     name: session.user.name,
-    coordAssertion: payload + "." + signature,
     sessionExpiresAt,
     organisationId: row.organisationId,
     organisationName: row.organisationName,

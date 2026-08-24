@@ -21,7 +21,7 @@ on:
         required: true
         type: string
       owner_email:
-        description: Email used for browser signup and one-shot owner linking
+        description: Email provisioned by supported one-shot owner bootstrap
         required: true
         type: string
 
@@ -86,11 +86,11 @@ jobs:
       - name: Activate control plane
         run: scripts/aws-e2e/terraform-apply.sh activate
 
-      - name: Wait for browser signup and link owner
+      - name: Provision first owner through supported bootstrap
         run: |
           public_url=$(terraform -chdir="$TF_DIR" output -state="$WORK_DIR/terraform.tfstate" -raw public_url)
-          printf 'Create the configured owner through the supported Better Auth sign-up API at %s, then sign out.\n' "$public_url"
           scripts/aws-e2e/bootstrap-owner.sh
+          printf 'Owner ready. Sign in at %s with password stored in %s/owner-password.\n' "$public_url" "$WORK_DIR"
 
       - name: Install agents through SSM
         run: scripts/aws-e2e/ssm-install-agents.sh

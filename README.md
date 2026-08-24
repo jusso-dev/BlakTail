@@ -90,6 +90,12 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 Operator UI lives in `apps/console` (Next.js 16.3, Better Auth, Drizzle, onshore Postgres).
 See [docs/console.md](docs/console.md).
 
+Fresh deployments use one explicit, time-limited first-owner ceremony from the
+console host. Public Better Auth sign-up is disabled at the HTTP endpoint. After
+bootstrap locks, owners add people with one-use, organisation-bound invitations;
+lost sole-owner access requires an audited on-host recovery. See
+[First owner and invitations](docs/console.md#first-owner-and-invitations).
+
 Metrics, audit coverage, and alert examples: [docs/observability.md](docs/observability.md).
 The public data-handling page is `/privacy`; operator duties and current retention
 limits are in [docs/privacy.md](docs/privacy.md).
@@ -164,7 +170,7 @@ Do not commit:
 - Node WireGuard private keys, TLS private keys, PSKs (`*.key`, `*.pem`, `*.psk`)
 - Join keys (`btk_…`) or node tokens (`btn_…`)
 - Coordinator SQLite/Postgres dumps
-- `.env`, `BETTER_AUTH_SECRET`, `BLAKTAIL_CONSOLE_SYNC_SECRET`, database URLs
+- `.env`, `BETTER_AUTH_SECRET`, `BLAKTAIL_AUTH_HMAC_SECRET`, database URLs
 - Live WireGuard configs (`wg*.conf`)
 
 `.gitignore` blocks the common filename patterns. CI runs gitleaks on every push, plus `cargo deny` against `deny.toml`. A throwaway branch that commits a dummy secret is required to fail that job (`scripts/ci/prove-gitleaks-detects-dummy.sh`). If a real secret lands in git, rotate it; deleting the file in a later commit does not erase the blob.

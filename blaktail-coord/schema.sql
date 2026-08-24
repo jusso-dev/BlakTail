@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS device_authorizations (
  expires_at INTEGER NOT NULL,
  approved_at INTEGER,
  consumed_at INTEGER,
+ last_polled_at INTEGER,
  org_id TEXT REFERENCES orgs(id) ON DELETE CASCADE,
  user_id TEXT,
  user_role TEXT,
@@ -61,3 +62,19 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS audit_events_org_created_idx
  ON audit_events(org_id, created_at DESC, id DESC);
+CREATE TABLE IF NOT EXISTS console_assertion_nonces (
+ jti_hash TEXT PRIMARY KEY,
+ expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS console_assertion_nonces_expiry_idx
+ ON console_assertion_nonces(expires_at);
+CREATE TABLE IF NOT EXISTS pending_bootstrap_orgs (
+ id TEXT PRIMARY KEY,
+ name TEXT NOT NULL UNIQUE,
+ acl_json TEXT NOT NULL CHECK (json_valid(acl_json)),
+ node_key_ttl_seconds INTEGER NOT NULL,
+ created_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pending_bootstrap_orgs_expiry_idx
+ ON pending_bootstrap_orgs(expires_at);

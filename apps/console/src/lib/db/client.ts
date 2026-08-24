@@ -14,6 +14,7 @@ function databaseUrl(): string {
 
 const globalForDb = globalThis as unknown as {
   blaktailSql?: ReturnType<typeof postgres>;
+  blaktailRawSql?: ReturnType<typeof postgres>;
 };
 
 function sqlClient() {
@@ -24,6 +25,16 @@ function sqlClient() {
     });
   }
   return globalForDb.blaktailSql;
+}
+
+export function rawSqlClient() {
+  if (!globalForDb.blaktailRawSql) {
+    globalForDb.blaktailRawSql = postgres(databaseUrl(), {
+      max: 5,
+      prepare: false,
+    });
+  }
+  return globalForDb.blaktailRawSql;
 }
 
 export function db() {

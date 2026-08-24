@@ -1,10 +1,13 @@
 import { ConsoleShell } from "@/components/console-shell";
+import { InvitationManager } from "@/components/invitation-manager";
+import { listPendingInvitations } from "@/lib/invitations";
 import { roleLabel } from "@/lib/roles";
 import { requireConsoleContext } from "@/lib/session";
 import { TAGLINE } from "@/lib/tagline";
 
 export default async function SettingsPage() {
   const ctx = await requireConsoleContext();
+  const invitations = await listPendingInvitations(ctx);
 
   return (
     <ConsoleShell ctx={ctx} current="/settings">
@@ -36,6 +39,16 @@ export default async function SettingsPage() {
             coordinator.
           </p>
         </div>
+        {ctx.role === "owner" ? (
+          <InvitationManager
+            invitations={invitations.map((invitation) => ({
+              id: invitation.id,
+              email: invitation.email,
+              role: invitation.role,
+              expiresAt: invitation.expiresAt.toISOString(),
+            }))}
+          />
+        ) : null}
       </div>
     </ConsoleShell>
   );

@@ -21,6 +21,7 @@ BlakTail is a WireGuard mesh. Devices join an organisation tailnet, talk peer to
 | Relay capability secret | Coordinator and relay env only | Attacker can register or hijack relay identities; it is separate from console-session signing |
 | Console sessions and `BETTER_AUTH_SECRET` | Onshore Postgres and console env | Account takeover of the operator UI |
 | `BLAKTAIL_AUTH_HMAC_SECRET` | Console and coordinator env | Forgery of console sessions into the coordinator |
+| Bootstrap/invitation credentials | Shown once to operator/invitee; SHA-256 hashes in Postgres | First-owner or invited-role takeover before expiry/use |
 | TLS private key | Coordinator host | Intercept of control-plane HTTP |
 
 The coordinator stores hashes of join keys and node tokens, not the secrets themselves. It never stores user file contents. WireGuard payload ciphertext is not a coordinator asset.
@@ -92,6 +93,12 @@ These are not optional hardening. They are the v1 bar.
    Default routes remain opt-in per client. The agent limits forwarding to the
    advertised destinations, and the coordinator accepts only RFC1918 private
    subnets while rejecting tailnet overlap and ambiguous approved routes.
+7. **Ownership starts on-host.** Public email/password sign-up is disabled. A
+   protected shell creates one short-lived first-owner credential, coordinator
+   organisation activation is staged until console identity is ready, and
+   bootstrap locks after one success. Later users require owner-issued,
+   organisation-bound invitations. Sole-owner recovery requires the exact owner
+   email from a trusted host and revokes existing sessions.
 
 ## Honest limits
 
@@ -202,7 +209,7 @@ sudo rm -f /var/lib/blaktail/private.key /var/lib/blaktail/state.json
 sudo shred -u /etc/blaktail/blaktaild.env 2>/dev/null || sudo rm -f /etc/blaktail/blaktaild.env
 ```
 
-Mint a new single-use join key with a short expiry (an hour, not a month). Enrol only the replacement device. Rotate `BLAKTAIL_CONSOLE_SYNC_SECRET` and `BETTER_AUTH_SECRET` if those files were on the same laptop.
+Mint a new single-use join key with a short expiry (an hour, not a month). Enrol only the replacement device. Rotate `BLAKTAIL_AUTH_HMAC_SECRET` and `BETTER_AUTH_SECRET` if those files were on the same laptop.
 
 ## What never goes in git
 
@@ -213,7 +220,7 @@ Never commit:
 - Node private keys, TLS private keys, WireGuard PSKs, `*.key`, `*.pem`, `*.psk`
 - Join keys, node tokens, or any `btk_` / `btn_` secret
 - Coordinator SQLite/Postgres dumps
-- `.env`, `/etc/blaktail/blaktaild.env`, `BETTER_AUTH_SECRET`, `BLAKTAIL_CONSOLE_SYNC_SECRET`, database URLs
+- `.env`, `/etc/blaktail/blaktaild.env`, `BETTER_AUTH_SECRET`, `BLAKTAIL_AUTH_HMAC_SECRET`, database URLs
 - `wg*.conf` and other live WireGuard configs
 - Real `BLAKTAIL_TLS_KEY` material
 

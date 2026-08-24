@@ -12,6 +12,12 @@ import {
   type DeviceTag,
 } from "@/lib/coord";
 import { canMutateTailnet, requireConsoleContext } from "@/lib/session";
+import {
+  createInvitation,
+  InvitationError,
+  revokeInvitation,
+  type InvitationRole,
+} from "@/lib/invitations";
 
 export type ActionResult<T = void> =
   | { ok: true; data: T }
@@ -195,6 +201,62 @@ export async function loadAclAction(): Promise<ActionResult<unknown>> {
     return {
       ok: false,
       error: error instanceof Error ? error.message : "Could not load ACL.",
+    };
+  }
+}
+
+export async function createInvitationAction(
+  formData: FormData,
+): Promise<ActionResult<{ id: string; url: string }>> {
+  try {
+    const ctx = await requireConsoleContext();
+    const email = String(formData.get("email") ?? "");
+    const requestedRole = String(formData.get("role") ?? "member");
+    if (requestedRole !== "admin" && requestedRole !== "member") {
+      return { ok: false, error: "Invitation role must be admin or member." };
+    }
+    const result = await createInvitation(
+      ctx,
+      email,
+      requestedRole as InvitationRole,
+    );
+    revalidatePath("/settings");
+    revalidatePath("/audit");
+    return {
+      ok: true,
+      data: { id: result.invitation.id, url: result.url },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof InvitationError
+          ? error.message
+          : "Could not create invitation.",
+    };
+  }
+}
+
+export async function revokeInvitationAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireConsoleContext();
+    const invitationId = String(formData.get("invitationId") ?? "");
+    if (!invitationId) {
+      return { ok: false, error: "Choose an invitation to revoke." };
+    }
+    await revokeInvitation(ctx, invitationId);
+    revalidatePath("/settings");
+    revalidatePath("/audit");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof InvitationError
+          ? error.message
+          : "Could not revoke invitation.",
     };
   }
 }

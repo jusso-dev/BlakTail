@@ -62,6 +62,13 @@ grep -q 'delete-task-definitions' "$SCRIPT_DIR/destroy.sh"
 grep -q 'PublicIpAddress == null' "$SCRIPT_DIR/common.sh"
 grep -q 'covers_ssh' "$SCRIPT_DIR/common.sh"
 grep -q 'assignPublicIp:"DISABLED"' "$SCRIPT_DIR/migrate-console.sh"
+grep -q 'bootstrap.mjs init' "$SCRIPT_DIR/bootstrap-owner.sh"
+grep -q 'bootstrap.mjs claim' "$SCRIPT_DIR/bootstrap-owner.sh"
+grep -q 'supported_bootstrap:true' "$SCRIPT_DIR/bootstrap-owner.sh"
+if grep -E 'sign-up/email|INSERT INTO membership|DELETE FROM membership' \
+  "$SCRIPT_DIR/bootstrap-owner.sh" "$SCRIPT_DIR/recover-owner.sh" >/dev/null; then
+  die "AWS owner ceremony must use supported bootstrap CLI only"
+fi
 for checked_file in "$SCRIPT_DIR"/*.sh "$REPO_ROOT/.github/workflows/aws-e2e.yml"; do
   [ "$checked_file" = "$SCRIPT_DIR/static-test.sh" ] && continue
   if grep -E ':[[:space:]]*latest|:latest' "$checked_file" >/dev/null; then

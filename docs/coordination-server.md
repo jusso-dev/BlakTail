@@ -26,8 +26,8 @@ The default database is `blaktail-coord.sqlite3`, suitable for a single office b
 
 The coordinator records an ordered schema version in SQLite's
 `PRAGMA user_version`. A version-zero database—including databases created before
-the runner existed—is migrated to the consolidated version-one schema inside one
-transaction. Reopening the database is idempotent. A coordinator refuses to open a
+the runner existed—is migrated through the ordered schema versions inside one
+transaction per version. Reopening the database is idempotent. A coordinator refuses to open a
 database whose version is newer than the binary supports instead of mutating it.
 
 Before upgrading, take a consistent backup while the coordinator is stopped, or use
@@ -45,10 +45,16 @@ advance `CURRENT_SCHEMA_VERSION`, not add another unconditional startup mutation
 
 ## HTTP API
 
-- `POST /v1/orgs` — `{ "name": "org", "acl": { "rules": [] } }`
+- `POST /v1/orgs` — on-host bootstrap service assertion with action
+  `bootstrap.prepare`; reserves but does not activate
+  `{ "id": "uuid", "name": "org", "acl": { "rules": [] } }`
+- `POST /v1/orgs/{org_id}/bootstrap-commit` — separate one-use service assertion
+  with action `bootstrap.commit`; activates the matching unexpired reservation
 - `POST /v1/orgs/{org_id}/join-keys` — owner/admin bearer session; `{ "expires_in_seconds": 3600, "single_use": true, "tags": ["office"] }`
 - `POST /v1/device-authorizations` — begin a ten-minute browser enrollment for a bound node name and WireGuard key
-- `GET /v1/device-authorizations/{device_code}` — agent poll; reveals only pending/approved state
+- `GET /v1/device-authorizations/{device_code}` — agent poll; reveals only
+  pending/approved state and enforces the returned poll interval with `429` plus
+  `Retry-After`
 - `GET|POST /v1/orgs/{org_id}/device-authorizations/{user_code}` — signed-in console preview and approval
 - `GET /v1/orgs/{org_id}/nodes` — any org user session; list devices
 - `PUT /v1/orgs/{org_id}/nodes/{node_id}/routes` — owner/admin approval of an exact subset of advertised routes
@@ -87,11 +93,28 @@ approves the high-entropy device code as a short-lived, single-use join grant bo
 to the requesting node name and WireGuard public key. The raw device secret remains
 only in `blaktaild`; a copied browser link cannot register a different device.
 
-The console verifies Better Auth sessions in onshore Postgres, maps the user to an organisation and role, then issues a short-lived HMAC assertion using the shared `BLAKTAIL_AUTH_HMAC_SECRET`. Rust validates that assertion on every console request and stores no auth sessions. Use independent, randomly generated values of at least 32 bytes for this secret and `BETTER_AUTH_SECRET`. Roles are
+The console verifies Better Auth sessions in onshore Postgres, maps the user to an
+organisation and role, then issues a new HMAC assertion for each request using the
+shared `BLAKTAIL_AUTH_HMAC_SECRET`. Rust requires exact issuer and audience, a
+maximum 60-second lifetime, actor, role, organisation, and a 32–128 character
+nonce; each nonce is hashed and consumed once. Service assertions additionally
+bind one exact action. Organisation prepare/commit accepts only the on-host
+`service` role and never an ordinary owner session. Pending reservations expire
+after one hour and are not visible to node or management routes. Use independent,
+randomly generated values of at least 32 bytes for this secret and
+`BETTER_AUTH_SECRET`. Roles are
 `owner`, `admin`, and `member`. Members can read ACLs and device lists but
 cannot mint join keys, update ACLs, or revoke devices. A join key binds its
 creator's user identity and role plus zero or more of the fixed device tags
 `office`, `ranger`, and `store` to the enrolled node.
+
+The current HMAC keyring contains one key, so rotation needs a brief management
+outage: stop console traffic, wait 65 seconds for every old assertion to expire,
+replace `BLAKTAIL_AUTH_HMAC_SECRET` with the same new random value on coordinator
+and console, restart coordinator then console, and verify one read plus one audited
+write. Never rotate only one side. Already consumed nonces remain hashed in SQLite
+until their expiry cleanup; restarting either service does not make a captured
+assertion reusable.
 
 ACL JSON uses `rules` with `action` (`allow` or `deny`) and optional `src_roles`,
 `src_tags`, `dst_roles`, and `dst_tags` arrays. A blank selector matches all. Explicit
@@ -112,7 +135,8 @@ nonce-confirmed UDP hole punch while keeping relayed WireGuard traffic available
 
 ## SQLite schema dump
 
-The canonical version-one schema is [`blaktail-coord/schema.sql`](../blaktail-coord/schema.sql). It is applied only through the versioned migration runner. Its tables are:
+The canonical current schema is [`blaktail-coord/schema.sql`](../blaktail-coord/schema.sql).
+It is applied only through the versioned migration runner. Its principal tables are:
 
 ```sql
 CREATE TABLE orgs (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
@@ -125,6 +149,7 @@ CREATE TABLE device_authorizations (id TEXT PRIMARY KEY,
   device_code_hash TEXT NOT NULL UNIQUE, user_code_hash TEXT NOT NULL UNIQUE,
   requested_name TEXT NOT NULL, wg_public_key TEXT NOT NULL,
   expires_at INTEGER NOT NULL, approved_at INTEGER, consumed_at INTEGER,
+  last_polled_at INTEGER,
   org_id TEXT, user_id TEXT, user_role TEXT, tags_json TEXT NOT NULL);
 CREATE TABLE nodes (id TEXT PRIMARY KEY, org_id TEXT NOT NULL, name TEXT NOT NULL,
   wg_public_key TEXT NOT NULL, endpoint TEXT, allowed_ips_json TEXT NOT NULL,
@@ -137,6 +162,12 @@ CREATE TABLE audit_events (id TEXT PRIMARY KEY, org_id TEXT NOT NULL,
   actor_email TEXT NOT NULL, actor_role TEXT NOT NULL, action TEXT NOT NULL,
   target_type TEXT NOT NULL, target_id TEXT, details_json TEXT NOT NULL,
   created_at INTEGER NOT NULL);
+CREATE TABLE console_assertion_nonces (
+  jti_hash TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+CREATE TABLE pending_bootstrap_orgs (id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE, acl_json TEXT NOT NULL,
+  node_key_ttl_seconds INTEGER NOT NULL,
+  created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
 ```
 
 The full schema includes foreign keys, JSON checks, uniqueness constraints, and indexes.

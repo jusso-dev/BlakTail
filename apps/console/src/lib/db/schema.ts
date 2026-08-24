@@ -1,7 +1,10 @@
 import { relations, sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   check,
+  integer,
+  jsonb,
   pgTable,
   text,
   timestamp,
@@ -68,6 +71,17 @@ export const verification = pgTable("verification", {
   updatedAt: timestamp("updated_at").defaultNow(),
 });
 
+export const rateLimit = pgTable(
+  "rate_limit",
+  {
+    id: text("id").primaryKey(),
+    key: text("key").notNull(),
+    count: integer("count").notNull(),
+    lastRequest: bigint("last_request", { mode: "number" }).notNull(),
+  },
+  (table) => [uniqueIndex("rate_limit_key_unique").on(table.key)],
+);
+
 /** Organisation membership mirrored to the Rust coordinator. */
 export const organisation = pgTable("organisation", {
   id: text("id").primaryKey(),
@@ -101,6 +115,95 @@ export const membership = pgTable(
     ),
   ],
 );
+
+export const bootstrapState = pgTable(
+  "bootstrap_state",
+  {
+    id: text("id").primaryKey(),
+    status: text("status")
+      .notNull()
+      .$type<"uninitialised" | "claimable" | "provisioning" | "locked">(),
+    tokenHash: text("token_hash"),
+    tokenExpiresAt: timestamp("token_expires_at", { withTimezone: true }),
+    provisioningUserId: text("provisioning_user_id"),
+    provisioningOrganisationId: text("provisioning_organisation_id"),
+    provisioningCoordOrgId: text("provisioning_coord_org_id"),
+    provisioningEmail: text("provisioning_email"),
+    provisioningOwnerName: text("provisioning_owner_name"),
+    provisioningOrganisationName: text("provisioning_organisation_name"),
+    lockedAt: timestamp("locked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  () => [
+    check("bootstrap_state_singleton_check", sql.raw("\"id\" = 'primary'")),
+    check(
+      "bootstrap_state_status_check",
+      sql.raw(
+        "\"status\" in ('uninitialised', 'claimable', 'provisioning', 'locked')",
+      ),
+    ),
+  ],
+);
+
+export const invitation = pgTable(
+  "invitation",
+  {
+    id: text("id").primaryKey(),
+    organisationId: text("organisation_id")
+      .notNull()
+      .references(() => organisation.id, { onDelete: "cascade" }),
+    email: text("email").notNull(),
+    role: text("role").notNull().$type<"admin" | "member">(),
+    tokenHash: text("token_hash").notNull().unique(),
+    inviterUserId: text("inviter_user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    status: text("status")
+      .notNull()
+      .$type<"pending" | "accepted" | "revoked">()
+      .default("pending"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("invitation_pending_org_email_unique")
+      .on(table.organisationId, table.email)
+      .where(sql.raw("\"status\" = 'pending'")),
+    check("invitation_role_check", sql.raw("\"role\" in ('admin', 'member')")),
+    check(
+      "invitation_status_check",
+      sql.raw("\"status\" in ('pending', 'accepted', 'revoked')"),
+    ),
+  ],
+);
+
+export const consoleAuditEvent = pgTable("console_audit_event", {
+  id: text("id").primaryKey(),
+  organisationId: text("organisation_id").references(() => organisation.id, {
+    onDelete: "cascade",
+  }),
+  actorUserId: text("actor_user_id"),
+  actorEmail: text("actor_email").notNull().default(""),
+  actorRole: text("actor_role").notNull(),
+  source: text("source").notNull(),
+  action: text("action").notNull(),
+  result: text("result").notNull(),
+  targetType: text("target_type").notNull(),
+  targetId: text("target_id"),
+  details: jsonb("details").notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
 
 export const userRelations = relations(user, ({ many }) => ({
   sessions: many(session),

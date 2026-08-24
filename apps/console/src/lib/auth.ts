@@ -20,11 +20,23 @@ export const auth = betterAuth({
       session: schema.session,
       account: schema.account,
       verification: schema.verification,
+      rateLimit: schema.rateLimit,
     },
   }),
   emailAndPassword: {
     enabled: true,
+    disableSignUp: true,
     minPasswordLength: 10,
+  },
+  rateLimit: {
+    enabled: true,
+    storage: "database",
+    window: 60,
+    max: 20,
+    customRules: {
+      "/sign-in/email": { window: 60, max: 10 },
+      "/sign-up/email": { window: 60, max: 3 },
+    },
   },
   session: {
     expiresIn: 60 * 60 * 24 * 7,

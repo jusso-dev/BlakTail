@@ -1,6 +1,6 @@
-import { createHmac } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { auth, type Session } from "@/lib/auth";
+import { requireBootstrapLocked } from "@/lib/bootstrap-state";
 import { db } from "@/lib/db/client";
 import { membership, organisation } from "@/lib/db/schema";
 import type { ConsoleContext } from "@/lib/session";
@@ -41,6 +41,7 @@ export async function sessionFromBearer(request: Request): Promise<Session | nul
 export async function requireConsoleContextFromSession(
   session: Session,
 ): Promise<ConsoleContext> {
+  await requireBootstrapLocked();
   const rows = await db()
     .select({
       organisationId: organisation.id,
@@ -61,34 +62,14 @@ export async function requireConsoleContextFromSession(
   }
 
   const sessionExpiresAt = new Date(session.session.expiresAt);
-  const expiresAt = Math.min(
-    Math.floor(sessionExpiresAt.getTime() / 1000),
-    Math.floor(Date.now() / 1000) + 60,
-  );
-  if (expiresAt <= Math.floor(Date.now() / 1000)) {
+  if (sessionExpiresAt.getTime() <= Date.now()) {
     throw new Error("Session has expired.");
   }
-  const secret = process.env.BLAKTAIL_AUTH_HMAC_SECRET;
-  if (!secret || Buffer.byteLength(secret) < 32) {
-    throw new Error("BLAKTAIL_AUTH_HMAC_SECRET must be at least 32 bytes.");
-  }
-  const payload = Buffer.from(
-    JSON.stringify({
-      sub: session.user.id,
-      org_id: row.coordOrgId,
-      role: row.role,
-      exp: expiresAt,
-    }),
-  ).toString("base64url");
-  const signature = createHmac("sha256", secret)
-    .update(payload)
-    .digest("base64url");
 
   return {
     userId: session.user.id,
     email: session.user.email,
     name: session.user.name,
-    coordAssertion: payload + "." + signature,
     sessionExpiresAt,
     organisationId: row.organisationId,
     organisationName: row.organisationName,

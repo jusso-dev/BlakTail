@@ -49,6 +49,20 @@ jobs:
   console:
     name: lint, typecheck, build
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: blaktail
+          POSTGRES_PASSWORD: blaktail
+          POSTGRES_DB: blaktail
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blaktail -d blaktail"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     defaults:
       run:
         working-directory: apps/console
@@ -58,6 +72,7 @@ jobs:
       BETTER_AUTH_URL: http://localhost:3000
       COORD_BASE_URL: https://coord.example.internal
       BLAKTAIL_AUTH_HMAC_SECRET: ci-auth-hmac-secret-at-least-32-chars
+      TEST_DATABASE_URL: postgres://blaktail:blaktail@127.0.0.1:5432/blaktail
       NEXT_TELEMETRY_DISABLED: "1"
     steps:
       - name: Checkout
@@ -73,5 +88,11 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Bootstrap race and replay tests
+        run: npm test
+
       - name: Build
         run: npm run build
+
+      - name: Auth and invitation HTTP E2E
+        run: npm run test:auth-e2e

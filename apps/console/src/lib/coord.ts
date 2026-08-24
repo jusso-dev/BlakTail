@@ -1,5 +1,6 @@
 import "server-only";
 
+import { signCoordAssertion } from "./coord-assertion";
 import type { ConsoleContext } from "./session";
 
 export type DeviceTag = "office" | "ranger" | "store";
@@ -66,12 +67,12 @@ function coordBaseUrl(): string {
 
 async function coordFetch(
   path: string,
-  init: RequestInit & { sessionToken?: string } = {},
+  init: RequestInit & { ctx?: ConsoleContext } = {},
 ): Promise<Response> {
-  const { sessionToken, headers: initHeaders, ...rest } = init;
+  const { ctx, headers: initHeaders, ...rest } = init;
   const headers = new Headers(initHeaders);
-  if (sessionToken) {
-    headers.set("Authorization", `Bearer ${sessionToken}`);
+  if (ctx) {
+    headers.set("Authorization", `Bearer ${signCoordAssertion(ctx)}`);
   }
   if (!headers.has("content-type") && rest.body) {
     headers.set("content-type", "application/json");
@@ -104,7 +105,7 @@ export async function getCoordHealth(): Promise<CoordHealth> {
 export async function listNodes(ctx: ConsoleContext): Promise<CoordNode[]> {
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/nodes`, {
     method: "GET",
-    sessionToken: ctx.coordAssertion,
+    ctx,
   });
   if (!res.ok) {
     throw new Error(await readError(res));
@@ -117,7 +118,7 @@ export async function listAuditEvents(
 ): Promise<AuditEvent[]> {
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/audit?limit=100`, {
     method: "GET",
-    sessionToken: ctx.coordAssertion,
+    ctx,
   });
   if (!res.ok) {
     throw new Error(await readError(res));
@@ -134,7 +135,7 @@ export async function revokeNode(
   }
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/nodes/${nodeId}`, {
     method: "DELETE",
-    sessionToken: ctx.coordAssertion,
+    ctx,
   });
   if (!res.ok) {
     throw new Error(await readError(res));
@@ -153,7 +154,7 @@ export async function updateNodeFriendlyName(
     `/v1/orgs/${ctx.coordOrgId}/nodes/${nodeId}/friendly-name`,
     {
       method: "PUT",
-      sessionToken: ctx.coordAssertion,
+      ctx,
       body: JSON.stringify({ friendly_name: friendlyName }),
     },
   );
@@ -174,7 +175,7 @@ export async function approveNodeRoutes(
     `/v1/orgs/${ctx.coordOrgId}/nodes/${nodeId}/routes`,
     {
       method: "PUT",
-      sessionToken: ctx.coordAssertion,
+      ctx,
       body: JSON.stringify({ approved_routes: approvedRoutes }),
     },
   );
@@ -196,7 +197,7 @@ export async function mintJoinKey(
   }
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/join-keys`, {
     method: "POST",
-    sessionToken: ctx.coordAssertion,
+    ctx,
     body: JSON.stringify({
       expires_in_seconds: input.expiresInSeconds ?? 3600,
       single_use: input.singleUse ?? true,
@@ -217,7 +218,7 @@ export async function getDeviceAuthorization(
     `/v1/orgs/${ctx.coordOrgId}/device-authorizations/${encodeURIComponent(code)}`,
     {
       method: "GET",
-      sessionToken: ctx.coordAssertion,
+      ctx,
     },
   );
   if (!res.ok) {
@@ -235,7 +236,7 @@ export async function approveDeviceAuthorization(
     `/v1/orgs/${ctx.coordOrgId}/device-authorizations/${encodeURIComponent(code)}`,
     {
       method: "POST",
-      sessionToken: ctx.coordAssertion,
+      ctx,
       body: JSON.stringify({ tags }),
     },
   );
@@ -248,7 +249,7 @@ export async function approveDeviceAuthorization(
 export async function getAcl(ctx: ConsoleContext): Promise<unknown> {
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/acl`, {
     method: "GET",
-    sessionToken: ctx.coordAssertion,
+    ctx,
   });
   if (!res.ok) {
     throw new Error(await readError(res));
@@ -262,7 +263,7 @@ export async function putAcl(ctx: ConsoleContext, acl: unknown): Promise<void> {
   }
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/acl`, {
     method: "PUT",
-    sessionToken: ctx.coordAssertion,
+    ctx,
     body: JSON.stringify(acl),
   });
   if (!res.ok) {

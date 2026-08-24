@@ -28,7 +28,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 2;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 const DEFAULT_NODE_KEY_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_NODE_KEY_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_NODE_KEY_TTL_SECS: i64 = 365 * 24 * 60 * 60;
@@ -37,6 +37,11 @@ const DEVICE_AUTH_POLL_SECS: u64 = 2;
 const MAX_PENDING_DEVICE_AUTHS: i64 = 1_000;
 const MAX_FRIENDLY_NAME_CHARS: usize = 64;
 const DEFAULT_CONSOLE_URL: &str = "https://console.invalid";
+const CONSOLE_ASSERTION_ISSUER: &str = "blaktail-console";
+const CONSOLE_ASSERTION_AUDIENCE: &str = "blaktail-coord";
+const MAX_CONSOLE_ASSERTION_LIFETIME_SECS: i64 = 60;
+const CONSOLE_ASSERTION_CLOCK_SKEW_SECS: i64 = 5;
+const BOOTSTRAP_RESERVATION_TTL_SECS: i64 = 60 * 60;
 #[derive(Clone)]
 pub struct Store(Arc<Mutex<Connection>>);
 
@@ -68,6 +73,16 @@ const MIGRATIONS: &[Migration] = &[
         version: 2,
         name: "friendly device names",
         apply: migrate_to_v2,
+    },
+    Migration {
+        version: 3,
+        name: "console assertion replay protection",
+        apply: migrate_to_v3,
+    },
+    Migration {
+        version: 4,
+        name: "bootstrap reservations and device poll throttling",
+        apply: migrate_to_v4,
     },
 ];
 
@@ -181,6 +196,33 @@ fn migrate_to_v1(db: &Connection) -> Result<(), rusqlite::Error> {
 
 fn migrate_to_v2(db: &Connection) -> Result<(), rusqlite::Error> {
     ensure_column(db, "nodes", "display_name", "TEXT")
+}
+
+fn migrate_to_v3(db: &Connection) -> Result<(), rusqlite::Error> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS console_assertion_nonces (
+            jti_hash TEXT PRIMARY KEY,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS console_assertion_nonces_expiry_idx
+            ON console_assertion_nonces(expires_at);",
+    )
+}
+
+fn migrate_to_v4(db: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(db, "device_authorizations", "last_polled_at", "INTEGER")?;
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_bootstrap_orgs (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            acl_json TEXT NOT NULL CHECK (json_valid(acl_json)),
+            node_key_ttl_seconds INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS pending_bootstrap_orgs_expiry_idx
+            ON pending_bootstrap_orgs(expires_at);",
+    )
 }
 
 fn normalise_dns_names(db: &Connection) -> Result<(), rusqlite::Error> {
@@ -361,7 +403,8 @@ pub fn app_with_relays_console_and_metrics(
             "/v1/device-authorizations/:device_code",
             get(poll_device_authorization),
         )
-        .route("/v1/orgs", post(create_org))
+        .route("/v1/orgs", post(prepare_org))
+        .route("/v1/orgs/:org_id/bootstrap-commit", post(commit_org))
         .route("/v1/orgs/:org_id/join-keys", post(mint_join_key))
         .route(
             "/v1/orgs/:org_id/device-authorizations/:user_code",
@@ -532,6 +575,13 @@ struct DeviceAuthorizationPreviewRow {
     approved_org: Option<String>,
 }
 
+struct DeviceAuthorizationPollRow {
+    expires_at: i64,
+    approved_at: Option<i64>,
+    consumed_at: Option<i64>,
+    last_polled_at: Option<i64>,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ApproveDeviceAuthorization {
@@ -623,18 +673,45 @@ async fn poll_device_authorization(
     UrlPath(device_code): UrlPath<String>,
 ) -> Result<Response, ApiError> {
     let db = s.store.0.lock().unwrap();
-    let row: Option<(i64, Option<i64>, Option<i64>)> = db
+    let row: Option<DeviceAuthorizationPollRow> = db
         .query_row(
-            "SELECT expires_at,approved_at,consumed_at FROM device_authorizations WHERE device_code_hash=?1",
+            "SELECT expires_at,approved_at,consumed_at,last_polled_at
+             FROM device_authorizations WHERE device_code_hash=?1",
             params![hash(device_code.trim())],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok(DeviceAuthorizationPollRow {
+                    expires_at: row.get(0)?,
+                    approved_at: row.get(1)?,
+                    consumed_at: row.get(2)?,
+                    last_polled_at: row.get(3)?,
+                })
+            },
         )
         .optional()?;
-    let (expires_at, approved_at, consumed_at) = row.ok_or(ApiError::Unauthorized)?;
-    if expires_at <= now() || consumed_at.is_some() {
+    let row = row.ok_or(ApiError::Unauthorized)?;
+    let current_time = now();
+    if row.expires_at <= current_time || row.consumed_at.is_some() {
         return Err(ApiError::Gone);
     }
-    let (status, state) = if approved_at.is_some() {
+    if row
+        .last_polled_at
+        .is_some_and(|last| current_time < last + DEVICE_AUTH_POLL_SECS as i64)
+    {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", DEVICE_AUTH_POLL_SECS.to_string())],
+            Json(serde_json::json!({
+                "error":"device authorization polled too quickly",
+                "interval_seconds":DEVICE_AUTH_POLL_SECS,
+            })),
+        )
+            .into_response());
+    }
+    db.execute(
+        "UPDATE device_authorizations SET last_polled_at=?1 WHERE device_code_hash=?2",
+        params![current_time, hash(device_code.trim())],
+    )?;
+    let (status, state) = if row.approved_at.is_some() {
         (StatusCode::OK, "approved")
     } else {
         (StatusCode::ACCEPTED, "pending")
@@ -643,7 +720,7 @@ async fn poll_device_authorization(
         status,
         Json(DeviceAuthorizationStatus {
             status: state.into(),
-            expires_at,
+            expires_at: row.expires_at,
         }),
     )
         .into_response())
@@ -810,6 +887,7 @@ async fn approve_device_authorization(
 
 #[derive(Deserialize)]
 struct CreateOrg {
+    id: Uuid,
     name: String,
     #[serde(default = "default_acl")]
     acl: serde_json::Value,
@@ -828,10 +906,12 @@ struct OrgResponse {
     name: String,
     node_key_ttl_seconds: i64,
 }
-async fn create_org(
+async fn prepare_org(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<CreateOrg>,
 ) -> Result<(StatusCode, Json<OrgResponse>), ApiError> {
+    service_session(&s, &headers, input.id, "bootstrap.prepare")?;
     let name = input.name.trim();
     if name.is_empty() {
         return Err(ApiError::BadRequest("org name must not be empty".into()));
@@ -840,27 +920,166 @@ async fn create_org(
     let acl: Acl = serde_json::from_value(input.acl.clone())
         .map_err(|error| ApiError::BadRequest(format!("invalid ACL: {error}")))?;
     acl.validate()?;
-    let id = Uuid::new_v4();
-    s.store
-        .0
-        .lock()
-        .unwrap()
-        .execute(
-            "INSERT INTO orgs(id,name,acl_json,created_at,node_key_ttl_seconds) VALUES(?1,?2,?3,?4,?5)",
-            params![id.to_string(), name, input.acl.to_string(), now(), input.node_key_ttl_seconds],
+    let acl_json = input.acl.to_string();
+    let current_time = now();
+    let db = s.store.0.lock().unwrap();
+    db.execute(
+        "DELETE FROM pending_bootstrap_orgs WHERE expires_at<=?1",
+        params![current_time],
+    )?;
+    let active: Option<(String, i64)> = db
+        .query_row(
+            "SELECT name,node_key_ttl_seconds FROM orgs WHERE id=?1",
+            params![input.id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(conflict("org name already exists"))?;
+        .optional()?;
+    if let Some((existing_name, existing_ttl)) = active {
+        if existing_name != name || existing_ttl != input.node_key_ttl_seconds {
+            return Err(ApiError::Conflict(
+                "organisation id already has different bootstrap settings".into(),
+            ));
+        }
+        return Ok((
+            StatusCode::OK,
+            Json(OrgResponse {
+                id: input.id,
+                name: existing_name,
+                node_key_ttl_seconds: existing_ttl,
+            }),
+        ));
+    }
+    let pending: Option<(String, String, i64)> = db
+        .query_row(
+            "SELECT name,acl_json,node_key_ttl_seconds FROM pending_bootstrap_orgs WHERE id=?1",
+            params![input.id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((existing_name, existing_acl, existing_ttl)) = pending {
+        if existing_name != name
+            || existing_acl != acl_json
+            || existing_ttl != input.node_key_ttl_seconds
+        {
+            return Err(ApiError::Conflict(
+                "organisation id already has different bootstrap settings".into(),
+            ));
+        }
+        return Ok((
+            StatusCode::OK,
+            Json(OrgResponse {
+                id: input.id,
+                name: existing_name,
+                node_key_ttl_seconds: existing_ttl,
+            }),
+        ));
+    }
+    db.execute(
+        "INSERT INTO pending_bootstrap_orgs(id,name,acl_json,node_key_ttl_seconds,created_at,expires_at)
+         VALUES(?1,?2,?3,?4,?5,?6)",
+        params![
+            input.id.to_string(),
+            name,
+            acl_json,
+            input.node_key_ttl_seconds,
+            current_time,
+            current_time + BOOTSTRAP_RESERVATION_TTL_SECS,
+        ],
+    )
+    .map_err(conflict("org name already exists"))?;
     Ok((
-        StatusCode::CREATED,
+        StatusCode::ACCEPTED,
         Json(OrgResponse {
-            id,
+            id: input.id,
             name: name.into(),
             node_key_ttl_seconds: input.node_key_ttl_seconds,
         }),
     ))
 }
 
-#[derive(Deserialize, Serialize)]
+async fn commit_org(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<OrgResponse>), ApiError> {
+    let service = service_session(&s, &headers, org_id, "bootstrap.commit")?;
+    let mut db = s.store.0.lock().unwrap();
+    let active: Option<(String, i64)> = db
+        .query_row(
+            "SELECT name,node_key_ttl_seconds FROM orgs WHERE id=?1",
+            params![org_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((name, node_key_ttl_seconds)) = active {
+        return Ok((
+            StatusCode::OK,
+            Json(OrgResponse {
+                id: org_id,
+                name,
+                node_key_ttl_seconds,
+            }),
+        ));
+    }
+    let current_time = now();
+    let pending: Option<(String, String, i64, i64)> = db
+        .query_row(
+            "SELECT name,acl_json,node_key_ttl_seconds,expires_at
+             FROM pending_bootstrap_orgs WHERE id=?1",
+            params![org_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    let (name, acl_json, node_key_ttl_seconds, expires_at) = pending.ok_or(ApiError::NotFound)?;
+    if expires_at <= current_time {
+        db.execute(
+            "DELETE FROM pending_bootstrap_orgs WHERE id=?1",
+            params![org_id.to_string()],
+        )?;
+        return Err(ApiError::Gone);
+    }
+    let tx = db.transaction()?;
+    tx.execute(
+        "INSERT INTO orgs(id,name,acl_json,created_at,node_key_ttl_seconds)
+         VALUES(?1,?2,?3,?4,?5)",
+        params![
+            org_id.to_string(),
+            name,
+            acl_json,
+            current_time,
+            node_key_ttl_seconds,
+        ],
+    )
+    .map_err(conflict("org name already exists"))?;
+    tx.execute(
+        "INSERT INTO audit_events(id,org_id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at)
+         VALUES(?1,?2,?3,?4,?5,'service','bootstrap.completed','organisation',?2,?6,?7)",
+        params![
+            Uuid::new_v4().to_string(),
+            org_id.to_string(),
+            service.user_id,
+            service.name,
+            service.email,
+            serde_json::json!({"source":"operator_channel","result":"success"}).to_string(),
+            current_time,
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM pending_bootstrap_orgs WHERE id=?1",
+        params![org_id.to_string()],
+    )?;
+    tx.commit()?;
+    Ok((
+        StatusCode::CREATED,
+        Json(OrgResponse {
+            id: org_id,
+            name,
+            node_key_ttl_seconds,
+        }),
+    ))
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 struct SecurityPolicy {
     node_key_ttl_seconds: i64,
 }
@@ -2085,22 +2304,67 @@ fn append_audit(
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Session {
+struct AssertionClaims {
     #[serde(rename = "sub")]
     user_id: String,
     org_id: Uuid,
-    role: Role,
+    role: String,
     #[serde(default)]
     name: String,
     #[serde(default)]
     email: String,
+    iss: String,
+    aud: String,
+    iat: i64,
     exp: i64,
+    jti: String,
+    #[serde(default)]
+    action: Option<String>,
 }
+
+struct Session {
+    user_id: String,
+    role: Role,
+    name: String,
+    email: String,
+}
+
 fn console_session(
     state: &AppState,
     headers: &HeaderMap,
     org_id: Uuid,
 ) -> Result<Session, ApiError> {
+    let claims = verified_console_assertion(state, headers, org_id)?;
+    if claims.action.is_some() {
+        return Err(ApiError::Unauthorized);
+    }
+    let role = claims.role.parse().map_err(|_| ApiError::Unauthorized)?;
+    Ok(Session {
+        user_id: claims.user_id,
+        role,
+        name: claims.name,
+        email: claims.email,
+    })
+}
+
+fn service_session(
+    state: &AppState,
+    headers: &HeaderMap,
+    org_id: Uuid,
+    action: &str,
+) -> Result<AssertionClaims, ApiError> {
+    let claims = verified_console_assertion(state, headers, org_id)?;
+    if claims.role != "service" || claims.action.as_deref() != Some(action) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(claims)
+}
+
+fn verified_console_assertion(
+    state: &AppState,
+    headers: &HeaderMap,
+    org_id: Uuid,
+) -> Result<AssertionClaims, ApiError> {
     let token = bearer_value(headers)?;
     let (payload, signature) = token.split_once('.').ok_or(ApiError::Unauthorized)?;
     if signature.contains('.') {
@@ -2114,15 +2378,41 @@ fn console_session(
     mac.update(payload.as_bytes());
     mac.verify_slice(&signature)
         .map_err(|_| ApiError::Unauthorized)?;
-    let claims: Session = serde_json::from_slice(
+    let claims: AssertionClaims = serde_json::from_slice(
         &URL_SAFE_NO_PAD
             .decode(payload)
             .map_err(|_| ApiError::Unauthorized)?,
     )
     .map_err(|_| ApiError::Unauthorized)?;
-    if claims.exp <= now() || claims.org_id != org_id || claims.user_id.trim().is_empty() {
+    let current_time = now();
+    if claims.iss != CONSOLE_ASSERTION_ISSUER
+        || claims.aud != CONSOLE_ASSERTION_AUDIENCE
+        || claims.exp <= current_time
+        || claims.iat > current_time + CONSOLE_ASSERTION_CLOCK_SKEW_SECS
+        || claims.exp <= claims.iat
+        || claims.exp - claims.iat > MAX_CONSOLE_ASSERTION_LIFETIME_SECS
+        || claims.org_id != org_id
+        || claims.user_id.trim().is_empty()
+        || claims.jti.len() < 32
+        || claims.jti.len() > 128
+    {
         return Err(ApiError::Unauthorized);
     }
+    let db = state.store.0.lock().unwrap();
+    db.execute(
+        "DELETE FROM console_assertion_nonces WHERE expires_at<=?1",
+        params![current_time],
+    )?;
+    db.execute(
+        "INSERT INTO console_assertion_nonces(jti_hash,expires_at) VALUES(?1,?2)",
+        params![hash(&claims.jti), claims.exp],
+    )
+    .map_err(|error| match error {
+        rusqlite::Error::SqliteFailure(ref code, _) if code.extended_code == 1555 => {
+            ApiError::Unauthorized
+        }
+        other => ApiError::Database(other),
+    })?;
     Ok(claims)
 }
 
@@ -2319,17 +2609,50 @@ mod tests {
         );
     }
     fn signed_session(org_id: Uuid, user_id: &str, role: Role, exp: i64) -> String {
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(&Session {
-                user_id: user_id.into(),
-                org_id,
-                role,
-                name: user_id.into(),
-                email: format!("{user_id}@example.com"),
-                exp,
-            })
-            .unwrap(),
-        );
+        assertion_template(AssertionClaims {
+            user_id: user_id.into(),
+            org_id,
+            role: role.as_str().into(),
+            name: user_id.into(),
+            email: format!("{user_id}@example.com"),
+            iss: CONSOLE_ASSERTION_ISSUER.into(),
+            aud: CONSOLE_ASSERTION_AUDIENCE.into(),
+            iat: exp - MAX_CONSOLE_ASSERTION_LIFETIME_SECS,
+            exp,
+            jti: String::new(),
+            action: None,
+        })
+    }
+    fn signed_service(org_id: Uuid, action: &str) -> String {
+        let current_time = now();
+        assertion_template(AssertionClaims {
+            user_id: "operator-cli".into(),
+            org_id,
+            role: "service".into(),
+            name: "BlakTail operator".into(),
+            email: String::new(),
+            iss: CONSOLE_ASSERTION_ISSUER.into(),
+            aud: CONSOLE_ASSERTION_AUDIENCE.into(),
+            iat: current_time,
+            exp: current_time + MAX_CONSOLE_ASSERTION_LIFETIME_SECS,
+            jti: String::new(),
+            action: Some(action.into()),
+        })
+    }
+    fn assertion_template(claims: AssertionClaims) -> String {
+        format!(
+            "test:{}",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        )
+    }
+    fn sign_test_assertion(template: &str) -> String {
+        let encoded = template
+            .strip_prefix("test:")
+            .expect("test assertion template");
+        let mut claims: AssertionClaims =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(encoded).unwrap()).unwrap();
+        claims.jti = Uuid::new_v4().to_string();
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
         let mut mac = Hmac::<Sha256>::new_from_slice(TEST_SECRET).unwrap();
         mac.update(payload.as_bytes());
         format!(
@@ -2349,7 +2672,12 @@ mod tests {
             .uri(u)
             .header("content-type", "application/json");
         if let Some(t) = t {
-            q = q.header(AUTHORIZATION, format!("Bearer {t}"))
+            let token = if t.starts_with("test:") {
+                sign_test_assertion(t)
+            } else {
+                t.to_owned()
+            };
+            q = q.header(AUTHORIZATION, format!("Bearer {token}"))
         }
         r.clone()
             .oneshot(q.body(Body::from(b.to_string())).unwrap())
@@ -2358,6 +2686,31 @@ mod tests {
     }
     async fn body<T: serde::de::DeserializeOwned>(r: Response) -> T {
         serde_json::from_slice(&to_bytes(r.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    async fn create_test_org(router: &Router, name: &str) -> OrgResponse {
+        let id = Uuid::new_v4();
+        let service = signed_service(id, "bootstrap.prepare");
+        let response = call(
+            router,
+            Method::POST,
+            "/v1/orgs",
+            serde_json::json!({"id":id,"name":name}),
+            Some(&service),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let service = signed_service(id, "bootstrap.commit");
+        let response = call(
+            router,
+            Method::POST,
+            &format!("/v1/orgs/{id}/bootstrap-commit"),
+            serde_json::json!({}),
+            Some(&service),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        body(response).await
     }
 
     async fn register_test_node(
@@ -2409,17 +2762,7 @@ mod tests {
             DEFAULT_CONSOLE_URL.into(),
             metrics.clone(),
         );
-        let org: OrgResponse = body(
-            call(
-                &router,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"observable-org"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let org = create_test_org(&router, "observable-org").await;
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
         let node = register_test_node(
             &router,
@@ -2518,7 +2861,13 @@ mod tests {
         }
         assert!(audit
             .iter()
+            .filter(|event| event.actor_role != "service")
             .all(|event| event.actor_email == "owner-1@example.com"));
+        assert!(audit.iter().any(|event| {
+            event.action == "bootstrap.completed"
+                && event.actor_role == "service"
+                && event.details["source"] == "operator_channel"
+        }));
         assert!(!serde_json::to_string(&audit).unwrap().contains("btk_"));
 
         let metrics_response = metrics_app(store, metrics)
@@ -2552,17 +2901,7 @@ mod tests {
     async fn friendly_names_are_admin_scoped_audited_and_do_not_change_network_identity() {
         let store = Store::memory().unwrap();
         let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
-        let org: OrgResponse = body(
-            call(
-                &router,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"friendly-name-org"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let org = create_test_org(&router, "friendly-name-org").await;
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
         let admin = signed_session(org.id, "admin-1", Role::Admin, now() + 60);
         let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
@@ -2710,28 +3049,8 @@ mod tests {
 
         let store = Store::memory().unwrap();
         let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
-        let org_a: OrgResponse = body(
-            call(
-                &router,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"ipv6-org-a"}),
-                None,
-            )
-            .await,
-        )
-        .await;
-        let org_b: OrgResponse = body(
-            call(
-                &router,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"ipv6-org-b"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let org_a = create_test_org(&router, "ipv6-org-a").await;
+        let org_b = create_test_org(&router, "ipv6-org-b").await;
         let owner_a = signed_session(org_a.id, "owner-a", Role::Owner, now() + 60);
         let owner_b = signed_session(org_b.id, "owner-b", Role::Owner, now() + 60);
         let node_a = register_test_node(&router, org_a.id, &owner_a, "a", "key-a", &[]).await;
@@ -2809,17 +3128,7 @@ mod tests {
     async fn only_approved_routes_are_distributed_and_exit_nodes_are_opt_in() {
         let store = Store::memory().unwrap();
         let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
-        let org: OrgResponse = body(
-            call(
-                &router,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"routing-org"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let org = create_test_org(&router, "routing-org").await;
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
         let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
         let injection_key: JoinKeyResponse = body(
@@ -3114,17 +3423,7 @@ mod tests {
             vec![],
             "https://console.example.org.au/".into(),
         );
-        let org: OrgResponse = body(
-            call(
-                &r,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"browser-org"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let org = create_test_org(&r, "browser-org").await;
         let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
         let existing_key: JoinKeyResponse = body(
@@ -3185,6 +3484,19 @@ mod tests {
             .status(),
             StatusCode::ACCEPTED
         );
+        let throttled = call(
+            &r,
+            Method::GET,
+            &format!("/v1/device-authorizations/{}", started.device_code),
+            serde_json::Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            throttled.headers().get("retry-after").unwrap(),
+            DEVICE_AUTH_POLL_SECS.to_string().as_str()
+        );
         let preview: DeviceAuthorizationPreview = body(
             call(
                 &r,
@@ -3222,6 +3534,18 @@ mod tests {
         .await;
         assert_eq!(approval.status, "approved");
         assert_eq!(approval.expires_at, started.expires_at);
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE device_authorizations SET last_polled_at=?1 WHERE device_code_hash=?2",
+                params![
+                    now() - DEVICE_AUTH_POLL_SECS as i64,
+                    hash(&started.device_code)
+                ],
+            )
+            .unwrap();
         assert_eq!(
             call(
                 &r,
@@ -3337,17 +3661,7 @@ mod tests {
     async fn expired_browser_enrollment_cannot_be_polled_or_approved() {
         let store = Store::memory().unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
-        let org: OrgResponse = body(
-            call(
-                &r,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"expired-browser-org"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let org = create_test_org(&r, "expired-browser-org").await;
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
         let started: DeviceAuthorizationResponse = body(
             call(
@@ -3408,17 +3722,7 @@ mod tests {
             TEST_RELAY_SECRET,
             vec!["relay.example.org:3478".into()],
         );
-        let o: OrgResponse = body(
-            call(
-                &r,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"org"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let o = create_test_org(&r, "org").await;
         assert_eq!(o.node_key_ttl_seconds, DEFAULT_NODE_KEY_TTL_SECS);
         let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
         let mut ns = vec![];
@@ -3810,23 +4114,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn organisation_bootstrap_requires_scoped_service_assertion_and_rejects_replay() {
+        let store = Store::memory().unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org_id = Uuid::new_v4();
+        let request = serde_json::json!({"id":org_id,"name":"bootstrap-auth"});
+        assert_eq!(
+            call(&r, Method::POST, "/v1/orgs", request.clone(), None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let owner = signed_session(org_id, "owner-1", Role::Owner, now() + 60);
+        assert_eq!(
+            call(&r, Method::POST, "/v1/orgs", request.clone(), Some(&owner),)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let service = signed_service(org_id, "bootstrap.prepare");
+        let raw_service = sign_test_assertion(&service);
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                "/v1/orgs",
+                request.clone(),
+                Some(&raw_service),
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                "/v1/orgs",
+                request.clone(),
+                Some(&raw_service),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&r, Method::POST, "/v1/orgs", request, Some(&service),)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let (active, pending): (i64, i64) = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM orgs),
+                    (SELECT count(*) FROM pending_bootstrap_orgs)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active, pending), (0, 1));
+
+        let commit_path = format!("/v1/orgs/{org_id}/bootstrap-commit");
+        assert_eq!(
+            call(&r, Method::POST, &commit_path, serde_json::json!({}), None,)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let wrong_action = signed_service(org_id, "bootstrap.prepare");
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &commit_path,
+                serde_json::json!({}),
+                Some(&wrong_action),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let commit = signed_service(org_id, "bootstrap.commit");
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &commit_path,
+                serde_json::json!({}),
+                Some(&commit),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        let (active, pending): (i64, i64) = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT count(*) FROM orgs),
+                    (SELECT count(*) FROM pending_bootstrap_orgs)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((active, pending), (1, 0));
+
+        let commit_retry = signed_service(org_id, "bootstrap.commit");
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &commit_path,
+                serde_json::json!({}),
+                Some(&commit_retry),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let completion_events: i64 = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM audit_events
+                 WHERE org_id=?1 AND action='bootstrap.completed'",
+                params![org_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completion_events, 1);
+
+        let expired_id = Uuid::new_v4();
+        let expired_request = serde_json::json!({"id":expired_id,"name":"expired-bootstrap"});
+        let expired_prepare = signed_service(expired_id, "bootstrap.prepare");
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                "/v1/orgs",
+                expired_request,
+                Some(&expired_prepare),
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE pending_bootstrap_orgs SET expires_at=?1 WHERE id=?2",
+                params![now() - 1, expired_id.to_string()],
+            )
+            .unwrap();
+        let expired_commit = signed_service(expired_id, "bootstrap.commit");
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{expired_id}/bootstrap-commit"),
+                serde_json::json!({}),
+                Some(&expired_commit),
+            )
+            .await
+            .status(),
+            StatusCode::GONE
+        );
+    }
+
+    #[tokio::test]
     async fn console_auth_fails_closed_for_missing_forged_and_expired_assertions() {
         let r = app(
             Store::memory().unwrap(),
             "ap-southeast-2".into(),
             TEST_SECRET,
         );
-        let o: OrgResponse = body(
-            call(
-                &r,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"auth-tests"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let o = create_test_org(&r, "auth-tests").await;
         let path = format!("/v1/orgs/{}/join-keys", o.id);
         assert_eq!(
             call(&r, Method::POST, &path, serde_json::json!({}), None)
@@ -3847,7 +4316,39 @@ mod tests {
             .status(),
             StatusCode::UNAUTHORIZED
         );
-        let mut forged = signed_session(o.id, "owner-1", Role::Owner, now() + 60).into_bytes();
+        for (issuer, audience) in [
+            ("not-the-console", CONSOLE_ASSERTION_AUDIENCE),
+            (CONSOLE_ASSERTION_ISSUER, "not-the-coordinator"),
+        ] {
+            let current_time = now();
+            let malformed_claims = assertion_template(AssertionClaims {
+                user_id: "owner-1".into(),
+                org_id: o.id,
+                role: "owner".into(),
+                name: "Owner".into(),
+                email: "owner-1@example.com".into(),
+                iss: issuer.into(),
+                aud: audience.into(),
+                iat: current_time,
+                exp: current_time + MAX_CONSOLE_ASSERTION_LIFETIME_SECS,
+                jti: String::new(),
+                action: None,
+            });
+            assert_eq!(
+                call(
+                    &r,
+                    Method::POST,
+                    &path,
+                    serde_json::json!({}),
+                    Some(&malformed_claims),
+                )
+                .await
+                .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let template = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
+        let mut forged = sign_test_assertion(&template).into_bytes();
         let last = forged.len() - 1;
         forged[last] = if forged[last] == b'A' { b'B' } else { b'A' };
         let forged = String::from_utf8(forged).unwrap();
@@ -3863,50 +4364,202 @@ mod tests {
             .status(),
             StatusCode::UNAUTHORIZED
         );
-    }
-
-    #[tokio::test]
-    async fn member_cannot_mint_keys_or_edit_acl() {
-        let store = Store::memory().unwrap();
-        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
-        let o: OrgResponse = body(
+        let replay_template = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
+        let replay = sign_test_assertion(&replay_template);
+        assert_eq!(
             call(
                 &r,
                 Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"roles"}),
-                None,
-            )
-            .await,
-        )
-        .await;
-        let token = signed_session(o.id, "member-1", Role::Member, now() + 60);
-        for (method, path, value) in [
-            (
-                Method::POST,
-                format!("/v1/orgs/{}/join-keys", o.id),
+                &path,
                 serde_json::json!({}),
+                Some(&replay),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &path,
+                serde_json::json!({}),
+                Some(&replay),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn management_route_permission_matrix_fails_closed() {
+        let r = app(
+            Store::memory().unwrap(),
+            "ap-southeast-2".into(),
+            TEST_SECRET,
+        );
+        let o = create_test_org(&r, "roles").await;
+        let owner = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
+        let admin = signed_session(o.id, "admin-1", Role::Admin, now() + 60);
+        let member = signed_session(o.id, "member-1", Role::Member, now() + 60);
+        let roles = [&owner, &admin, &member];
+
+        for (name, method, path, value, authorised_status) in [
+            (
+                "device authorization preview",
+                Method::GET,
+                format!("/v1/orgs/{}/device-authorizations/ABCDEFGH", o.id),
+                serde_json::Value::Null,
+                StatusCode::NOT_FOUND,
             ),
             (
+                "node list",
+                Method::GET,
+                format!("/v1/orgs/{}/nodes", o.id),
+                serde_json::Value::Null,
+                StatusCode::OK,
+            ),
+            (
+                "ACL read",
+                Method::GET,
+                format!("/v1/orgs/{}/acl", o.id),
+                serde_json::Value::Null,
+                StatusCode::OK,
+            ),
+            (
+                "security policy read",
+                Method::GET,
+                format!("/v1/orgs/{}/security", o.id),
+                serde_json::Value::Null,
+                StatusCode::OK,
+            ),
+            (
+                "audit read",
+                Method::GET,
+                format!("/v1/orgs/{}/audit", o.id),
+                serde_json::Value::Null,
+                StatusCode::OK,
+            ),
+        ] {
+            for token in roles {
+                assert_eq!(
+                    call(&r, method.clone(), &path, value.clone(), Some(token))
+                        .await
+                        .status(),
+                    authorised_status,
+                    "{name} role access"
+                );
+            }
+            for denied in [None, Some("malformed")] {
+                assert_eq!(
+                    call(&r, method.clone(), &path, value.clone(), denied)
+                        .await
+                        .status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{name} authentication boundary"
+                );
+            }
+        }
+
+        let missing_node = Uuid::new_v4();
+        for (name, method, path, value, expected) in [
+            (
+                "join-key mint",
+                Method::POST,
+                format!("/v1/orgs/{}/join-keys", o.id),
+                serde_json::json!({"expires_in_seconds":60}),
+                [
+                    StatusCode::CREATED,
+                    StatusCode::CREATED,
+                    StatusCode::FORBIDDEN,
+                ],
+            ),
+            (
+                "device authorization approval",
+                Method::POST,
+                format!("/v1/orgs/{}/device-authorizations/ABCDEFGH", o.id),
+                serde_json::json!({}),
+                [
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                ],
+            ),
+            (
+                "friendly-name update",
+                Method::PUT,
+                format!("/v1/orgs/{}/nodes/{missing_node}/friendly-name", o.id),
+                serde_json::json!({"friendly_name":"Field laptop"}),
+                [
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::FORBIDDEN,
+                ],
+            ),
+            (
+                "route approval",
+                Method::PUT,
+                format!("/v1/orgs/{}/nodes/{missing_node}/routes", o.id),
+                serde_json::json!({"approved_routes":[]}),
+                [
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::FORBIDDEN,
+                ],
+            ),
+            (
+                "ACL update",
                 Method::PUT,
                 format!("/v1/orgs/{}/acl", o.id),
                 serde_json::json!({"rules":[]}),
+                [
+                    StatusCode::NO_CONTENT,
+                    StatusCode::NO_CONTENT,
+                    StatusCode::FORBIDDEN,
+                ],
             ),
             (
+                "security policy update",
                 Method::PUT,
                 format!("/v1/orgs/{}/security", o.id),
                 serde_json::json!({"node_key_ttl_seconds": MIN_NODE_KEY_TTL_SECS}),
+                [
+                    StatusCode::NO_CONTENT,
+                    StatusCode::NO_CONTENT,
+                    StatusCode::FORBIDDEN,
+                ],
             ),
             (
+                "node revocation",
                 Method::DELETE,
-                format!("/v1/orgs/{}/nodes/{}", o.id, Uuid::new_v4()),
+                format!("/v1/orgs/{}/nodes/{missing_node}", o.id),
                 serde_json::Value::Null,
+                [
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::FORBIDDEN,
+                ],
             ),
         ] {
-            assert_eq!(
-                call(&r, method, &path, value, Some(&token)).await.status(),
-                StatusCode::FORBIDDEN
-            );
+            for (index, token) in roles.into_iter().enumerate() {
+                assert_eq!(
+                    call(&r, method.clone(), &path, value.clone(), Some(token))
+                        .await
+                        .status(),
+                    expected[index],
+                    "{name} role access"
+                );
+            }
+            for denied in [None, Some("malformed")] {
+                assert_eq!(
+                    call(&r, method.clone(), &path, value.clone(), denied)
+                        .await
+                        .status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{name} authentication boundary"
+                );
+            }
         }
     }
 
@@ -3914,17 +4567,7 @@ mod tests {
     async fn deny_rule_removes_matching_node_from_peer_response() {
         let store = Store::memory().unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
-        let o: OrgResponse = body(
-            call(
-                &r,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name":"filtered"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let o = create_test_org(&r, "filtered").await;
         let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
         let mut nodes = vec![];
         for n in 1..=2 {
@@ -3961,17 +4604,7 @@ mod tests {
     async fn console_can_list_and_revoke_nodes() {
         let store = Store::memory().unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
-        let o: OrgResponse = body(
-            call(
-                &r,
-                Method::POST,
-                "/v1/orgs",
-                serde_json::json!({"name": "console-org"}),
-                None,
-            )
-            .await,
-        )
-        .await;
+        let o = create_test_org(&r, "console-org").await;
         let token = signed_session(o.id, "owner-1", Role::Owner, now() + 60);
         let key: JoinKeyResponse = body(
             call(

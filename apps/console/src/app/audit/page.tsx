@@ -1,5 +1,6 @@
 import { ConsoleShell } from "@/components/console-shell";
 import { listAuditEvents } from "@/lib/coord";
+import { listConsoleAuditEvents } from "@/lib/console-audit";
 import { requireConsoleContext } from "@/lib/session";
 
 function actor(event: Awaited<ReturnType<typeof listAuditEvents>>[number]) {
@@ -11,7 +12,13 @@ export default async function AuditPage() {
   let events: Awaited<ReturnType<typeof listAuditEvents>> = [];
   let error: string | null = null;
   try {
-    events = await listAuditEvents(ctx);
+    const [coordinatorEvents, consoleEvents] = await Promise.all([
+      listAuditEvents(ctx),
+      listConsoleAuditEvents(ctx),
+    ]);
+    events = [...coordinatorEvents, ...consoleEvents]
+      .sort((left, right) => right.created_at - left.created_at)
+      .slice(0, 100);
   } catch (err) {
     error = err instanceof Error ? err.message : "Could not load audit events.";
   }

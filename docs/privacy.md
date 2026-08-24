@@ -10,7 +10,9 @@ local process for access, correction, export, and deletion requests.
 
 - The console Postgres database holds account name and email, the Better Auth
   credential record, sessions (which may include IP address and user agent),
-  organisation membership, and role.
+  organisation membership and role, hashed invitation/bootstrap credentials,
+  invitation status/expiry, and actor-attributed console audit events. Raw
+  bootstrap and invitation credentials are shown once and are not stored.
 - Coordinator SQLite holds organisation and node identifiers, device names,
   WireGuard public keys, tailnet addresses, advertised endpoints/routes, ACLs,
   hashed join/node credentials, credential expiry, and actor-attributed audit events.
@@ -44,8 +46,10 @@ security incident.
 Expired browser authorisations are removed by the coordinator, and relay state is
 short-lived in memory. Current coordinator node, join-key, and audit rows otherwise
 have no automatic retention job; revoked and expired records can remain in SQLite.
-Console account/session retention follows Better Auth plus the operator's database
-procedures. Logs and backups follow deployment policy (the included AWS example uses
+Console account, session, invitation, bootstrap-state, rate-limit, and audit
+retention follows Better Auth plus the operator's database procedures. Used,
+expired, and revoked invitation rows are not currently purged automatically. Logs
+and backups follow deployment policy (the included AWS example uses
 30-day CloudWatch log retention).
 
 Operators must choose and publish retention periods, test deletion across live
