@@ -92,13 +92,16 @@ jobs:
           scripts/aws-e2e/bootstrap-owner.sh
           printf 'Owner ready. Sign in at %s with password stored in %s/owner-password.\n' "$public_url" "$WORK_DIR"
 
+      - name: Verify disabled signup and owner portal login
+        run: scripts/aws-e2e/verify-auth.sh
+
       - name: Install agents through SSM
         run: scripts/aws-e2e/ssm-install-agents.sh
 
       - name: Start browser enrollment
         run: scripts/aws-e2e/ssm-start-enrolment.sh
 
-      - name: Wait for manual portal approvals
+      - name: Wait for authenticated portal approvals
         run: |
           echo "Run scripts/aws-e2e/ssm-show-enrolment.sh from an authenticated operator terminal."
           echo "Sign in through public portal and approve both matching device fingerprints."

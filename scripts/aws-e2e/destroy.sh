@@ -212,5 +212,12 @@ if [ -d "$WORK_DIR/evidence" ]; then
   printf 'run_id=%s\nregion=%s\nscoped_residue=0\n' \
     "$RUN_ID" "$AWS_REGION" >"$WORK_DIR/evidence/teardown.txt"
 fi
-rm -f -- "$WORK_DIR/owner-password"
+rm -f -- \
+  "$WORK_DIR/owner-password" \
+  "$WORK_DIR/owner.cookies" \
+  "$WORK_DIR/enroll-ubuntu.url" \
+  "$WORK_DIR/enroll-al2023.url" \
+  "$WORK_DIR/terraform.tfstate" \
+  "$WORK_DIR/terraform.tfstate.backup" \
+  "$WORK_DIR/destroy-context.json"
 printf 'destroy complete; no scoped residue: run_id=%s\n' "$RUN_ID"

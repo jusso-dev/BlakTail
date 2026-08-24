@@ -1,4 +1,63 @@
-# AWS Fargate smoke run — 23–24 August 2026
+# AWS Fargate smoke runs — 23–24 August 2026
+
+## Hardened first-owner rerun — `20260824i35a`
+
+Run `20260824i35a` exercised the supported [#35](https://github.com/jusso-dev/BlakTail/issues/35)
+first-owner boundary at commit `2b61be4a42a1ec130e1ce44fd3e731a337941b9f`.
+Credential-free evidence was sealed at `2026-08-24T05:13:21Z`; guarded teardown
+then destroyed 95 resources and reported zero scoped residue.
+
+```text
+region: ap-southeast-2
+supported_one_shot_bootstrap: passed
+public_signup: HTTP 400 EMAIL_PASSWORD_SIGN_UP_DISABLED
+owner_login: HTTP 200
+authenticated_devices_page: HTTP 200
+private_agent_enrollment: passed
+bidirectional_ipv4_ipv6: passed
+magicdns_overlay_routes_ssh: passed
+teardown: 95 destroyed, scoped_residue=0
+```
+
+The owner password crossed only a temporary encrypted run-bucket object readable by
+the private console task role; the object was deleted after bootstrap. The live
+verifier kept its request body, session response, and cookie jar in mode-`0600`
+temporary files, emitted only status/code assertions, and removed those files on
+exit. Public organisation creation was no longer the bootstrap mechanism.
+
+The authenticated enrollment pages rendered the approval control and WireGuard-key
+fingerprint. The managed Chrome control runtime then failed during bootstrap because
+its bundled client attempted an unavailable `node:process` import, before it could
+control a tab or take a screenshot. To finish the expiring infrastructure proof
+without misrepresenting UI evidence, a one-off private console task approved the two
+protected device codes with fresh issuer-, audience-, expiry-, nonce-, actor-, role-,
+and organisation-bound assertions. The screenshots later in this report therefore
+remain evidence from `20260823t120928z`; none is labelled as current-run evidence.
+
+The immutable image digests were:
+
+```text
+console:     sha256:f3d5b76824a49c4e77fd17d48ef88875054b2c58eabbc4c5bcc9b07ab9afdd6c
+coordinator: sha256:3858af25258df4206cdae4eeb19d9c67bd08642d4a939f099c69cb840b597684
+relay:       sha256:bae97669fba90ad8e113162feb2a7333543ded975ee4f18afee777601fd96911
+TLS bridge:  sha256:3214e863db4bb6c0a547faf290d782e547752f6c7aa3039ae433f1977d00a073
+```
+
+The ARM64 package checksums were:
+
+```text
+RPM: 054b4f9d4a3fc8ca4bd9f25f1158d957ea4261b06f9e309edcd267623ca8a307
+DEB: 700191d9a3033ccf114e72dbebf1bbeb85b17b2f3cd3250bfb7bbaba614f331e
+```
+
+Both agents had no public IP and no inbound SSH. Each direction proved IPv4, IPv6,
+MagicDNS, `blaktail0` route ownership, relay configuration, and SSH to the other
+agent's BlakTail DNS name. After AWS absence verification, the harness removed the
+owner password; an independent audit also found and removed a retained cookie jar,
+enrollment URLs, the empty state, its secret-bearing pre-destroy backup, and the
+destroy context. The destroy script now removes those artifacts automatically.
+
+## Historical browser run — `20260823t120928z`
 
 This is the public, credential-free record for disposable run
 `20260823t120928z`. It proves the browser onboarding and private-node remote-access

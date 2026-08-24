@@ -43,5 +43,4 @@ for agent_name in ubuntu al2023; do
   printf '%s' "$status_output" | grep -q '^active$' || die "active service proof missing for $agent_name"
   printf '%s\n' "$status_output" >"$WORK_DIR/enrolment-$agent_name.ok"
 done
-printf 'manual browser enrollment complete on both agents\n'
-
+printf 'authenticated enrollment complete on both agents\n'

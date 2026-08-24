@@ -106,7 +106,7 @@ ip route get \"\$TARGET_IPV4\" | grep -F 'dev blaktail0' >/dev/null
 ip -6 route get \"\$TARGET_IPV6\" | grep -F 'dev blaktail0' >/dev/null
 ssh -i /var/lib/blaktail-e2e/id_ed25519 -o BatchMode=yes \\
   -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/var/lib/blaktail-e2e/known_hosts \\
-  -o ConnectTimeout=10 \"blaktail-e2e@\$TARGET_DNS\" 'printf ssh=ok; uname -m'
+  -o ConnectTimeout=10 \"blaktail-e2e@\$TARGET_DNS\" 'printf \"ssh=ok\\n\"; uname -m'
 printf '\\nipv4=ok\\nipv6=ok\\nmagicdns=ok\\nrelay_configured=ok\\noverlay_routes=ok\\n'"
   ssm_send_script "$source_id" "Prove BlakTail E2E network from $source_name $RUN_ID" "$remote_script"
   wait_ssm_command "$SSM_COMMAND_ID" "$source_id"

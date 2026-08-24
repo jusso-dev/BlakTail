@@ -128,12 +128,20 @@ and an enrolled node on the actual destination.
 
 ### Verified AWS smoke run
 
-Disposable run `20260823t120928z` deployed the console, coordinator, and relay as
-ARM64 Fargate services in Sydney, then used a real Better Auth owner session to
-browser-approve Ubuntu and Amazon Linux agents on private EC2 instances. Both
-agents passed bidirectional IPv4, IPv6, MagicDNS, overlay-route, and SSH checks over
-`blaktail0`; the Amazon Linux agent also recovered after a stop/start without
-re-enrolment. All live run resources were then destroyed.
+Hardened rerun `20260824i35a` deployed immutable ARM64 console, coordinator, and
+relay images in Sydney. The supported one-shot ceremony created and locked exactly
+one owner; live HTTP proof then rejected public signup with
+`EMAIL_PASSWORD_SIGN_UP_DISABLED`, signed that owner in, and loaded the authenticated
+Devices page. Private Ubuntu and Amazon Linux agents passed bidirectional IPv4,
+IPv6, MagicDNS, overlay-route, and SSH checks over `blaktail0`. Terraform destroyed
+all 95 resources, the residue guard returned zero, and local cookies, enrollment
+URLs, passwords, and Terraform state backups were removed.
+
+The screenshots below are visual evidence from earlier disposable browser run
+`20260823t120928z`, not screenshots from the hardened rerun. Current-run screenshot
+capture failed before browser control began because the managed Chrome runtime could
+not import `node:process`; the run report records that gap instead of relabelling old
+images as new evidence.
 
 ![BlakTail sign-in served by the disposable AWS stack](docs/images/aws-e2e/sign-in.png)
 
@@ -141,9 +149,10 @@ re-enrolment. All live run resources were then destroyed.
 
 ![Sydney coordinator health shown in the BlakTail console](docs/images/aws-e2e/status.png)
 
-See the [redacted run report](docs/e2e/aws-fargate-run.md) and
-[#34](https://github.com/jusso-dev/BlakTail/issues/34). This was a current-commit
-smoke run, not release proof: forced relay traffic, revocation/re-enrolment, all
+See the [redacted run report](docs/e2e/aws-fargate-run.md),
+[#35](https://github.com/jusso-dev/BlakTail/issues/35), and
+[#34](https://github.com/jusso-dev/BlakTail/issues/34). These are current-commit
+smoke proofs, not release proof: forced relay traffic, revocation/re-enrolment, all
 restart cases, and a published agent package remain open acceptance work.
 
 ## Stack (locked for first cut)

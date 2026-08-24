@@ -105,6 +105,11 @@ variables/state, or CloudWatch output. The disposable isolated harness implement
 this as `scripts/aws-e2e/bootstrap-owner.sh`: it uses a short-lived encrypted S3
 object readable only by the console task role, deletes it on exit, keeps the
 bootstrap token inside the task, and writes a credential-free evidence marker.
+`scripts/aws-e2e/verify-auth.sh` then proves that public signup is disabled and
+that the generated owner can reach the authenticated Devices page without writing
+the password, session body, or cookie jar to evidence. Successful teardown removes
+the local password, cookie, enrollment URLs, Terraform state and state backup after
+AWS absence checks pass.
 
 Production additions:
 
