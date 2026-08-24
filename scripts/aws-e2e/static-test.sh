@@ -87,6 +87,10 @@ grep -q 'chown blaktail:blaktail /tmp /app/.next/cache' \
 grep -q 'bootstrap.mjs init' "$SCRIPT_DIR/bootstrap-owner.sh"
 grep -q 'bootstrap.mjs claim' "$SCRIPT_DIR/bootstrap-owner.sh"
 grep -q 'supported_bootstrap:true' "$SCRIPT_DIR/bootstrap-owner.sh"
+grep -q 'bun scripts/s3-get.mjs' "$SCRIPT_DIR/bootstrap-owner.sh"
+if grep -q 'aws s3 cp.*CREDENTIAL_KEY' "$SCRIPT_DIR/bootstrap-owner.sh"; then
+  die "owner task must not depend on the AWS CLI"
+fi
 grep -q 'EMAIL_PASSWORD_SIGN_UP_DISABLED' "$SCRIPT_DIR/verify-auth.sh"
 grep -q 'owner-auth.ok' "$SCRIPT_DIR/verify-auth.sh"
 grep -q 'owner-auth.ok' "$SCRIPT_DIR/collect-evidence.sh"

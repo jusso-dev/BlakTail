@@ -61,7 +61,7 @@ token_file=/tmp/blaktail-bootstrap-token
 password_file=/tmp/blaktail-owner-password
 cleanup() { rm -f -- "$token_file" "$password_file"; }
 trap cleanup EXIT HUP INT TERM
-aws s3 cp "s3://$ARTIFACT_BUCKET/$CREDENTIAL_KEY" "$password_file" --only-show-errors
+bun scripts/s3-get.mjs "$ARTIFACT_BUCKET" "$CREDENTIAL_KEY" "$password_file"
 chmod 600 "$password_file"
 bun scripts/bootstrap.mjs init --token-file "$token_file"
 bun scripts/bootstrap.mjs claim \
@@ -76,12 +76,14 @@ task_overrides=$(jq -cn \
   --rawfile script "$task_script_file" \
   --arg artifact_bucket "$artifact_bucket" \
   --arg credential_key "$credential_key" \
+  --arg aws_region "$AWS_REGION" \
   --arg owner_email "$OWNER_EMAIL" \
   --arg owner_name "$OWNER_NAME" \
   --arg organisation_name "$ORGANISATION_NAME" \
   '{containerOverrides:[{name:"console",command:["sh","-c",$script],environment:[
     {name:"ARTIFACT_BUCKET",value:$artifact_bucket},
     {name:"CREDENTIAL_KEY",value:$credential_key},
+    {name:"AWS_REGION",value:$aws_region},
     {name:"OWNER_EMAIL",value:$owner_email},
     {name:"OWNER_NAME",value:$owner_name},
     {name:"ORGANISATION_NAME",value:$organisation_name}
