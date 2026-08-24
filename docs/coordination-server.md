@@ -9,39 +9,39 @@ TLS and an explicit region are mandatory. The process refuses to start when `BLA
 browser-enrollment link. Use HTTPS for every non-local deployment.
 
 ```sh
-BLAKTAIL_REGION=ap-southeast-2 \
-BLAKTAIL_BIND=0.0.0.0:443 \
-BLAKTAIL_COORD_METRICS_BIND=127.0.0.1:9701 \
-BLAKTAIL_DATABASE=/var/lib/blaktail/coord.sqlite3 \
-BLAKTAIL_CONSOLE_URL=https://console.example.org.au \
-BLAKTAIL_AUTH_HMAC_SECRET=<shared-random-secret-at-least-32-bytes> \
-BLAKTAIL_TLS_CERT=/etc/blaktail/tls/fullchain.pem \
-BLAKTAIL_TLS_KEY=/etc/blaktail/tls/private.key \
-cargo run -p blaktail-coord --release
+# Start from config/blaktail.toml.example, then set operator-owned paths/URLs.
+blaktail-config --config /etc/blaktail/config.toml check-config --service coordinator
+blaktail-coord --config /etc/blaktail/config.toml migrate
+blaktail-coord --config /etc/blaktail/config.toml serve
 ```
 
-The default database is `blaktail-coord.sqlite3`, suitable for a single office box. SQLite WAL mode and foreign keys are enabled. PostgreSQL is not implemented in v1; it can later be added behind the store interface without changing the API. Set `RUST_LOG=info` for startup, registration, and revocation events. Startup and `GET /health` report the configured region.
+The default database is `blaktail-coord.sqlite3`, suitable for a single office
+box. SQLite WAL mode and foreign keys are enabled. PostgreSQL is not implemented
+in v1; it can later be added behind the store interface without changing the API.
+Set `RUST_LOG=info` for startup, registration, and revocation events. Startup logs
+include the configured region; public health responses contain status only.
 
 ## SQLite migrations and rollback
 
 The coordinator records an ordered schema version in SQLite's
-`PRAGMA user_version`. A version-zero database—including databases created before
-the runner existed—is migrated through the ordered schema versions inside one
-transaction per version. Reopening the database is idempotent. A coordinator refuses to open a
-database whose version is newer than the binary supports instead of mutating it.
+`PRAGMA user_version`. `blaktail-coord migrate` advances a version-zero or older
+database through ordered schema versions inside one transaction per version and
+is idempotent. Normal `serve` startup never migrates: it refuses missing, older,
+or newer schema state before opening listeners.
 
 Before upgrading, take a consistent backup while the coordinator is stopped, or use
 SQLite's online backup command:
 
 ```sh
-sqlite3 /var/lib/blaktail/coord.sqlite3 \
-  ".backup '/var/lib/blaktail/coord-before-upgrade.sqlite3'"
+sqlite3 /var/lib/blaktail-coord/coordinator.sqlite3 \
+  ".backup '/var/lib/blaktail-coord/coordinator-before-upgrade.sqlite3'"
 ```
 
-Check the backup off-host, then start the new coordinator and inspect its startup
-log and `/health`. Database downgrade is unsupported; restore the snapshot before
-starting the old binary. Future schema changes must append an ordered migration and
-advance `CURRENT_SCHEMA_VERSION`, not add another unconditional startup mutation.
+Check the backup off-host, run the explicit migration command, then start the new
+coordinator and inspect `/livez`, `/readyz`, and its startup log. Database downgrade
+is unsupported; restore the snapshot before starting the old binary. Future schema
+changes must append an ordered migration and advance `CURRENT_SCHEMA_VERSION`, not
+add an unconditional startup mutation.
 
 ## HTTP API
 
@@ -57,6 +57,8 @@ advance `CURRENT_SCHEMA_VERSION`, not add another unconditional startup mutation
   `Retry-After`
 - `GET|POST /v1/orgs/{org_id}/device-authorizations/{user_code}` — signed-in console preview and approval
 - `GET /v1/orgs/{org_id}/nodes` — any org user session; list devices
+- `PUT /v1/orgs/{org_id}/nodes/{node_id}/friendly-name` — any org user session;
+  set a unique friendly device name
 - `PUT /v1/orgs/{org_id}/nodes/{node_id}/routes` — owner/admin approval of an exact subset of advertised routes
 - `GET /v1/orgs/{org_id}/security` — any org user session; read node-key lifetime policy
 - `PUT /v1/orgs/{org_id}/security` — owner/admin session; set node-key lifetime from 1 to 365 days
@@ -70,11 +72,14 @@ advance `CURRENT_SCHEMA_VERSION`, not add another unconditional startup mutation
 - `DELETE /v1/nodes/{node_id}` — bearer node token; self-revocation
 - `GET /v1/orgs/{org_id}/acl` — any org user session
 - `PUT /v1/orgs/{org_id}/acl` — owner/admin only
-- `GET /health`
+- `GET /livez` — status-only process liveness
+- `GET /readyz` — status-only SQLite readiness
+- `GET /health` — compatibility alias for readiness
 
 Prometheus metrics are served as plain HTTP on the separate
-`BLAKTAIL_COORD_METRICS_BIND` listener. It defaults to `127.0.0.1:9701`; do not
-publish it through the public coordinator TLS listener. See
+`BLAKTAIL_COORD_METRICS_BIND` listener. It defaults to `127.0.0.1:9701`; a
+non-loopback bind needs explicit acknowledgement plus a 32-byte diagnostics bearer
+token. Do not publish it through the public coordinator TLS listener. See
 [observability.md](observability.md) for metric names, Compose scraping, audit
 coverage, and alerts.
 

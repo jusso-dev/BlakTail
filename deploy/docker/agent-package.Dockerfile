@@ -15,7 +15,7 @@ ENV PATH=/root/.cargo/bin:$PATH
 
 WORKDIR /src
 COPY . .
-RUN cargo build --locked --release -p blaktaild \
+RUN cargo build --locked --release -p blaktaild -p blaktail-config \
  && target/release/blaktaild --version
 
 FROM debian:12-slim AS package
@@ -30,6 +30,7 @@ COPY scripts/package-agent.sh scripts/agent-checksums.sh ./scripts/
 COPY packaging/systemd/blaktaild.service ./packaging/systemd/blaktaild.service
 COPY docs/linux-agent.md ./docs/linux-agent.md
 COPY --from=build /src/target/release/blaktaild ./blaktaild
+COPY --from=build /src/target/release/blaktail-config ./blaktail-config
 RUN mkdir /out \
  && BLAKTAIL_TARGET=aarch64-unknown-linux-gnu scripts/package-agent.sh \
       deb ./blaktaild /out \

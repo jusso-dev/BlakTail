@@ -11,6 +11,7 @@ name = "blaktail-relay"
 path = "src/main.rs"
 
 [dependencies]
+blaktail-config = { path = "../blaktail-config" }
 hmac = "0.12"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive", "env"] }

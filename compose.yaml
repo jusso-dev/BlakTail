@@ -16,13 +16,44 @@ services:
       timeout: 3s
       retries: 20
 
+  coord-migrate:
+    build:
+      context: .
+      dockerfile: deploy/docker/coord.Dockerfile
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=0700
+    volumes:
+      - coorddata:/data
+      - ./certs:/certs:ro
+    environment:
+      BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
+      BLAKTAIL_BIND: 0.0.0.0:8443
+      BLAKTAIL_COORD_METRICS_BIND: 0.0.0.0:9701
+      BLAKTAIL_COORD_ALLOW_PUBLIC_METRICS: "true"
+      BLAKTAIL_COORD_DIAGNOSTICS_TOKEN: ${BLAKTAIL_DIAGNOSTICS_TOKEN:?set BLAKTAIL_DIAGNOSTICS_TOKEN in .env}
+      BLAKTAIL_DATABASE: /data/blaktail-coord.sqlite3
+      BLAKTAIL_DATABASE_STORAGE: local
+      BLAKTAIL_TLS_CERT: /certs/coord.crt
+      BLAKTAIL_TLS_KEY: /certs/coord.key
+      BLAKTAIL_AUTH_HMAC_SECRET: ${BLAKTAIL_AUTH_HMAC_SECRET:?set BLAKTAIL_AUTH_HMAC_SECRET in .env}
+      BLAKTAIL_RELAY_AUTH_SECRET: ${BLAKTAIL_RELAY_AUTH_SECRET:?set BLAKTAIL_RELAY_AUTH_SECRET in .env}
+      BLAKTAIL_RELAYS: ${BLAKTAIL_RELAY_ENDPOINT:?set BLAKTAIL_RELAY_ENDPOINT in .env}
+      BLAKTAIL_CONSOLE_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+    command: ["migrate"]
+
   coord:
     build:
       context: .
       dockerfile: deploy/docker/coord.Dockerfile
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:mode=0700
     depends_on:
-      - postgres
+      coord-migrate:
+        condition: service_completed_successfully
     ports:
       - "8443:8443"
       - "127.0.0.1:9701:9701"
@@ -33,7 +64,10 @@ services:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
       BLAKTAIL_BIND: 0.0.0.0:8443
       BLAKTAIL_COORD_METRICS_BIND: 0.0.0.0:9701
+      BLAKTAIL_COORD_ALLOW_PUBLIC_METRICS: "true"
+      BLAKTAIL_COORD_DIAGNOSTICS_TOKEN: ${BLAKTAIL_DIAGNOSTICS_TOKEN:?set BLAKTAIL_DIAGNOSTICS_TOKEN in .env}
       BLAKTAIL_DATABASE: /data/blaktail-coord.sqlite3
+      BLAKTAIL_DATABASE_STORAGE: local
       BLAKTAIL_TLS_CERT: /certs/coord.crt
       BLAKTAIL_TLS_KEY: /certs/coord.key
       BLAKTAIL_AUTH_HMAC_SECRET: ${BLAKTAIL_AUTH_HMAC_SECRET:?set BLAKTAIL_AUTH_HMAC_SECRET in .env}
@@ -46,6 +80,9 @@ services:
       context: .
       dockerfile: deploy/docker/relay.Dockerfile
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:mode=0700
     ports:
       - "3478:3478/udp"
       - "127.0.0.1:9702:9702"
@@ -53,29 +90,62 @@ services:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
       BLAKTAIL_RELAY_AUTH_SECRET: ${BLAKTAIL_RELAY_AUTH_SECRET:?set BLAKTAIL_RELAY_AUTH_SECRET in .env}
       BLAKTAIL_RELAY_METRICS_BIND: 0.0.0.0:9702
+      BLAKTAIL_RELAY_ALLOW_PUBLIC_METRICS: "true"
+      BLAKTAIL_RELAY_DIAGNOSTICS_TOKEN: ${BLAKTAIL_DIAGNOSTICS_TOKEN:?set BLAKTAIL_DIAGNOSTICS_TOKEN in .env}
+
+  console-migrate:
+    build:
+      context: .
+      dockerfile: apps/console/Dockerfile
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=0700
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./certs:/certs:ro
+    environment:
+      BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
+      DATABASE_URL: postgres://blaktail:${POSTGRES_PASSWORD}@postgres:5432/blaktail
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      BETTER_AUTH_TRUSTED_ORIGINS: ${BETTER_AUTH_URL:-http://localhost:3000}
+      COORD_BASE_URL: https://coord:8443
+      BLAKTAIL_AUTH_HMAC_SECRET: ${BLAKTAIL_AUTH_HMAC_SECRET:?set BLAKTAIL_AUTH_HMAC_SECRET in .env}
+      NODE_EXTRA_CA_CERTS: /certs/ca.crt
+    command: ["./node_modules/.bin/drizzle-kit", "migrate", "--config", "drizzle.config.ts"]
 
   console:
     build:
       context: .
       dockerfile: apps/console/Dockerfile
     restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:mode=0700
     depends_on:
-      postgres:
-        condition: service_healthy
+      console-migrate:
+        condition: service_completed_successfully
       coord:
         condition: service_started
     ports:
       - "3000:3000"
     volumes:
       - ./certs:/certs:ro
+      - consolecache:/app/.next/cache
     environment:
+      BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
       DATABASE_URL: postgres://blaktail:${POSTGRES_PASSWORD}@postgres:5432/blaktail
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET in .env}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3000}
+      BETTER_AUTH_TRUSTED_ORIGINS: ${BETTER_AUTH_URL:-http://localhost:3000}
       COORD_BASE_URL: https://coord:8443
-      BLAKTAIL_AUTH_HMAC_SECRET: ${BLAKTAIL_AUTH_HMAC_SECRET}
+      BLAKTAIL_AUTH_HMAC_SECRET: ${BLAKTAIL_AUTH_HMAC_SECRET:?set BLAKTAIL_AUTH_HMAC_SECRET in .env}
       NODE_EXTRA_CA_CERTS: /certs/ca.crt
 
 volumes:
   pgdata:
   coorddata:
+  consolecache:

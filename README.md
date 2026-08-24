@@ -105,8 +105,10 @@ limits are in [docs/privacy.md](docs/privacy.md).
 Until the first release is published, build the agent on its target operating system:
 
 ```sh
-cargo build --locked --release -p blaktaild
+cargo build --locked --release -p blaktaild -p blaktail-config
 sudo install -m 0755 target/release/blaktaild /usr/local/bin/blaktaild
+sudo install -m 0755 target/release/blaktail-config /usr/local/bin/blaktail-config
+blaktail-config check-config --service agent
 ```
 
 Release packaging and the checksum-verifying installer support macOS `.pkg`, Debian
@@ -116,11 +118,21 @@ GitHub release does not exist. See [docs/releases.md](docs/releases.md) and the
 
 ## Deployment
 
-Host it yourself, on one box or scaled out on AWS:
+Host it yourself on one box, or run the isolated AWS proof harness:
 
 - **Single EC2 / any Docker host:** `compose.yaml` quickstart in [docs/deploy-aws.md](docs/deploy-aws.md).
-- **AWS (Fargate + RDS + EFS + ALB/NLB):** Terraform in `deploy/aws`; console autoscales, while coordinator and relay are pinned to one task until SQLite and relay registration state are sharded. Region is pinned to Sydney (`ap-southeast-2`) — the relay refuses anything else.
-- Images: `deploy/docker/*.Dockerfile` and `apps/console/Dockerfile`; push with `scripts/publish-images.sh`.
+- **Disposable AWS E2E:** guarded Terraform in `deploy/aws/e2e` runs ARM64 Fargate
+  console/coordinator/relay tasks plus two private agent hosts, all pinned to Sydney.
+  Images are immutable digest references built by `scripts/aws-e2e/build-images.sh`.
+- **Persistent AWS:** blocked on [#27](https://github.com/jusso-dev/BlakTail/issues/27).
+  The legacy `deploy/aws` coordinator declares its SQLite-on-EFS shape and now
+  fails schema validation instead of presenting that unsafe store as production.
+
+All services share schema-v1 TOML plus deterministic environment overrides.
+`blaktail-config` validates offline, prints only redacted effective config, previews
+restart-required changes, and creates operator-confirmed redacted support bundles.
+Normal service startup validates before listeners; coordinator and console
+migrations are separate gates. See [operator configuration](docs/configuration.md).
 
 The Compose/AWS files are deployment inputs, not evidence of a running production
 service. Verify TLS, health, metrics, storage, backups, privacy contact/retention,
@@ -147,7 +159,7 @@ images as new evidence.
 
 ![Two browser-enrolled private agents active in the BlakTail console](docs/images/aws-e2e/devices.png)
 
-![Sydney coordinator health shown in the BlakTail console](docs/images/aws-e2e/status.png)
+![Historical coordinator status screenshot; current builds expose status only](docs/images/aws-e2e/status.png)
 
 See the [redacted run report](docs/e2e/aws-fargate-run.md),
 [#35](https://github.com/jusso-dev/BlakTail/issues/35), and

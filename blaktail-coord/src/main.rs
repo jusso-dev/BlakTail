@@ -1,95 +1,280 @@
 use axum_server::tls_rustls::RustlsConfig;
+use blaktail_config::{ConfigHandle, LoadedConfig, ReloadPlan, SecretRef, Service};
 use blaktail_coord::{CoordMetrics, Store};
-use clap::Parser;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
-use tracing::info;
+use clap::{Parser, Subcommand};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use tracing::{info, warn};
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-#[derive(Debug, Parser)]
-#[command(about = "Self-hosted BlakTail coordination server")]
-struct Config {
-    #[arg(long, env = "BLAKTAIL_REGION")]
-    region: String,
-    #[arg(long, env = "BLAKTAIL_BIND", default_value = "0.0.0.0:8443")]
-    bind: SocketAddr,
-    /// Host-local Prometheus endpoint unless explicitly exposed by the operator.
-    #[arg(
-        long,
-        env = "BLAKTAIL_COORD_METRICS_BIND",
-        default_value = "127.0.0.1:9701"
-    )]
-    metrics_bind: SocketAddr,
-    #[arg(
-        long,
-        env = "BLAKTAIL_DATABASE",
-        default_value = "blaktail-coord.sqlite3"
-    )]
-    database: PathBuf,
-    #[arg(long, env = "BLAKTAIL_TLS_CERT")]
-    tls_cert: PathBuf,
-    #[arg(long, env = "BLAKTAIL_TLS_KEY")]
-    tls_key: PathBuf,
-    #[arg(long, env = "BLAKTAIL_AUTH_HMAC_SECRET", hide_env_values = true)]
-    auth_hmac_secret: String,
-    /// Dedicated HMAC secret shared only with relay processes.
-    #[arg(long, env = "BLAKTAIL_RELAY_AUTH_SECRET", hide_env_values = true)]
-    relay_auth_secret: Option<String>,
-    /// Comma-separated relay endpoints (host:port UDP) advertised to nodes.
-    #[arg(long, env = "BLAKTAIL_RELAYS", default_value = "")]
-    relays: String,
+#[derive(Clone, Debug, Parser)]
+#[command(about = "Self-hosted BlakTail coordination server", version)]
+struct Cli {
+    /// Versioned TOML configuration. Environment overrides remain deterministic.
+    #[arg(long, global = true, env = "BLAKTAIL_CONFIG")]
+    config: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+    #[arg(long, global = true)]
+    region: Option<String>,
+    #[arg(long, global = true)]
+    bind: Option<String>,
+    #[arg(long, global = true)]
+    metrics_bind: Option<String>,
+    #[arg(long, global = true)]
+    allow_public_metrics: bool,
+    #[arg(long, global = true)]
+    database: Option<PathBuf>,
+    #[arg(long, global = true)]
+    database_storage: Option<String>,
+    #[arg(long, global = true)]
+    allow_unsafe_efs_sqlite: bool,
+    #[arg(long, global = true)]
+    tls_cert: Option<PathBuf>,
+    /// TLS private-key file path. Secret values are never accepted on argv.
+    #[arg(long, global = true)]
+    tls_key: Option<PathBuf>,
+    /// Comma-separated relay endpoints advertised to nodes.
+    #[arg(long, global = true)]
+    relays: Option<String>,
     /// Public console URL printed for browser-based headless enrollment.
-    #[arg(long, env = "BLAKTAIL_CONSOLE_URL")]
-    console_url: String,
+    #[arg(long, global = true)]
+    console_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum Command {
+    /// Serve an already-migrated database. This is the default command.
+    Serve,
+    /// Apply coordinator database migrations without opening network listeners.
+    Migrate,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    let cli = Cli::parse();
+    let loaded = load_effective(&cli)?;
+    let filter = tracing_subscriber::EnvFilter::new(&loaded.config.diagnostics.log_filter);
+    let (filter_layer, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
         .init();
-    let config = Config::parse();
-    let region = config.region.trim();
-    if region.is_empty() {
-        return Err("region must not be empty; choose the Australian hosting region".into());
+    for warning in &loaded.warnings {
+        warn!(%warning, "configuration deprecation");
     }
-    if config.auth_hmac_secret.len() < 32 {
-        return Err("BLAKTAIL_AUTH_HMAC_SECRET must be at least 32 bytes".into());
-    }
-    let console_url = config.console_url.trim_end_matches('/').to_owned();
-    if !(console_url.starts_with("https://") || console_url.starts_with("http://")) {
-        return Err("BLAKTAIL_CONSOLE_URL must be an HTTP(S) URL".into());
-    }
-    let store = Store::open(&config.database)?;
-    let tls = RustlsConfig::from_pem_file(&config.tls_cert, &config.tls_key).await?;
-    let relays: Vec<String> = config
-        .relays
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .collect();
-    let relay_auth_secret = config.relay_auth_secret.unwrap_or_default();
-    if !relays.is_empty() && relay_auth_secret.len() < 32 {
-        return Err(
-            "BLAKTAIL_RELAY_AUTH_SECRET must be at least 32 bytes when relays are configured"
-                .into(),
+
+    if matches!(cli.command, Some(Command::Migrate)) {
+        Store::open(&loaded.config.coordinator.database)?;
+        info!(
+            schema_version = blaktail_coord::CURRENT_SCHEMA_VERSION,
+            "coordinator database migration complete"
         );
+        return Ok(());
     }
+
+    let config_handle = ConfigHandle::new(loaded.config.clone());
+    #[cfg(unix)]
+    {
+        let cli = cli.clone();
+        let config_handle = config_handle.clone();
+        tokio::spawn(async move {
+            let mut signal =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        warn!(%error, "configuration reload signal unavailable");
+                        return;
+                    }
+                };
+            while signal.recv().await.is_some() {
+                let candidate = match load_effective(&cli) {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        warn!(%error, "configuration reload rejected; active configuration unchanged");
+                        continue;
+                    }
+                };
+                match config_handle.plan_for_service(&candidate.config, Service::Coordinator) {
+                    ReloadPlan::NoChange => info!("configuration reload found no changes"),
+                    ReloadPlan::RestartRequired { fields } => {
+                        warn!(
+                            ?fields,
+                            "configuration reload requires restart; active configuration unchanged"
+                        )
+                    }
+                    ReloadPlan::Safe { ref fields } => {
+                        let new_filter = tracing_subscriber::EnvFilter::new(
+                            &candidate.config.diagnostics.log_filter,
+                        );
+                        if let Err(error) = filter_handle.reload(new_filter) {
+                            warn!(%error, "configuration reload rejected; active configuration unchanged");
+                            continue;
+                        }
+                        match config_handle
+                            .commit_safe_for_service(candidate.config, Service::Coordinator)
+                        {
+                            Ok(_) => info!(?fields, "configuration reloaded atomically"),
+                            Err(plan) => warn!(
+                                ?plan,
+                                "configuration changed during reload; restart required"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    let config = loaded.config.coordinator.clone();
+    let schema_version = loaded.config.schema_version;
+    let bind = config.bind.parse::<SocketAddr>()?;
+    let metrics_bind = config.metrics_bind.parse::<SocketAddr>()?;
+    let tls_key = match config
+        .tls_key
+        .as_ref()
+        .expect("validated coordinator TLS key")
+    {
+        SecretRef::File { path, .. } => path,
+        SecretRef::Environment { .. } => {
+            return Err("coordinator TLS key must be a file reference".into())
+        }
+    };
+    let auth_hmac_secret = loaded
+        .secret(
+            config
+                .auth_hmac_secret
+                .as_ref()
+                .expect("validated coordinator auth secret"),
+            "coordinator.auth_hmac_secret",
+        )?
+        .as_bytes()
+        .to_vec();
+    let relay_auth_secret = match config.relay_auth_secret.as_ref() {
+        Some(reference) => loaded
+            .secret(reference, "coordinator.relay_auth_secret")?
+            .as_bytes()
+            .to_vec(),
+        None => Vec::new(),
+    };
+    let diagnostics_token = match config.diagnostics_token.as_ref() {
+        Some(reference) => Some(
+            loaded
+                .secret(reference, "coordinator.diagnostics_token")?
+                .as_bytes()
+                .to_vec(),
+        ),
+        None => None,
+    };
+    drop(loaded);
+
+    let tls = RustlsConfig::from_pem_file(&config.tls_cert, tls_key).await?;
+    let store = Store::open_existing(&config.database)?;
     let metrics = Arc::new(CoordMetrics::default());
-    let metrics_listener = tokio::net::TcpListener::bind(config.metrics_bind).await?;
-    let metrics_router = blaktail_coord::metrics_app(store.clone(), metrics.clone());
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_bind).await?;
+    let metrics_router =
+        blaktail_coord::metrics_app_with_token(store.clone(), metrics.clone(), diagnostics_token);
     let api_router = blaktail_coord::app_with_relays_console_and_metrics(
         store,
-        region.to_owned(),
-        config.auth_hmac_secret.into_bytes(),
-        relay_auth_secret.into_bytes(),
-        relays,
-        console_url,
+        config.region.clone(),
+        auth_hmac_secret,
+        relay_auth_secret,
+        config.relays.clone(),
+        config.console_url.trim_end_matches('/').to_owned(),
         metrics,
     );
-    info!(region, bind = %config.bind, metrics = %config.metrics_bind, "starting BlakTail coordination server");
+    info!(
+        region = config.region,
+        bind = %bind,
+        metrics = %metrics_bind,
+        schema_version,
+        "starting BlakTail coordination server"
+    );
+
+    let api_handle = axum_server::Handle::new();
+    let api_shutdown = api_handle.clone();
+    let (shutdown_tx, mut metrics_shutdown) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        match shutdown_signal().await {
+            Ok(()) => {
+                info!("shutdown signal received; draining coordinator listeners");
+                api_shutdown.graceful_shutdown(Some(Duration::from_secs(10)));
+                let _ = shutdown_tx.send(true);
+            }
+            Err(error) => warn!(%error, "shutdown signal unavailable"),
+        }
+    });
+
     tokio::select! {
-        result = axum_server::bind_rustls(config.bind, tls).serve(api_router.into_make_service()) => result?,
-        result = axum::serve(metrics_listener, metrics_router.into_make_service()) => result?,
+        result = axum_server::bind_rustls(bind, tls)
+            .handle(api_handle)
+            .serve(api_router.into_make_service()) => result?,
+        result = axum::serve(metrics_listener, metrics_router.into_make_service())
+            .with_graceful_shutdown(async move {
+                if !*metrics_shutdown.borrow() {
+                    let _ = metrics_shutdown.changed().await;
+                }
+            }) => result?,
     }
     Ok(())
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
+fn load_effective(cli: &Cli) -> Result<LoadedConfig, blaktail_config::ConfigError> {
+    let mut loaded = LoadedConfig::load(cli.config.as_deref(), Service::Coordinator)?;
+    let config = &mut loaded.config.coordinator;
+    if let Some(value) = &cli.region {
+        config.region = value.clone();
+    }
+    if let Some(value) = &cli.bind {
+        config.bind = value.clone();
+    }
+    if let Some(value) = &cli.metrics_bind {
+        config.metrics_bind = value.clone();
+    }
+    if cli.allow_public_metrics {
+        config.allow_public_metrics = true;
+    }
+    if let Some(value) = &cli.database {
+        config.database = value.clone();
+    }
+    if let Some(value) = &cli.database_storage {
+        config.database_storage = value.clone();
+    }
+    if cli.allow_unsafe_efs_sqlite {
+        config.allow_unsafe_efs_sqlite = true;
+    }
+    if let Some(value) = &cli.tls_cert {
+        config.tls_cert = value.clone();
+    }
+    if let Some(value) = &cli.tls_key {
+        config.tls_key = Some(SecretRef::file(value));
+    }
+    if let Some(value) = &cli.relays {
+        config.relays = value
+            .split(',')
+            .map(str::trim)
+            .filter(|relay| !relay.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    if let Some(value) = &cli.console_url {
+        config.console_url = value.clone();
+    }
+    loaded.validate(Service::Coordinator)?;
+    Ok(loaded)
 }

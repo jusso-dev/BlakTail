@@ -14,14 +14,17 @@ not force IPv6 routes onto older agents.
 Upgrade in this order:
 
 1. Back up Postgres, coordinator SQLite, configuration, and TLS material.
-2. Upgrade one coordinator and its relay. Check `/health`, both metrics listeners,
+2. Run `blaktail-config check-config` and `dump-config --redacted`. Preview the
+   reload plan; stop if any undocumented field or deprecation appears.
+3. Run `blaktail-coord migrate` as a separate stopped-service gate, then upgrade
+   one coordinator and its relay. Check `/livez`, `/readyz`, authenticated metrics,
    and peer polling before continuing.
-3. Upgrade one canary agent. Confirm IPv4, IPv6, MagicDNS, direct/relay paths, and
+4. Upgrade one canary agent. Confirm IPv4, IPv6, MagicDNS, direct/relay paths, and
    persisted enrollment after a service restart.
-4. Upgrade remaining agents in small batches. End any advertised skew window within
+5. Upgrade remaining agents in small batches. End any advertised skew window within
    30 days.
-5. Upgrade the console and run its Drizzle migrations when the release notes require
-   them.
+6. Run console Drizzle migrations as a separate stopped-service gate, then upgrade
+   the console tasks.
 
 The Debian and RPM packages do not restart or enable `blaktaild` automatically:
 
@@ -35,8 +38,9 @@ On macOS, install the pinned package, then restart the existing LaunchDaemon and
 check status. Enrollment state remains under `/var/lib/blaktail` and is not part of
 the package.
 
-Coordinator SQLite migrations run in one transaction and advance
-`PRAGMA user_version`. A coordinator refuses a database created by a newer binary.
+Coordinator SQLite migrations run only through `blaktail-coord migrate`, use one
+transaction per schema step, and advance `PRAGMA user_version`. Normal `serve`
+startup never migrates and refuses missing, older, or newer schema state.
 Database downgrade is unsupported: restore the pre-upgrade snapshot with the old
 binary. Agent rollback is supported only when that release's notes confirm its state
 format is compatible.

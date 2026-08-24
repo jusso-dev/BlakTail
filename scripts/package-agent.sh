@@ -30,6 +30,10 @@ output_dir=${3:-"$repo_root/dist"}
 [ -f "$binary" ] || die "binary not found: $binary"
 [ -x "$binary" ] || die "binary is not executable: $binary"
 binary=$(CDPATH='' cd -- "$(dirname -- "$binary")" && pwd)/$(basename -- "$binary")
+config_binary=${BLAKTAIL_CONFIG_BINARY:-"$(dirname -- "$binary")/blaktail-config"}
+[ -f "$config_binary" ] || die "config binary not found: $config_binary"
+[ -x "$config_binary" ] || die "config binary is not executable: $config_binary"
+config_binary=$(CDPATH='' cd -- "$(dirname -- "$config_binary")" && pwd)/$(basename -- "$config_binary")
 mkdir -p "$output_dir"
 output_dir=$(CDPATH='' cd -- "$output_dir" && pwd)
 
@@ -89,6 +93,7 @@ package_pkg() {
   root="$work/root"
   install -d "$root/usr/local/bin" "$root/Library/LaunchDaemons"
   install -m 0755 "$binary" "$root/usr/local/bin/blaktaild"
+  install -m 0755 "$config_binary" "$root/usr/local/bin/blaktail-config"
   install -m 0644 "$repo_root/packaging/macos/com.blaktail.agent.plist" \
     "$root/Library/LaunchDaemons/com.blaktail.agent.plist"
   if command -v xattr >/dev/null 2>&1; then
@@ -112,6 +117,7 @@ package_deb() {
   install -d "$root/DEBIAN" "$root/usr/local/bin" \
     "$root/usr/lib/systemd/system" "$root/usr/share/doc/blaktaild"
   install -m 0755 "$binary" "$root/usr/local/bin/blaktaild"
+  install -m 0755 "$config_binary" "$root/usr/local/bin/blaktail-config"
   install -m 0644 "$repo_root/packaging/systemd/blaktaild.service" \
     "$root/usr/lib/systemd/system/blaktaild.service"
   install -m 0644 "$repo_root/docs/linux-agent.md" \
@@ -144,6 +150,7 @@ package_rpm() {
   top="$work/rpmbuild"
   install -d "$top/BUILD" "$top/BUILDROOT" "$top/RPMS" "$top/SOURCES" "$top/SPECS" "$top/SRPMS"
   install -m 0755 "$binary" "$top/SOURCES/blaktaild"
+  install -m 0755 "$config_binary" "$top/SOURCES/blaktail-config"
   install -m 0644 "$repo_root/packaging/systemd/blaktaild.service" \
     "$top/SOURCES/blaktaild.service"
   install -m 0644 "$repo_root/docs/linux-agent.md" "$top/SOURCES/README.md"
@@ -163,6 +170,7 @@ Requires: procps-ng
 Source0: blaktaild
 Source1: blaktaild.service
 Source2: README.md
+Source3: blaktail-config
 
 %description
 BlakTail joins Linux nodes to an organisation-controlled WireGuard tailnet.
@@ -173,6 +181,7 @@ BlakTail joins Linux nodes to an organisation-controlled WireGuard tailnet.
 
 %install
 install -D -m 0755 %{SOURCE0} %{buildroot}/usr/local/bin/blaktaild
+install -D -m 0755 %{SOURCE3} %{buildroot}/usr/local/bin/blaktail-config
 install -D -m 0644 %{SOURCE1} %{buildroot}/usr/lib/systemd/system/blaktaild.service
 install -D -m 0644 %{SOURCE2} %{buildroot}/usr/share/doc/blaktaild/README.md
 
@@ -184,6 +193,7 @@ install -D -m 0644 %{SOURCE2} %{buildroot}/usr/share/doc/blaktaild/README.md
 
 %files
 /usr/local/bin/blaktaild
+/usr/local/bin/blaktail-config
 /usr/lib/systemd/system/blaktaild.service
 /usr/share/doc/blaktaild/README.md
 

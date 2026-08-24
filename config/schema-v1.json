@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/jusso-dev/BlakTail/config/schema-v1.json",
+  "title": "BlakTail operator configuration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "deployment": { "$ref": "#/$defs/deployment" },
+    "diagnostics": { "$ref": "#/$defs/diagnostics" },
+    "coordinator": { "$ref": "#/$defs/coordinator" },
+    "relay": { "$ref": "#/$defs/relay" },
+    "agent": { "$ref": "#/$defs/agent" },
+    "console": { "$ref": "#/$defs/console" }
+  },
+  "$defs": {
+    "secretRef": {
+      "type": "string",
+      "pattern": "^file:/.+",
+      "description": "Secret file reference. Literal secret values are forbidden in configuration files."
+    },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": {
+          "enum": ["production", "development", "e2e"],
+          "default": "production"
+        }
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "log_filter": { "type": "string", "minLength": 1, "default": "info" },
+        "support_log_lines": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 200
+        }
+      }
+    },
+    "coordinator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "region": { "type": "string" },
+        "bind": { "type": "string", "default": "0.0.0.0:8443" },
+        "metrics_bind": { "type": "string", "default": "127.0.0.1:9701" },
+        "allow_public_metrics": { "type": "boolean", "default": false },
+        "diagnostics_token": { "$ref": "#/$defs/secretRef" },
+        "database": { "type": "string", "default": "blaktail-coord.sqlite3" },
+        "database_storage": { "enum": ["local", "efs"], "default": "local" },
+        "allow_unsafe_efs_sqlite": { "type": "boolean", "default": false },
+        "tls_mode": { "const": "files", "default": "files" },
+        "tls_cert": { "type": "string", "pattern": "^/" },
+        "tls_key": { "$ref": "#/$defs/secretRef" },
+        "auth_hmac_secret": { "$ref": "#/$defs/secretRef" },
+        "relay_auth_secret": { "$ref": "#/$defs/secretRef" },
+        "relays": { "type": "array", "items": { "type": "string" }, "default": [] },
+        "console_url": { "type": "string", "format": "uri" }
+      }
+    },
+    "relay": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "region": { "type": "string" },
+        "bind": { "type": "string", "default": "0.0.0.0:3478" },
+        "metrics_bind": { "type": "string", "default": "127.0.0.1:9702" },
+        "allow_public_metrics": { "type": "boolean", "default": false },
+        "diagnostics_token": { "$ref": "#/$defs/secretRef" },
+        "auth_secret": { "$ref": "#/$defs/secretRef" },
+        "idle_seconds": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 86400,
+          "default": 120
+        },
+        "rate_per_second": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000,
+          "default": 100
+        },
+        "rate_burst": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000,
+          "default": 200
+        }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state_dir": { "type": "string", "pattern": "^/", "default": "/var/lib/blaktail" },
+        "coordinator_url": { "type": "string", "format": "uri" },
+        "interface": { "type": "string", "minLength": 1, "maxLength": 15, "default": "blaktail0" },
+        "poll_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600,
+          "default": 30
+        },
+        "advertised_routes": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        }
+      }
+    },
+    "console": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "region": { "type": "string" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 3000 },
+        "database_url": { "$ref": "#/$defs/secretRef" },
+        "base_url": { "type": "string", "format": "uri" },
+        "trusted_origins": {
+          "type": "array",
+          "items": { "type": "string", "format": "uri" },
+          "default": []
+        },
+        "coordinator_url": { "type": "string", "format": "uri" },
+        "coordinator_ca_file": { "type": "string", "pattern": "^/" },
+        "auth_secret": { "$ref": "#/$defs/secretRef" },
+        "coordinator_auth_secret": { "$ref": "#/$defs/secretRef" }
+      }
+    }
+  }
+}

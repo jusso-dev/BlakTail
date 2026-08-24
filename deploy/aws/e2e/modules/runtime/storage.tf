@@ -18,6 +18,11 @@ resource "random_password" "relay_auth" {
   special = false
 }
 
+resource "random_password" "diagnostics" {
+  length  = 48
+  special = false
+}
+
 resource "aws_db_subnet_group" "this" {
   name       = var.name_prefix
   subnet_ids = aws_subnet.tasks[*].id
@@ -159,5 +164,6 @@ resource "aws_secretsmanager_secret_version" "control_plane" {
   secret_string = jsonencode({
     BLAKTAIL_AUTH_HMAC_SECRET  = random_password.auth_hmac.result
     BLAKTAIL_RELAY_AUTH_SECRET = random_password.relay_auth.result
+    BLAKTAIL_DIAGNOSTICS_TOKEN = random_password.diagnostics.result
   })
 }

@@ -43,16 +43,25 @@ resource "aws_ecs_task_definition" "console" {
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_console_task.arn
 
+  volume {
+    name = "console-cache"
+  }
+
+  volume {
+    name = "console-tmp"
+  }
+
   runtime_platform {
     operating_system_family = "LINUX"
     cpu_architecture        = "ARM64"
   }
 
   container_definitions = jsonencode([{
-    name      = "console"
-    image     = var.console_image
-    essential = true
-    command   = ["npx", "next", "start", "-p", "3000"]
+    name                   = "console"
+    image                  = var.console_image
+    essential              = true
+    command                = ["./node_modules/.bin/next", "start", "-p", "3000"]
+    readonlyRootFilesystem = true
     portMappings = [{
       name          = "console-http"
       containerPort = 3000
@@ -60,6 +69,7 @@ resource "aws_ecs_task_definition" "console" {
       protocol      = "tcp"
     }]
     environment = [
+      { name = "BLAKTAIL_REGION", value = var.region },
       { name = "BETTER_AUTH_URL", value = local.public_url },
       { name = "BETTER_AUTH_TRUSTED_ORIGINS", value = local.public_url },
       { name = "COORD_BASE_URL", value = local.public_url },
@@ -68,6 +78,10 @@ resource "aws_ecs_task_definition" "console" {
       { name = "DATABASE_URL", valueFrom = "${aws_secretsmanager_secret.console.arn}:DATABASE_URL::" },
       { name = "BETTER_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.console.arn}:BETTER_AUTH_SECRET::" },
       { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.console.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
+    ]
+    mountPoints = [
+      { sourceVolume = "console-cache", containerPath = "/app/.next/cache", readOnly = false },
+      { sourceVolume = "console-tmp", containerPath = "/tmp", readOnly = false },
     ]
     logConfiguration = {
       logDriver = "awslogs"
@@ -147,10 +161,11 @@ resource "aws_ecs_task_definition" "coord" {
 
   container_definitions = jsonencode([
     {
-      name       = "certgen"
-      image      = var.coord_proxy_image
-      essential  = false
-      entryPoint = ["/bin/sh", "-c"]
+      name                   = "certgen"
+      image                  = var.coord_proxy_image
+      essential              = false
+      readonlyRootFilesystem = true
+      entryPoint             = ["/bin/sh", "-c"]
       command = [
         "umask 077; openssl req -x509 -newkey rsa:2048 -nodes -keyout /tls/tls.key -out /tls/tls.crt -days 2 -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 >/dev/null 2>&1; chown 10001:10001 /tls/tls.crt /tls/tls.key; chmod 0444 /tls/tls.crt; chmod 0400 /tls/tls.key"
       ]
@@ -168,16 +183,21 @@ resource "aws_ecs_task_definition" "coord" {
       }
     },
     {
-      name       = "coord"
-      image      = var.coord_image
-      essential  = true
-      entryPoint = ["/usr/local/bin/blaktail-coord"]
-      dependsOn  = [{ containerName = "certgen", condition = "SUCCESS" }]
+      name                   = "coord"
+      image                  = var.coord_image
+      essential              = true
+      entryPoint             = ["/usr/local/bin/blaktail-coord"]
+      readonlyRootFilesystem = true
+      dependsOn              = [{ containerName = "certgen", condition = "SUCCESS" }]
       environment = [
+        { name = "BLAKTAIL_DEPLOYMENT_PROFILE", value = "e2e" },
         { name = "BLAKTAIL_REGION", value = var.region },
         { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
         { name = "BLAKTAIL_COORD_METRICS_BIND", value = "0.0.0.0:9701" },
+        { name = "BLAKTAIL_COORD_ALLOW_PUBLIC_METRICS", value = "true" },
         { name = "BLAKTAIL_DATABASE", value = "/data/blaktail-coord.sqlite3" },
+        { name = "BLAKTAIL_DATABASE_STORAGE", value = "efs" },
+        { name = "BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE", value = "true" },
         { name = "BLAKTAIL_RELAYS", value = local.relay_endpoint },
         { name = "BLAKTAIL_CONSOLE_URL", value = local.public_url },
         { name = "BLAKTAIL_TLS_CERT", value = "/tls/tls.crt" },
@@ -186,6 +206,7 @@ resource "aws_ecs_task_definition" "coord" {
       secrets = [
         { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
         { name = "BLAKTAIL_RELAY_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_RELAY_AUTH_SECRET::" },
+        { name = "BLAKTAIL_COORD_DIAGNOSTICS_TOKEN", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_DIAGNOSTICS_TOKEN::" },
       ]
       mountPoints = [
         { sourceVolume = "coord-data", containerPath = "/data", readOnly = false },
@@ -231,6 +252,108 @@ resource "aws_ecs_task_definition" "coord" {
   tags = var.tags
 
   depends_on = [aws_secretsmanager_secret_version.control_plane]
+}
+
+resource "aws_ecs_task_definition" "coord_migration" {
+  family                   = "${var.name_prefix}-coord-migration"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = 256
+  memory                   = 512
+  execution_role_arn       = aws_iam_role.ecs_execution.arn
+  task_role_arn            = aws_iam_role.ecs_task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  volume {
+    name = "coord-data"
+    efs_volume_configuration {
+      file_system_id     = aws_efs_file_system.coord.id
+      root_directory     = "/"
+      transit_encryption = "ENABLED"
+      authorization_config {
+        access_point_id = aws_efs_access_point.coord.id
+        iam             = "DISABLED"
+      }
+    }
+  }
+
+  volume {
+    name = "coord-tls"
+  }
+
+  container_definitions = jsonencode([
+    {
+      name                   = "certgen"
+      image                  = var.coord_proxy_image
+      essential              = false
+      readonlyRootFilesystem = true
+      entryPoint             = ["/bin/sh", "-c"]
+      command = [
+        "umask 077; openssl req -x509 -newkey rsa:2048 -nodes -keyout /tls/tls.key -out /tls/tls.crt -days 2 -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 >/dev/null 2>&1; chown 10001:10001 /tls/tls.crt /tls/tls.key; chmod 0444 /tls/tls.crt; chmod 0400 /tls/tls.key"
+      ]
+      mountPoints = [{
+        sourceVolume  = "coord-tls"
+        containerPath = "/tls"
+        readOnly      = false
+      }]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = merge(local.log_options, {
+          awslogs-group         = aws_cloudwatch_log_group.service["coord"].name
+          awslogs-stream-prefix = "migration-certgen"
+        })
+      }
+    },
+    {
+      name                   = "coord-migration"
+      image                  = var.coord_image
+      essential              = true
+      readonlyRootFilesystem = true
+      entryPoint             = ["/bin/sh", "-c"]
+      command = [
+        "/usr/local/bin/blaktail-config dump-config --service coordinator --redacted && exec /usr/local/bin/blaktail-coord migrate"
+      ]
+      dependsOn = [{ containerName = "certgen", condition = "SUCCESS" }]
+      environment = [
+        { name = "BLAKTAIL_DEPLOYMENT_PROFILE", value = "e2e" },
+        { name = "BLAKTAIL_REGION", value = var.region },
+        { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
+        { name = "BLAKTAIL_COORD_METRICS_BIND", value = "0.0.0.0:9701" },
+        { name = "BLAKTAIL_COORD_ALLOW_PUBLIC_METRICS", value = "true" },
+        { name = "BLAKTAIL_DATABASE", value = "/data/blaktail-coord.sqlite3" },
+        { name = "BLAKTAIL_DATABASE_STORAGE", value = "efs" },
+        { name = "BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE", value = "true" },
+        { name = "BLAKTAIL_RELAYS", value = local.relay_endpoint },
+        { name = "BLAKTAIL_CONSOLE_URL", value = local.public_url },
+        { name = "BLAKTAIL_TLS_CERT", value = "/tls/tls.crt" },
+        { name = "BLAKTAIL_TLS_KEY", value = "/tls/tls.key" },
+      ]
+      secrets = [
+        { name = "BLAKTAIL_AUTH_HMAC_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_AUTH_HMAC_SECRET::" },
+        { name = "BLAKTAIL_RELAY_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_RELAY_AUTH_SECRET::" },
+        { name = "BLAKTAIL_COORD_DIAGNOSTICS_TOKEN", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_DIAGNOSTICS_TOKEN::" },
+      ]
+      mountPoints = [
+        { sourceVolume = "coord-data", containerPath = "/data", readOnly = false },
+        { sourceVolume = "coord-tls", containerPath = "/tls", readOnly = true },
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = merge(local.log_options, {
+          awslogs-group         = aws_cloudwatch_log_group.service["coord"].name
+          awslogs-stream-prefix = "migration"
+        })
+      }
+    },
+  ])
+
+  tags = var.tags
+
+  depends_on = [aws_secretsmanager_secret_version.control_plane, aws_efs_mount_target.coord]
 }
 
 resource "aws_ecs_service" "coord" {
@@ -279,16 +402,19 @@ resource "aws_ecs_task_definition" "relay" {
   }
 
   container_definitions = jsonencode([{
-    name      = "relay"
-    image     = var.relay_image
-    essential = true
+    name                   = "relay"
+    image                  = var.relay_image
+    essential              = true
+    readonlyRootFilesystem = true
     environment = [
       { name = "BLAKTAIL_REGION", value = var.region },
       { name = "BLAKTAIL_RELAY_BIND", value = "0.0.0.0:3478" },
       { name = "BLAKTAIL_RELAY_METRICS_BIND", value = "0.0.0.0:9702" },
+      { name = "BLAKTAIL_RELAY_ALLOW_PUBLIC_METRICS", value = "true" },
     ]
     secrets = [
       { name = "BLAKTAIL_RELAY_AUTH_SECRET", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_RELAY_AUTH_SECRET::" },
+      { name = "BLAKTAIL_RELAY_DIAGNOSTICS_TOKEN", valueFrom = "${aws_secretsmanager_secret.control_plane.arn}:BLAKTAIL_DIAGNOSTICS_TOKEN::" },
     ]
     portMappings = [
       { name = "relay-udp", containerPort = 3478, hostPort = 3478, protocol = "udp" },

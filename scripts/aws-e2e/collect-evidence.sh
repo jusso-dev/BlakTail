@@ -15,6 +15,7 @@ validate_image_tfvars
 
 for required_file in \
   "$WORK_DIR/migration.ok" \
+  "$WORK_DIR/config-validation.log" \
   "$WORK_DIR/owner-bootstrap.ok" \
   "$WORK_DIR/owner-auth.ok" \
   "$WORK_DIR/agent-install.ok" \
@@ -87,6 +88,7 @@ cp "$IMAGES_TFVARS" "$evidence_dir/image-digests.json"
 cp "$PACKAGE_DIR/SHA256SUMS" "$evidence_dir/agent-package-SHA256SUMS"
 cp "$WORK_DIR/owner-bootstrap.ok" "$evidence_dir/owner-bootstrap.json"
 cp "$WORK_DIR/owner-auth.ok" "$evidence_dir/owner-auth.json"
+cp "$WORK_DIR/config-validation.log" "$evidence_dir/config-validation.log"
 cp "$WORK_DIR/enrolment-ubuntu.ok" "$evidence_dir/enrolment-ubuntu.txt"
 cp "$WORK_DIR/enrolment-al2023.ok" "$evidence_dir/enrolment-al2023.txt"
 cp "$WORK_DIR/network-proof-ubuntu.ok" "$evidence_dir/network-proof-ubuntu.txt"
@@ -108,6 +110,7 @@ jq -n \
     coordinator_http_status: $coordinator_http_status,
     assertions: ["supported one-shot first-owner bootstrap", "public signup disabled",
       "authenticated owner portal login", "authenticated device enrollment",
+      "schema-v1 config validated before migrations", "redacted effective config stored",
       "no public agent IP", "no inbound SSH",
       "immutable ARM64 images", "bidirectional IPv4", "bidirectional IPv6",
       "MagicDNS", "relay endpoint configured", "overlay routes", "SSH over BlakTail"]}' >"$evidence_dir/manifest.json"

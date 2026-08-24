@@ -29,13 +29,10 @@ export default async function StatusPage() {
               <p>
                 <strong>Status:</strong> {health.status}
               </p>
-              <p>
-                <strong>Region:</strong>{" "}
-                <span className="mono">{health.region}</span>
-              </p>
               <p className="muted">
-                Region must be set on the coordinator host. Empty region values
-                are refused at startup.
+                Public readiness returns only availability. Region and component
+                diagnostics stay in the protected operator configuration and
+                support bundle.
               </p>
             </>
           ) : null}

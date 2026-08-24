@@ -1,39 +1,36 @@
 [Unit]
-Description=BlakTail WireGuard node agent
+Description=BlakTail UDP relay
 Documentation=https://github.com/jusso-dev/BlakTail/blob/main/docs/configuration.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=-/etc/blaktail/agent.env
-ExecStartPre=/usr/local/bin/blaktail-config check-config --service agent
-ExecStart=/usr/local/bin/blaktaild run
+DynamicUser=true
+UMask=0077
+EnvironmentFile=-/etc/blaktail/relay.env
+ExecStartPre=/usr/local/bin/blaktail-config check-config --service relay
+ExecStart=/usr/local/bin/blaktail-relay
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
-User=root
-Group=root
-UMask=0077
-StateDirectory=blaktail
-StateDirectoryMode=0700
-RuntimeDirectory=blaktail
+RuntimeDirectory=blaktail-relay
 RuntimeDirectoryMode=0700
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
 ProtectKernelLogs=true
 ProtectClock=true
 PrivateTmp=true
-PrivateDevices=false
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+PrivateDevices=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 LockPersonality=true
+MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
-ReadWritePaths=/var/lib/blaktail
 LimitNOFILE=65536
 
 [Install]

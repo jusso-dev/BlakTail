@@ -4,10 +4,12 @@
 
 No agent release is published yet. Build from source, or after a tagged release use
 the checksum-verifying `.deb`/`.rpm` flow in [releases.md](releases.md). Packages
-install the binary and systemd unit but do not enrol or enable the service.
+install `blaktaild`, the shared `blaktail-config` operator CLI, and the systemd
+unit, but do not enrol or enable the service.
 
 ```sh
 sudo install -d -m 0700 /var/lib/blaktail
+blaktail-config check-config --service agent
 sudo blaktaild up --coord https://coord.example.org \
   --endpoint 203.0.113.10:51820
 sudo blaktaild status
@@ -122,5 +124,9 @@ printf '%s' "$BLAKTAIL_JOIN_KEY" | sudo blaktaild reauth
 For systemd, first complete enrollment with `--exit-after-join`, then install
 `packaging/systemd/blaktaild.service` and run
 `sudo systemctl enable --now blaktaild`. The unit resumes persisted state with
-`blaktaild run`; it never puts a join key in argv or an environment file. See the
+`blaktaild run`, validates config in `ExecStartPre`, and keeps capabilities limited
+to `CAP_NET_ADMIN` and `CAP_NET_BIND_SERVICE`. It never puts a join key in argv or
+an environment file. Optional file configuration is selected by setting
+`BLAKTAIL_CONFIG=/etc/blaktail/config.toml` in `/etc/blaktail/agent.env`; see
+[configuration.md](configuration.md). See the
 [upgrade/version-skew policy](upgrades.md) before replacing a running agent.

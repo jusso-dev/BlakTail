@@ -1,15 +1,16 @@
 # Deploying BlakTail to AWS
 
-Two supported paths:
+Deployment paths:
 
 | Path | Shape | Scales | Best for |
 | --- | --- | --- | --- |
 | **Single host (EC2)** | `compose.yaml` + Docker on one box | Vertical only | Pilots, self-hosted demos |
-| **AWS ECS (this directory)** | Fargate services + RDS + EFS + ALB/NLB | Horizontal | Production |
+| **Isolated AWS E2E (`deploy/aws/e2e`)** | Fargate services + RDS + EFS + API Gateway/ALB/NLB + two private agents | Run-scoped | Disposable proof |
+| **Legacy AWS root (`deploy/aws`)** | Fargate services + RDS + EFS + ALB/NLB | Blocked by #27 | Not supported persistently |
 
 Everything is pinned to Sydney (`ap-southeast-2`); the relay binary refuses other regions by design (onshore data rule).
 
-## Architecture (ECS path)
+## Legacy root architecture (blocked for persistent use)
 
 | Component | Runs as | Scaling | Data store |
 | --- | --- | --- | --- |
@@ -21,6 +22,9 @@ Notes:
 
 * The coord NLB is pass-through, so the Rust binary keeps terminating TLS itself; its certificate and key travel through Secrets Manager into env vars and are materialised at `/tmp` by the container entrypoint.
 * Coordinator and relay are intentionally pinned at one task. SQLite keeps coordinator single-writer; relay registrations currently live in one process.
+* Schema-v1 validation rejects SQLite on EFS in a production profile. The
+  isolated E2E root names and acknowledges this unsafe smoke exception; do not
+  deploy the legacy root persistently until #27 replaces coordinator storage.
 * Secrets (`DATABASE_URL`, `BETTER_AUTH_SECRET`, `BLAKTAIL_AUTH_HMAC_SECRET`, dedicated `BLAKTAIL_RELAY_AUTH_SECRET`, coord TLS material) live in Secrets Manager and are injected by ECS; nothing lands in the image or task definition.
 * Logs go to CloudWatch (`/ecs/blaktail/{console,coord,relay}`, 30-day retention).
 * ECS Container Insights is enabled by Terraform for task-level CPU, memory,
@@ -36,17 +40,18 @@ POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 BETTER_AUTH_SECRET="$(openssl rand -hex 32)"
 BLAKTAIL_AUTH_HMAC_SECRET="$(openssl rand -hex 32)"
 BLAKTAIL_RELAY_AUTH_SECRET="$(openssl rand -hex 32)"
+BLAKTAIL_DIAGNOSTICS_TOKEN="$(openssl rand -hex 32)"
 cat > .env <<EOF
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
 BETTER_AUTH_SECRET=$BETTER_AUTH_SECRET
 BLAKTAIL_AUTH_HMAC_SECRET=$BLAKTAIL_AUTH_HMAC_SECRET
 BLAKTAIL_RELAY_AUTH_SECRET=$BLAKTAIL_RELAY_AUTH_SECRET
+BLAKTAIL_DIAGNOSTICS_TOKEN=$BLAKTAIL_DIAGNOSTICS_TOKEN
 BLAKTAIL_RELAY_ENDPOINT=relay.example.org.au:3478
 BETTER_AUTH_URL=https://console.example.org.au
 EOF
 docker compose build
-docker compose up -d postgres coord relay
-docker compose run --rm console npm run db:migrate
+docker compose up -d
 
 umask 077
 openssl rand -base64 32 > owner-password
@@ -71,35 +76,39 @@ production). Public sign-up is disabled; create later users with owner invitatio
 from `/settings`. Security group needs inbound 3000/tcp, 8443/tcp, 3478/udp. Coord
 state lives in the `coorddata` volume; Postgres in `pgdata`. Compose binds
 coordinator and relay metrics to host loopback at `127.0.0.1:9701` and
-`127.0.0.1:9702`; scrape them from the host or a host-networked collector. See
+`127.0.0.1:9702`; both still require the diagnostics bearer token because their
+container listeners use an explicitly non-loopback bind. Compose runs separate
+`coord-migrate` and `console-migrate` one-shot services before normal processes.
+See [configuration.md](configuration.md),
 [console.md](console.md#first-owner-and-invitations) and
 [observability.md](observability.md).
 
-## Path 2: ECS via Terraform
+## Path 2: isolated ECS E2E
 
 ```sh
-cd deploy/aws
-terraform init
-terraform apply \
-  -var="coord_tls_cert_pem=$(cat coord.crt)" \
-  -var="coord_tls_key_pem=$(cat coord.key)"
+export EXPECTED_AWS_ACCOUNT=123456789012 AWS_REGION=ap-southeast-2
+export RUN_ID=20260824config01 EXPIRES_AT=2026-08-25T00:00:00Z
+export WORK_DIR=/tmp/blaktail-e2e-$RUN_ID TF_DIR=deploy/aws/e2e
+scripts/aws-e2e/preflight.sh
 ```
 
-Then build and push images and force new deployments:
+Follow the guarded stages in `.github/workflows/aws-e2e.yml`. Before services
+start, a dedicated coordinator task validates schema v1, stores a redacted
+effective dump in run evidence, and applies SQLite migrations; a separate console
+task does the same for Drizzle. Normal task commands never migrate.
 
 ```sh
-ACCOUNT=123456789012
-scripts/publish-images.sh "$ACCOUNT" ap-southeast-2 latest
-aws ecs update-service --cluster blaktail --service console  --force-new-deployment
-aws ecs update-service --cluster blaktail --service coord    --force-new-deployment
-aws ecs update-service --cluster blaktail --service relay    --force-new-deployment
-terraform output console_url     # set BETTER_AUTH_URL / your DNS here
-terraform output coord_endpoint  # agents' --coord value
-terraform output relay_endpoint
+scripts/aws-e2e/terraform-bootstrap.sh
+scripts/aws-e2e/build-images.sh
+scripts/aws-e2e/build-agent-packages.sh
+scripts/aws-e2e/upload-agent-packages.sh
+scripts/aws-e2e/terraform-apply.sh prepare
+scripts/aws-e2e/migrate-console.sh
+scripts/aws-e2e/terraform-apply.sh activate
 ```
 
-Run console migrations once, then execute the same supported `bootstrap.mjs
-init`/`claim` ceremony in a one-off console task or ECS Exec session. Transfer the
+After explicit migrations, execute the supported `bootstrap.mjs init`/`claim`
+ceremony in a one-off console task or ECS Exec session. Transfer the
 password through a protected operator channel, never task arguments, Terraform
 variables/state, or CloudWatch output. The disposable isolated harness implements
 this as `scripts/aws-e2e/bootstrap-owner.sh`: it uses a short-lived encrypted S3
@@ -111,9 +120,9 @@ the password, session body, or cookie jar to evidence. Successful teardown remov
 the local password, cookie, enrollment URLs, Terraform state and state backup after
 AWS absence checks pass.
 
-Production additions:
+Requirements before a persistent AWS deployment:
 
-* `terraform apply -var="db_multi_az=true" -var="db_instance_class=db.t4g.large"`.
+* Complete #27 and remove the guarded SQLite/EFS smoke exception.
 * ACM certificate for the console: `-var="console_acm_certificate_arn=arn:aws:acm:..."` plus a Route53 alias; then set `-var="better_auth_url=https://your-domain"`.
 * Replace the default VPC with a dedicated VPC, private subnets, and NAT gateways.
 * Coordinate certificate: a publicly trusted cert (e.g. Let's Encrypt DNS-01 for your coord hostname) works best; agents must trust whatever chain coord presents.

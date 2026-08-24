@@ -12,7 +12,7 @@ tailnet authorisation.
 - `/join-keys` — mint join keys (owner/admin)
 - `/acls` — read and edit ACL JSON (owner/admin write)
 - `/audit` — latest actor-attributed security and administration changes
-- `/status` — coordinator health and region
+- `/status` — status-only coordinator readiness; region stays in protected diagnostics
 - `/settings` — account details, owner-only invitations, and the shared project mission
 - `/invite?token=…` — one-use invitation acceptance; public account creation remains disabled
 

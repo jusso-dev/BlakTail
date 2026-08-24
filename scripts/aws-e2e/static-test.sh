@@ -65,6 +65,15 @@ grep -q 'owner.cookies' "$SCRIPT_DIR/destroy.sh"
 grep -q 'PublicIpAddress == null' "$SCRIPT_DIR/common.sh"
 grep -q 'covers_ssh' "$SCRIPT_DIR/common.sh"
 grep -q 'assignPublicIp:"DISABLED"' "$SCRIPT_DIR/migrate-console.sh"
+grep -q 'coord_migration' "$SCRIPT_DIR/migrate-console.sh"
+grep -q 'dump-config --service console --redacted' "$SCRIPT_DIR/migrate-console.sh"
+grep -q 'config-validation.log' "$SCRIPT_DIR/collect-evidence.sh"
+grep -q 'BLAKTAIL_DATABASE_STORAGE", value = "efs"' \
+  "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
+grep -q 'BLAKTAIL_ALLOW_UNSAFE_EFS_SQLITE", value = "true"' \
+  "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
+grep -q 'readonlyRootFilesystem = true' \
+  "$REPO_ROOT/deploy/aws/e2e/modules/runtime/ecs.tf"
 grep -q 'bootstrap.mjs init' "$SCRIPT_DIR/bootstrap-owner.sh"
 grep -q 'bootstrap.mjs claim' "$SCRIPT_DIR/bootstrap-owner.sh"
 grep -q 'supported_bootstrap:true' "$SCRIPT_DIR/bootstrap-owner.sh"

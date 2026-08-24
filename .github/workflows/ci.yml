@@ -26,16 +26,21 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Validate operator configuration and service hardening
+        run: |
+          cargo build --locked -p blaktail-config -p blaktail-coord
+          scripts/config-contract-test.sh target/debug/blaktail-config target/debug/blaktail-coord
+
       - name: Validate rollout scripts
         run: >-
           sh -n scripts/package-agent.sh scripts/install-agent.sh
-          scripts/agent-checksums.sh scripts/two-vm-test.sh
+          scripts/agent-checksums.sh scripts/two-vm-test.sh scripts/config-contract-test.sh
 
       - name: Build and inspect Linux packages
         run: |
           sudo apt-get update
           sudo apt-get install --yes rpm
-          cargo build --locked -p blaktaild
+          cargo build --locked -p blaktaild -p blaktail-config
           dist="${RUNNER_TEMP}/blaktail-agent-packages"
           scripts/package-agent.sh deb target/debug/blaktaild "${dist}"
           scripts/package-agent.sh rpm target/debug/blaktaild "${dist}"
@@ -43,8 +48,10 @@ jobs:
           (cd "${dist}" && sha256sum --check SHA256SUMS)
           dpkg-deb --info "${dist}/blaktaild-x86_64-unknown-linux-gnu.deb"
           dpkg-deb --contents "${dist}/blaktaild-x86_64-unknown-linux-gnu.deb" | grep '/usr/local/bin/blaktaild'
+          dpkg-deb --contents "${dist}/blaktaild-x86_64-unknown-linux-gnu.deb" | grep '/usr/local/bin/blaktail-config'
           rpm --query --package --info "${dist}/blaktaild-x86_64-unknown-linux-gnu.rpm"
           rpm --query --package --list "${dist}/blaktaild-x86_64-unknown-linux-gnu.rpm" | grep '^/usr/local/bin/blaktaild$'
+          rpm --query --package --list "${dist}/blaktaild-x86_64-unknown-linux-gnu.rpm" | grep '^/usr/local/bin/blaktail-config$'
 
   console:
     name: lint, typecheck, build

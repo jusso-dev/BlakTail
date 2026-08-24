@@ -12,7 +12,7 @@ notarised `.pkg` and checksum-verifying installer described in
 build from source:
 
 ```sh
-cargo build --release -p blaktaild
+cargo build --release -p blaktaild -p blaktail-config
 sudo install -m 0755 target/release/blaktaild /usr/local/bin/blaktaild
 sudo install -m 0644 packaging/macos/com.blaktail.agent.plist /Library/LaunchDaemons/com.blaktail.agent.plist
 ```

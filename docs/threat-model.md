@@ -77,7 +77,11 @@ Typical ways to break the onshore rule without dropping a key in Slack:
 - Secret scanning SaaS that uploads the repository
 - `cargo deny` / gitleaks run somewhere that ships the tree off the runner
 
-The relay refuses to start unless `BLAKTAIL_REGION` is an Australian cloud region (`ap-southeast-2`, `australiaeast`, `australiasoutheast`, `australia-southeast1`, `australia-southeast2`). The coordinator refuses to start when `BLAKTAIL_REGION` is empty and reports that label on `GET /health`. Operators still have to set an Australian value; a non-empty offshore label on the coordinator is a human mistake the process will currently honour. Pin the coordinator the same way you pin the relay.
+The shared schema refuses coordinator, relay, and console startup unless
+`BLAKTAIL_REGION` is an approved Australian cloud region (`ap-southeast-2`,
+`australiaeast`, `australiasoutheast`, `australia-southeast1`, or
+`australia-southeast2`). Public health responses contain status only and never
+echo the configured region. Deployment policy still pins AWS stacks to Sydney.
 
 ## Required controls
 

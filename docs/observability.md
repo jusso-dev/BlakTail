@@ -10,14 +10,16 @@ listeners. Both listeners default to loopback and should remain private.
 
 ```sh
 docker compose up -d --build
-curl --fail --silent http://127.0.0.1:9701/metrics
-curl --fail --silent http://127.0.0.1:9702/metrics
+curl --fail --silent -H "Authorization: Bearer $BLAKTAIL_DIAGNOSTICS_TOKEN" \
+  http://127.0.0.1:9701/metrics
+curl --fail --silent -H "Authorization: Bearer $BLAKTAIL_DIAGNOSTICS_TOKEN" \
+  http://127.0.0.1:9702/metrics
 ```
 
 The container listeners bind `0.0.0.0` so Docker port forwarding can reach them;
-the published host ports remain `127.0.0.1` only. If Prometheus runs in the same
-Compose network, scrape `coord:9701` and `relay:9702` and do not publish the
-ports externally.
+that explicit exposure requires a separate 32-byte diagnostics token. Published
+host ports remain `127.0.0.1` only. A same-network Prometheus must send the same
+bearer token and the ports must not be published externally.
 
 Coordinator metrics:
 
@@ -36,8 +38,11 @@ Relay metrics:
 - `blaktail_relay_dropped_total{reason}` — unknown destinations, rate limits,
   and oversized packets
 
-The relay returns `404` for paths other than `/metrics`. The endpoints have no
-application authentication; network isolation is the access control.
+Coordinator public `/livez`, `/readyz`, and `/health` responses contain status
+only; readiness performs a required SQLite query. Relay `/livez` and `/readyz`
+are status-only on its private HTTP listener. `/metrics` and
+`/diagnostics/readiness` require bearer authentication whenever a non-loopback
+metrics bind is enabled. Network isolation remains mandatory.
 
 ## Audit trail
 

@@ -170,17 +170,32 @@ impl Metrics {
 
 /// Serves Prometheus text metrics over HTTP for dashboards and scrapes.
 pub async fn serve_metrics(bind: SocketAddr, metrics: std::sync::Arc<Metrics>) -> io::Result<()> {
+    serve_metrics_with_token(bind, metrics, None).await
+}
+
+pub async fn serve_metrics_with_token(
+    bind: SocketAddr,
+    metrics: std::sync::Arc<Metrics>,
+    diagnostics_token: Option<Vec<u8>>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(bind).await?;
-    serve_metrics_listener(listener, metrics).await
+    serve_metrics_listener(
+        listener,
+        metrics,
+        std::sync::Arc::<[u8]>::from(diagnostics_token.unwrap_or_default()),
+    )
+    .await
 }
 
 async fn serve_metrics_listener(
     listener: TcpListener,
     metrics: std::sync::Arc<Metrics>,
+    diagnostics_token: std::sync::Arc<[u8]>,
 ) -> io::Result<()> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         let metrics = metrics.clone();
+        let diagnostics_token = diagnostics_token.clone();
         tokio::spawn(async move {
             let mut request = Vec::with_capacity(1_024);
             let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -191,7 +206,7 @@ async fn serve_metrics_listener(
                         return Ok::<(), io::Error>(());
                     }
                     request.extend_from_slice(&chunk[..read]);
-                    if request.windows(2).any(|window| window == b"\r\n") {
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
                         return Ok(());
                     }
                     if request.len() >= 8_192 {
@@ -206,26 +221,50 @@ async fn serve_metrics_listener(
             else {
                 return;
             };
-            let request_line = request
-                .split(|byte| *byte == b'\r')
-                .next()
-                .unwrap_or_default();
-            let valid = matches!(
-                request_line,
-                b"GET /metrics HTTP/1.0" | b"GET /metrics HTTP/1.1"
-            );
-            let (status, content_type, body) = if valid {
-                (
+            let request_text = String::from_utf8_lossy(&request);
+            let request_line = request_text.lines().next().unwrap_or_default();
+            let authorized = diagnostics_token.is_empty()
+                || bearer_token(&request_text).is_some_and(|candidate| {
+                    diagnostics_token_matches(candidate, &diagnostics_token)
+                });
+            let (status, content_type, body) = match request_line {
+                "GET /livez HTTP/1.0" | "GET /livez HTTP/1.1" => (
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    "{\"status\":\"ok\"}\n".into(),
+                ),
+                "GET /readyz HTTP/1.0" | "GET /readyz HTTP/1.1" => (
+                    "200 OK",
+                    "application/json; charset=utf-8",
+                    "{\"status\":\"ready\"}\n".into(),
+                ),
+                "GET /metrics HTTP/1.0" | "GET /metrics HTTP/1.1" if authorized => (
                     "200 OK",
                     "text/plain; version=0.0.4; charset=utf-8",
                     metrics.render(),
-                )
-            } else {
-                (
+                ),
+                "GET /diagnostics/readiness HTTP/1.0" | "GET /diagnostics/readiness HTTP/1.1"
+                    if authorized =>
+                {
+                    (
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        "{\"status\":\"ready\",\"udp\":\"bound\"}\n".into(),
+                    )
+                }
+                "GET /metrics HTTP/1.0"
+                | "GET /metrics HTTP/1.1"
+                | "GET /diagnostics/readiness HTTP/1.0"
+                | "GET /diagnostics/readiness HTTP/1.1" => (
+                    "401 Unauthorized",
+                    "application/json; charset=utf-8",
+                    "{\"error\":\"authentication failed\"}\n".into(),
+                ),
+                _ => (
                     "404 Not Found",
                     "text/plain; charset=utf-8",
                     "not found\n".into(),
-                )
+                ),
             };
             let response = format!(
                 "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -236,6 +275,26 @@ async fn serve_metrics_listener(
             }
         });
     }
+}
+
+fn bearer_token(request: &str) -> Option<&str> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization")
+            .then(|| value.trim().strip_prefix("Bearer "))
+            .flatten()
+    })
+}
+
+fn diagnostics_token_matches(candidate: &str, expected: &[u8]) -> bool {
+    let mut expected_mac = Hmac::<Sha256>::new_from_slice(expected).expect("HMAC accepts keys");
+    expected_mac.update(b"blaktail-private-diagnostics");
+    let expected_digest = expected_mac.finalize().into_bytes();
+    let Ok(mut candidate_mac) = Hmac::<Sha256>::new_from_slice(candidate.as_bytes()) else {
+        return false;
+    };
+    candidate_mac.update(b"blaktail-private-diagnostics");
+    candidate_mac.verify_slice(&expected_digest).is_ok()
 }
 
 /// Relays opaque (normally WireGuard-encrypted) UDP payloads between enrolled
@@ -836,6 +895,7 @@ mod tests {
         let task = tokio::spawn(serve_metrics_listener(
             listener,
             Arc::new(Metrics::default()),
+            Arc::from(Vec::<u8>::new()),
         ));
 
         let mut valid = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -861,6 +921,40 @@ mod tests {
         assert!(String::from_utf8(response)
             .unwrap()
             .starts_with("HTTP/1.1 404 Not Found"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn health_is_minimal_and_private_diagnostics_require_authentication() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let token = b"relay-diagnostics-token-at-least-32-bytes";
+        let task = tokio::spawn(serve_metrics_listener(
+            listener,
+            Arc::new(Metrics::default()),
+            Arc::from(token.to_vec()),
+        ));
+
+        let request = async |request: &[u8]| {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(request).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            String::from_utf8(response).unwrap()
+        };
+        let ready = request(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(ready.starts_with("HTTP/1.1 200 OK"));
+        assert!(ready.contains("{\"status\":\"ready\"}"));
+        assert!(!ready.contains("version"));
+
+        let denied = request(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(denied.starts_with("HTTP/1.1 401 Unauthorized"));
+        let authenticated = request(
+            b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer relay-diagnostics-token-at-least-32-bytes\r\n\r\n",
+        )
+        .await;
+        assert!(authenticated.starts_with("HTTP/1.1 200 OK"));
+        assert!(authenticated.contains("blaktail_relay_forwards_total"));
         task.abort();
     }
 

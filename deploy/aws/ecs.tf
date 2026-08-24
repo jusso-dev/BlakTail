@@ -61,7 +61,9 @@ resource "aws_ecs_task_definition" "console" {
     image        = local.console_image
     portMappings = [{ containerPort = 3000, protocol = "tcp" }]
     environment = [
+      { name = "BLAKTAIL_REGION", value = var.region },
       { name = "BETTER_AUTH_URL", value = local.better_auth_url },
+      { name = "BETTER_AUTH_TRUSTED_ORIGINS", value = local.better_auth_url },
       { name = "COORD_BASE_URL", value = "https://${aws_lb.coord.dns_name}" },
     ]
     secrets = [
@@ -143,6 +145,7 @@ resource "aws_ecs_task_definition" "coord" {
       { name = "BLAKTAIL_REGION", value = var.region },
       { name = "BLAKTAIL_BIND", value = "0.0.0.0:8443" },
       { name = "BLAKTAIL_DATABASE", value = "/data/blaktail-coord.sqlite3" },
+      { name = "BLAKTAIL_DATABASE_STORAGE", value = "efs" },
       { name = "BLAKTAIL_RELAYS", value = "${aws_lb.relay.dns_name}:3478" },
       { name = "BLAKTAIL_CONSOLE_URL", value = local.better_auth_url },
     ]

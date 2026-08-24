@@ -1,8 +1,9 @@
+use blaktail_config::{AgentConfig, ConfigHandle, LoadedConfig, ReloadPlan, Service};
 use blaktaild::{
     configure_system_dns, dns_domain, ensure_private_key, peer_key_hex, read_state,
     remove_system_dns, restore_peers, sync_once, validate_advertised_routes, validate_interface,
-    write_state, Coordinator, MagicDns, Network, Registration, RelayMesh, DEFAULT_INTERFACE,
-    DEFAULT_STATE_DIR, DIRECT_GRACE_SECS, DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
+    write_state, Coordinator, MagicDns, Network, Registration, RelayMesh, DIRECT_GRACE_SECS,
+    DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
 };
 use clap::{Parser, Subcommand};
 use std::{
@@ -14,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::{info, warn};
+use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -24,8 +26,10 @@ use zeroize::Zeroize;
     version
 )]
 struct Cli {
-    #[arg(long, global = true, default_value = DEFAULT_STATE_DIR, hide = true)]
-    state_dir: PathBuf,
+    #[arg(long, global = true, env = "BLAKTAIL_CONFIG")]
+    config: Option<PathBuf>,
+    #[arg(long, global = true, hide = true)]
+    state_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -34,12 +38,12 @@ enum Command {
     /// Join a tailnet and keep WireGuard peers synchronized.
     Up {
         #[arg(long)]
-        coord: String,
+        coord: Option<String>,
         /// Single-use join key. Omit for browser enrollment or pipe a key on stdin.
         #[arg(long, hide_env_values = true, env = "BLAKTAIL_JOIN_KEY")]
         join_key: Option<String>,
-        #[arg(long, default_value = DEFAULT_INTERFACE)]
-        interface: String,
+        #[arg(long)]
+        interface: Option<String>,
         #[arg(long)]
         name: Option<String>,
         /// Public UDP endpoint advertised to peers, for example 203.0.113.5:51820.
@@ -54,16 +58,16 @@ enum Command {
         /// Approved exit node name, DNS name, or UUID. Use `none` to disable.
         #[arg(long)]
         exit_node: Option<String>,
-        #[arg(long, default_value_t = 30)]
-        poll_seconds: u64,
+        #[arg(long)]
+        poll_seconds: Option<u64>,
         /// Exit after the first successful peer sync; launchd or systemd keeps syncing via `run`.
         #[arg(long)]
         exit_after_join: bool,
     },
     /// Resume the persisted enrollment and keep WireGuard peers synchronized.
     Run {
-        #[arg(long, default_value_t = 30)]
-        poll_seconds: u64,
+        #[arg(long)]
+        poll_seconds: Option<u64>,
     },
     /// Renew this enrollment with a fresh join key without changing its tailnet IP.
     Reauth {
@@ -77,12 +81,153 @@ enum Command {
     Down,
 }
 
+#[derive(Clone, Default)]
+struct AgentOverrides {
+    state_dir: Option<PathBuf>,
+    coordinator_url: Option<String>,
+    interface: Option<String>,
+    poll_seconds: Option<u64>,
+    advertised_routes: Option<Vec<String>>,
+}
+
+impl AgentOverrides {
+    fn from_cli(cli: &Cli) -> Self {
+        let mut overrides = Self {
+            state_dir: cli.state_dir.clone(),
+            ..Self::default()
+        };
+        match &cli.command {
+            Command::Up {
+                coord,
+                interface,
+                advertise_routes,
+                poll_seconds,
+                ..
+            } => {
+                overrides.coordinator_url = coord.clone();
+                overrides.interface = interface.clone();
+                overrides.poll_seconds = *poll_seconds;
+                if !advertise_routes.is_empty() {
+                    overrides.advertised_routes = Some(
+                        (advertise_routes.len() == 1
+                            && advertise_routes[0].eq_ignore_ascii_case("none"))
+                        .then(Vec::new)
+                        .unwrap_or_else(|| advertise_routes.clone()),
+                    );
+                }
+            }
+            Command::Run { poll_seconds } => overrides.poll_seconds = *poll_seconds,
+            Command::Reauth { .. } | Command::Status | Command::Down => {}
+        }
+        overrides
+    }
+
+    fn apply(&self, config: &mut AgentConfig) {
+        if let Some(value) = &self.state_dir {
+            config.state_dir = value.clone();
+        }
+        if let Some(value) = &self.coordinator_url {
+            config.coordinator_url = Some(value.clone());
+        }
+        if let Some(value) = &self.interface {
+            config.interface = value.clone();
+        }
+        if let Some(value) = self.poll_seconds {
+            config.poll_seconds = value;
+        }
+        if let Some(value) = &self.advertised_routes {
+            config.advertised_routes = value.clone();
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    let mut cli = Cli::parse();
+    let overrides = AgentOverrides::from_cli(&cli);
+    let mut loaded = match LoadedConfig::load(cli.config.as_deref(), Service::Agent) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("blaktaild: {error}");
+            std::process::exit(1);
+        }
+    };
+    overrides.apply(&mut loaded.config.agent);
+    if cli.state_dir.is_none() {
+        cli.state_dir = Some(loaded.config.agent.state_dir.clone());
+    }
+    if let Err(error) = loaded.validate(Service::Agent) {
+        eprintln!("blaktaild: {error}");
+        std::process::exit(1);
+    }
+    let filter = tracing_subscriber::EnvFilter::new(&loaded.config.diagnostics.log_filter);
+    let (filter_layer, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
+    tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(tracing_subscriber::fmt::layer())
         .init();
-    if let Err(error) = run(Cli::parse()).await {
+    for warning in &loaded.warnings {
+        warn!(%warning, "configuration deprecation");
+    }
+    #[cfg(unix)]
+    {
+        let config_path = cli.config.clone();
+        let overrides = overrides.clone();
+        let config_handle = ConfigHandle::new(loaded.config.clone());
+        tokio::spawn(async move {
+            let mut signal =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        warn!(%error, "configuration reload signal unavailable");
+                        return;
+                    }
+                };
+            while signal.recv().await.is_some() {
+                let mut candidate = match LoadedConfig::load(config_path.as_deref(), Service::Agent)
+                {
+                    Ok(candidate) => candidate,
+                    Err(error) => {
+                        warn!(%error, "configuration reload rejected; active configuration unchanged");
+                        continue;
+                    }
+                };
+                overrides.apply(&mut candidate.config.agent);
+                if let Err(error) = candidate.validate(Service::Agent) {
+                    warn!(%error, "configuration reload rejected; active configuration unchanged");
+                    continue;
+                }
+                match config_handle.plan_for_service(&candidate.config, Service::Agent) {
+                    ReloadPlan::NoChange => info!("configuration reload found no changes"),
+                    ReloadPlan::RestartRequired { fields } => {
+                        warn!(
+                            ?fields,
+                            "configuration reload requires restart; active configuration unchanged"
+                        )
+                    }
+                    ReloadPlan::Safe { ref fields } => {
+                        let new_filter = tracing_subscriber::EnvFilter::new(
+                            &candidate.config.diagnostics.log_filter,
+                        );
+                        if let Err(error) = filter_handle.reload(new_filter) {
+                            warn!(%error, "configuration reload rejected; active configuration unchanged");
+                            continue;
+                        }
+                        match config_handle
+                            .commit_safe_for_service(candidate.config, Service::Agent)
+                        {
+                            Ok(_) => info!(?fields, "configuration reloaded atomically"),
+                            Err(plan) => warn!(
+                                ?plan,
+                                "configuration changed during reload; restart required"
+                            ),
+                        }
+                    }
+                }
+            }
+        });
+    }
+    if let Err(error) = run(cli, loaded.config.agent).await {
         eprintln!("blaktaild: {error}");
         std::process::exit(1);
     }
@@ -687,7 +832,11 @@ fn blaktaild_now() -> u64 {
         .unwrap_or(0)
 }
 
-async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
+async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Error> {
+    let state_dir = cli
+        .state_dir
+        .as_deref()
+        .expect("agent state directory resolved before run");
     match cli.command {
         Command::Up {
             coord,
@@ -701,6 +850,21 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             poll_seconds,
             exit_after_join,
         } => {
+            let coord = coord
+                .or_else(|| operator_config.coordinator_url.clone())
+                .ok_or_else(|| {
+                    blaktaild::Error::Message(
+                        "coordinator URL is required via --coord, agent.coordinator_url, or BLAKTAIL_AGENT_COORD_URL"
+                            .into(),
+                    )
+                })?;
+            let interface = interface.unwrap_or_else(|| operator_config.interface.clone());
+            let poll_seconds = poll_seconds.unwrap_or(operator_config.poll_seconds);
+            let advertise_routes = if advertise_routes.is_empty() {
+                operator_config.advertised_routes.clone()
+            } else {
+                advertise_routes
+            };
             validate_interface(&interface)?;
             let routes_were_supplied = !advertise_routes.is_empty() || advertise_exit_node;
             let clear_routes =
@@ -734,13 +898,13 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                     "subnet and exit-node routing is currently supported on Linux only".into(),
                 ));
             }
-            let (key_path, public_key) = ensure_private_key(&cli.state_dir)?;
+            let (key_path, public_key) = ensure_private_key(state_dir)?;
             let coordinator = Coordinator::new(&coord)?;
             let name = name.unwrap_or_else(detect_hostname);
-            let resumed = cli.state_dir.join("state.json").exists();
+            let resumed = state_dir.join("state.json").exists();
             let mut previous_routes = Vec::new();
             let mut routes_changed = false;
-            let mut state = match read_state(&cli.state_dir) {
+            let mut state = match read_state(state_dir) {
                 Ok(mut existing) if existing.coord == coord && existing.interface == interface => {
                     previous_routes = existing.advertised_routes.clone();
                     if routes_were_supplied && requested_routes != existing.advertised_routes {
@@ -822,7 +986,7 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                     return Err(error);
                 }
             }
-            write_state(&cli.state_dir, &state)?;
+            write_state(state_dir, &state)?;
             let restored = restore_peers(network.as_mut(), &state)?;
             if restored > 0 {
                 info!(restored, "restored persisted WireGuard peers");
@@ -841,16 +1005,17 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                 &coordinator,
                 network.as_mut(),
                 &mut state,
-                &cli.state_dir,
+                state_dir,
                 poll_seconds,
                 exit_after_join,
             )
             .await?;
         }
         Command::Run { poll_seconds } => {
-            let mut state = read_state(&cli.state_dir)?;
+            let poll_seconds = poll_seconds.unwrap_or(operator_config.poll_seconds);
+            let mut state = read_state(state_dir)?;
             validate_interface(&state.interface)?;
-            let (key_path, _) = ensure_private_key(&cli.state_dir)?;
+            let (key_path, _) = ensure_private_key(state_dir)?;
             let coordinator = Coordinator::new(&state.coord)?;
             let mut network = make_network();
             network.setup(&state.interface, &key_path, &state.interface_addresses())?;
@@ -860,7 +1025,7 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                 &state.advertised_routes,
                 state.router_previous_ipv4_forward,
             )?;
-            write_state(&cli.state_dir, &state)?;
+            write_state(state_dir, &state)?;
             let restored = restore_peers(network.as_mut(), &state)?;
             if restored > 0 {
                 info!(restored, "restored persisted WireGuard peers");
@@ -870,27 +1035,27 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
                 &coordinator,
                 network.as_mut(),
                 &mut state,
-                &cli.state_dir,
+                state_dir,
                 poll_seconds,
                 false,
             )
             .await?;
         }
         Command::Reauth { join_key } => {
-            let mut state = read_state(&cli.state_dir)?;
+            let mut state = read_state(state_dir)?;
             let coordinator = Coordinator::new(&state.coord)?;
             let mut join_key = resolve_join_key(join_key)?;
             let result = coordinator.reauth(&mut state, &join_key).await;
             join_key.zeroize();
             result?;
-            write_state(&cli.state_dir, &state)?;
+            write_state(state_dir, &state)?;
             println!(
                 "node credential renewed\n{}",
                 credential_status(state.credential_expires_at, blaktaild_now() as i64)
             );
         }
         Command::Status => {
-            let state = read_state(&cli.state_dir)?;
+            let state = read_state(state_dir)?;
             println!(
                 "joined\nnode: {}\ninterface: {}\naddress: {}\nipv6 address: {}\ndns: {}\ncoordinator: {}\ncredential: {}\nadvertised routes: {}\nexit node: {}\npeers: {}",
                 state.node_id,
@@ -924,10 +1089,10 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             }
         }
         Command::Down => {
-            let state = read_state(&cli.state_dir)?;
+            let state = read_state(state_dir)?;
             if let Some(domain) = dns_domain(&state.dns_name) {
                 remove_system_dns(
-                    &cli.state_dir,
+                    state_dir,
                     &state.interface,
                     &domain,
                     state.dns_mode.as_deref(),
@@ -943,7 +1108,7 @@ async fn run(cli: Cli) -> Result<(), blaktaild::Error> {
             )?;
             coordinator.revoke(&state).await?;
             network.down(&state.interface)?;
-            fs::remove_file(cli.state_dir.join("state.json"))?;
+            fs::remove_file(state_dir.join("state.json"))?;
             println!("node revoked and {} removed", state.interface);
         }
     }
@@ -1076,6 +1241,54 @@ mod tests {
         assert!(credential_status(0, 100).contains("unknown"));
         assert!(credential_status(99, 100).contains("reauth"));
         assert!(credential_status(86_500, 100).contains("1 day"));
+    }
+
+    #[test]
+    fn non_secret_cli_overrides_form_the_validated_agent_config() {
+        let cli = Cli::parse_from([
+            "blaktaild",
+            "--state-dir",
+            "/tmp/blaktail-test",
+            "up",
+            "--coord",
+            "https://coord.example",
+            "--interface",
+            "bt-test0",
+            "--poll-seconds",
+            "15",
+            "--advertise-routes",
+            "10.10.0.0/16,fd00::/64",
+        ]);
+        let overrides = AgentOverrides::from_cli(&cli);
+        let mut config = AgentConfig::default();
+        overrides.apply(&mut config);
+        assert_eq!(config.state_dir, PathBuf::from("/tmp/blaktail-test"));
+        assert_eq!(
+            config.coordinator_url.as_deref(),
+            Some("https://coord.example")
+        );
+        assert_eq!(config.interface, "bt-test0");
+        assert_eq!(config.poll_seconds, 15);
+        assert_eq!(config.advertised_routes, ["10.10.0.0/16", "fd00::/64"]);
+    }
+
+    #[test]
+    fn clear_routes_flag_overrides_file_routes_without_becoming_invalid_cidr() {
+        let cli = Cli::parse_from([
+            "blaktaild",
+            "up",
+            "--coord",
+            "https://coord.example",
+            "--advertise-routes",
+            "none",
+        ]);
+        let overrides = AgentOverrides::from_cli(&cli);
+        let mut config = AgentConfig {
+            advertised_routes: vec!["10.10.0.0/16".into()],
+            ..AgentConfig::default()
+        };
+        overrides.apply(&mut config);
+        assert!(config.advertised_routes.is_empty());
     }
 
     fn candidate() -> std::net::SocketAddr {

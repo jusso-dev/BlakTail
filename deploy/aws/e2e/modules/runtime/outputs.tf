@@ -12,9 +12,10 @@ output "cluster_name" {
 
 output "task_definition_arns" {
   value = {
-    console = aws_ecs_task_definition.console.arn
-    coord   = aws_ecs_task_definition.coord.arn
-    relay   = aws_ecs_task_definition.relay.arn
+    console         = aws_ecs_task_definition.console.arn
+    coord           = aws_ecs_task_definition.coord.arn
+    coord_migration = aws_ecs_task_definition.coord_migration.arn
+    relay           = aws_ecs_task_definition.relay.arn
   }
 }
 

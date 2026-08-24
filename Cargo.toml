@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "blaktail-config",
     "blaktaild",
     "blaktail-coord",
     "blaktail-relay",

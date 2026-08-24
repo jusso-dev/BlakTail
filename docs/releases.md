@@ -19,7 +19,7 @@ oldest glibc baseline supported by that release; do not relabel a binary built f
 different target.
 
 ```sh
-cargo build --locked --release -p blaktaild
+cargo build --locked --release -p blaktaild -p blaktail-config
 BLAKTAIL_VERSION=0.1.0 BLAKTAIL_TARGET=aarch64-apple-darwin \
   scripts/package-agent.sh pkg target/release/blaktaild dist
 

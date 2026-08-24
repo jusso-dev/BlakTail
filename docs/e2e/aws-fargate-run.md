@@ -141,7 +141,7 @@ only a redacted `supported_bootstrap` marker.
 
 ![Ubuntu and Amazon Linux agents active after browser approval](../images/aws-e2e/devices.png)
 
-![Coordinator health and Sydney region](../images/aws-e2e/status.png)
+![Historical coordinator status screenshot; current builds expose status only](../images/aws-e2e/status.png)
 
 ![Actor-attributed browser approval events](../images/aws-e2e/audit.png)
 

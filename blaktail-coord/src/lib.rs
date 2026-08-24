@@ -14,7 +14,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use rand::{rngs::OsRng, RngCore};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -28,7 +28,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 const DEFAULT_NODE_KEY_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_NODE_KEY_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_NODE_KEY_TTL_SECS: i64 = 365 * 24 * 60 * 60;
@@ -87,6 +87,8 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 impl Store {
+    /// Opens a database and applies pending migrations. Operator-controlled
+    /// migration commands use this; service startup must use `open_existing`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let mut db = Connection::open(path)?;
         db.execute_batch("PRAGMA foreign_keys=ON;")?;
@@ -94,9 +96,47 @@ impl Store {
         db.execute_batch("PRAGMA journal_mode=WAL;")?;
         Ok(Self(Arc::new(Mutex::new(db))))
     }
+
+    /// Opens an already-migrated database without creating or changing schema.
+    pub fn open_existing(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let db = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        db.execute_batch("PRAGMA foreign_keys=ON;")?;
+        validate_schema_version(&db)?;
+        db.execute_batch("PRAGMA journal_mode=WAL;")?;
+        Ok(Self(Arc::new(Mutex::new(db))))
+    }
+
+    pub fn readiness(&self) -> Result<(), StoreError> {
+        self.0
+            .lock()
+            .expect("coordinator database lock poisoned")
+            .query_row("SELECT COUNT(*) FROM orgs", [], |row| row.get::<_, i64>(0))?;
+        Ok(())
+    }
+
     pub fn memory() -> Result<Self, StoreError> {
         Self::open(":memory:")
     }
+}
+
+fn validate_schema_version(db: &Connection) -> Result<(), StoreError> {
+    let found = db.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?;
+    if found > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    if found != CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::InvalidMigrationPlan {
+            expected: CURRENT_SCHEMA_VERSION,
+            found,
+        });
+    }
+    Ok(())
 }
 
 fn apply_migrations(db: &mut Connection) -> Result<(), StoreError> {
@@ -323,7 +363,6 @@ fn ensure_column(
 struct AppState {
     store: Store,
     metrics: Arc<CoordMetrics>,
-    region: String,
     auth_hmac_secret: Arc<[u8]>,
     relay_auth_secret: Arc<[u8]>,
     /// Advertised relay endpoints (host:port, UDP) handed to nodes.
@@ -377,7 +416,7 @@ pub fn app_with_relays_and_console(
 
 pub fn app_with_relays_console_and_metrics(
     store: Store,
-    region: String,
+    _region: String,
     auth_hmac_secret: impl Into<Vec<u8>>,
     relay_auth_secret: impl Into<Vec<u8>>,
     relays: Vec<String>,
@@ -387,14 +426,15 @@ pub fn app_with_relays_console_and_metrics(
     let state = AppState {
         store,
         metrics,
-        region,
         auth_hmac_secret: auth_hmac_secret.into().into(),
         relay_auth_secret: relay_auth_secret.into().into(),
         relays: Arc::new(relays),
         console_url: Arc::new(console_url.trim_end_matches('/').to_owned()),
     };
     Router::new()
-        .route("/health", get(health))
+        .route("/health", get(readiness))
+        .route("/livez", get(liveness))
+        .route("/readyz", get(readiness))
         .route(
             "/v1/device-authorizations",
             post(create_device_authorization),
@@ -445,17 +485,33 @@ pub fn app_with_relays_console_and_metrics(
 struct MetricsState {
     store: Store,
     metrics: Arc<CoordMetrics>,
+    diagnostics_token: Arc<[u8]>,
 }
 
 pub fn metrics_app(store: Store, metrics: Arc<CoordMetrics>) -> Router {
+    metrics_app_with_token(store, metrics, None)
+}
+
+pub fn metrics_app_with_token(
+    store: Store,
+    metrics: Arc<CoordMetrics>,
+    diagnostics_token: Option<Vec<u8>>,
+) -> Router {
     Router::new()
         .route("/metrics", get(prometheus_metrics))
-        .with_state(MetricsState { store, metrics })
+        .route("/diagnostics/readiness", get(private_readiness))
+        .with_state(MetricsState {
+            store,
+            metrics,
+            diagnostics_token: diagnostics_token.unwrap_or_default().into(),
+        })
 }
 
 async fn prometheus_metrics(
     State(state): State<MetricsState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ApiError> {
+    require_diagnostics_authorization(&headers, &state.diagnostics_token)?;
     let active_nodes: i64 = state.store.0.lock().unwrap().query_row(
         "SELECT COUNT(*) FROM nodes WHERE revoked_at IS NULL AND credential_expires_at>?1",
         params![now()],
@@ -465,6 +521,40 @@ async fn prometheus_metrics(
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         state.metrics.render(active_nodes.max(0) as u64),
     ))
+}
+
+async fn private_readiness(
+    State(state): State<MetricsState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ApiError> {
+    require_diagnostics_authorization(&headers, &state.diagnostics_token)?;
+    state.store.readiness().map_err(|_| ApiError::Unavailable)?;
+    Ok(Json(serde_json::json!({
+        "status": "ready",
+        "database": "ok",
+        "schema_version": CURRENT_SCHEMA_VERSION,
+    })))
+}
+
+fn require_diagnostics_authorization(headers: &HeaderMap, expected: &[u8]) -> Result<(), ApiError> {
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let candidate = headers
+        .get(AUTHORIZATION)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .ok_or(ApiError::Unauthorized)?;
+    let mut expected_mac =
+        Hmac::<Sha256>::new_from_slice(expected).map_err(|_| ApiError::Unauthorized)?;
+    expected_mac.update(b"blaktail-private-diagnostics");
+    let expected_digest = expected_mac.finalize().into_bytes();
+    let mut candidate_mac =
+        Hmac::<Sha256>::new_from_slice(candidate.as_bytes()).map_err(|_| ApiError::Unauthorized)?;
+    candidate_mac.update(b"blaktail-private-diagnostics");
+    candidate_mac
+        .verify_slice(&expected_digest)
+        .map_err(|_| ApiError::Unauthorized)
 }
 
 async fn record_metrics(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -504,6 +594,8 @@ enum ApiError {
     Gone,
     #[error("too many pending device authorizations; try again later")]
     TooManyRequests,
+    #[error("service unavailable")]
+    Unavailable,
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("database error")]
@@ -519,6 +611,7 @@ impl IntoResponse for ApiError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Gone => StatusCode::GONE,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -528,13 +621,22 @@ impl IntoResponse for ApiError {
 #[derive(Serialize)]
 struct Health {
     status: &'static str,
-    region: String,
 }
-async fn health(State(s): State<AppState>) -> Json<Health> {
-    Json(Health {
-        status: "ok",
-        region: s.region,
-    })
+async fn liveness() -> Json<Health> {
+    Json(Health { status: "ok" })
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    match state.store.readiness() {
+        Ok(()) => (StatusCode::OK, Json(Health { status: "ready" })).into_response(),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(Health {
+                status: "unavailable",
+            }),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -4030,18 +4132,68 @@ mod tests {
         assert!(p.peers.is_empty())
     }
     #[tokio::test]
-    async fn health_region() {
-        let r = app(
-            Store::memory().unwrap(),
-            "ap-southeast-2".into(),
-            TEST_SECRET,
-        );
+    async fn public_health_is_minimal_and_readiness_checks_database() {
+        let store = Store::memory().unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let v: serde_json::Value =
             body(call(&r, Method::GET, "/health", serde_json::Value::Null, None).await).await;
+        assert_eq!(v, serde_json::json!({"status":"ready"}));
+        assert!(!v.to_string().contains("ap-southeast-2"));
+        let live: serde_json::Value =
+            body(call(&r, Method::GET, "/livez", serde_json::Value::Null, None).await).await;
+        assert_eq!(live, serde_json::json!({"status":"ok"}));
+
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE orgs RENAME TO orgs_unavailable")
+            .unwrap();
+        let response = call(&r, Method::GET, "/readyz", serde_json::Value::Null, None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let unavailable: serde_json::Value = body(response).await;
+        assert_eq!(unavailable, serde_json::json!({"status":"unavailable"}));
+        assert!(!unavailable.to_string().contains("database"));
         assert_eq!(
-            v,
-            serde_json::json!({"status":"ok","region":"ap-southeast-2"})
+            call(&r, Method::GET, "/livez", serde_json::Value::Null, None)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn private_diagnostics_require_bearer_token() {
+        const DIAGNOSTICS_TOKEN: &str = "coordinator-diagnostics-token-at-least-32-bytes";
+        let router = metrics_app_with_token(
+            Store::memory().unwrap(),
+            Arc::new(CoordMetrics::default()),
+            Some(DIAGNOSTICS_TOKEN.as_bytes().to_vec()),
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::GET,
+                "/metrics",
+                serde_json::Value::Null,
+                None,
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = call(
+            &router,
+            Method::GET,
+            "/diagnostics/readiness",
+            serde_json::Value::Null,
+            Some(DIAGNOSTICS_TOKEN),
         )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value: serde_json::Value = body(response).await;
+        assert_eq!(value["database"], "ok");
+        assert_eq!(value["schema_version"], CURRENT_SCHEMA_VERSION);
     }
 
     #[test]
@@ -4798,6 +4950,38 @@ mod tests {
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
         assert_eq!(audit_table, "audit_events");
+    }
+
+    #[test]
+    fn service_open_refuses_unmigrated_database_without_mutation() {
+        let path =
+            std::env::temp_dir().join(format!("blaktail-unmigrated-{}.sqlite3", Uuid::new_v4()));
+        drop(Connection::open(&path).unwrap());
+        assert!(matches!(
+            Store::open_existing(&path),
+            Err(StoreError::InvalidMigrationPlan {
+                expected: CURRENT_SCHEMA_VERSION,
+                found: 0,
+            })
+        ));
+        let db = Connection::open(&path).unwrap();
+        let version = db
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .unwrap();
+        let tables: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 0);
+        assert_eq!(tables, 0);
+        drop(db);
+
+        drop(Store::open(&path).unwrap());
+        Store::open_existing(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

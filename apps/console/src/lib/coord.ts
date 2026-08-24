@@ -41,7 +41,6 @@ export type DeviceAuthorizationPreview = {
 
 export type CoordHealth = {
   status: string;
-  region: string;
 };
 
 export type AuditEvent = {

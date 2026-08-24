@@ -1,0 +1,52 @@
+schema_version = 1
+
+[deployment]
+profile = "production"
+
+[diagnostics]
+log_filter = "info"
+support_log_lines = 200
+
+[coordinator]
+region = "ap-southeast-2"
+bind = "0.0.0.0:8443"
+metrics_bind = "127.0.0.1:9701"
+allow_public_metrics = false
+database = "/var/lib/blaktail-coord/coordinator.sqlite3"
+database_storage = "local"
+allow_unsafe_efs_sqlite = false
+tls_mode = "files"
+tls_cert = "/etc/blaktail/tls.crt"
+tls_key = "file:/run/credentials/blaktail-coord.service/tls-key"
+auth_hmac_secret = "file:/run/credentials/blaktail-coord.service/console-hmac"
+relay_auth_secret = "file:/run/credentials/blaktail-coord.service/relay-hmac"
+relays = ["relay.example.org.au:3478"]
+console_url = "https://console.example.org.au"
+
+[relay]
+region = "ap-southeast-2"
+bind = "0.0.0.0:3478"
+metrics_bind = "127.0.0.1:9702"
+allow_public_metrics = false
+auth_secret = "file:/run/credentials/blaktail-relay.service/relay-hmac"
+idle_seconds = 120
+rate_per_second = 100
+rate_burst = 200
+
+[agent]
+state_dir = "/var/lib/blaktail"
+coordinator_url = "https://coord.example.org.au"
+interface = "blaktail0"
+poll_seconds = 30
+advertised_routes = []
+
+[console]
+region = "ap-southeast-2"
+port = 3000
+database_url = "file:/run/secrets/database-url"
+base_url = "https://console.example.org.au"
+trusted_origins = ["https://console.example.org.au"]
+coordinator_url = "https://coord.example.org.au"
+coordinator_ca_file = "/etc/ssl/certs/blaktail-ca.pem"
+auth_secret = "file:/run/secrets/better-auth"
+coordinator_auth_secret = "file:/run/secrets/console-hmac"
