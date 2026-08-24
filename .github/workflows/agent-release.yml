@@ -1,0 +1,314 @@
+name: Agent release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag at the selected commit
+        required: true
+        type: string
+      publish:
+        description: Publish the draft after every native artifact passes
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  preflight:
+    name: Validate immutable release input
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Match tag, Cargo version, and checked-out commit
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag must be vMAJOR.MINOR.PATCH" >&2
+            exit 2
+          fi
+          version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          test "$RELEASE_TAG" = "v$version"
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
+          test -z "$(git status --porcelain)"
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux ${{ matrix.target }}
+    needs: preflight
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Build packages on the release architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          docker build \
+            --platform "linux/${{ matrix.arch }}" \
+            --output type=local,dest=dist \
+            -f deploy/docker/agent-package.Dockerfile .
+          test -f "dist/blaktaild-${{ matrix.target }}.deb"
+          test -f "dist/blaktaild-${{ matrix.target }}.rpm"
+          rm -f dist/SHA256SUMS
+
+      - name: Inspect package metadata and executable version
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes rpm
+          deb="dist/blaktaild-${{ matrix.target }}.deb"
+          rpm_asset="dist/blaktaild-${{ matrix.target }}.rpm"
+          dpkg-deb --info "$deb"
+          rpm --query --package --info "$rpm_asset"
+          mkdir extracted
+          dpkg-deb --extract "$deb" extracted
+          test "$(extracted/usr/local/bin/blaktaild --version)" = \
+            "blaktaild ${{ needs.preflight.outputs.version }}"
+          test "$(extracted/usr/local/bin/blaktail-config --version)" = \
+            "blaktail-config ${{ needs.preflight.outputs.version }}"
+
+      - name: Attest Linux packages
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/blaktaild-${{ matrix.target }}.deb
+            dist/blaktaild-${{ matrix.target }}.rpm
+
+      - name: Upload Linux packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            dist/blaktaild-${{ matrix.target }}.deb
+            dist/blaktaild-${{ matrix.target }}.rpm
+
+  macos:
+    name: macOS ${{ matrix.target }}
+    needs: preflight
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Import Developer ID certificates and notarisation key
+        shell: bash
+        env:
+          CERTIFICATES_P12: ${{ secrets.MACOS_DEVELOPER_CERTIFICATES_P12_BASE64 }}
+          CERTIFICATES_PASSWORD: ${{ secrets.MACOS_DEVELOPER_CERTIFICATES_PASSWORD }}
+          APPLICATION_IDENTITY: ${{ secrets.MACOS_APPLICATION_IDENTITY }}
+          INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          for value in \
+            "$CERTIFICATES_P12" "$CERTIFICATES_PASSWORD" \
+            "$APPLICATION_IDENTITY" "$INSTALLER_IDENTITY" \
+            "$NOTARY_KEY_P8" "$NOTARY_KEY_ID" "$NOTARY_ISSUER_ID"; do
+            test -n "$value"
+          done
+          keychain="$RUNNER_TEMP/blaktail-release.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          notary_key="$RUNNER_TEMP/notary-key.p8"
+          printf '%s' "$CERTIFICATES_P12" | base64 -D >"$certificate"
+          printf '%s' "$NOTARY_KEY_P8" | base64 -D >"$notary_key"
+          chmod 600 "$certificate" "$notary_key"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" \
+            -P "$CERTIFICATES_PASSWORD" -T /usr/bin/codesign -T /usr/bin/pkgbuild
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v "$keychain"
+          {
+            printf 'BLAKTAIL_RELEASE_KEYCHAIN=%s\n' "$keychain"
+            printf 'BLAKTAIL_NOTARY_KEY=%s\n' "$notary_key"
+          } >>"$GITHUB_ENV"
+
+      - name: Build, sign, notarise, and staple package
+        shell: bash
+        env:
+          BLAKTAIL_APPLICATION_IDENTITY: ${{ secrets.MACOS_APPLICATION_IDENTITY }}
+          BLAKTAIL_INSTALLER_IDENTITY: ${{ secrets.MACOS_INSTALLER_IDENTITY }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p blaktaild -p blaktail-config
+          mkdir dist
+          package="$(
+            BLAKTAIL_VERSION='${{ needs.preflight.outputs.version }}' \
+            BLAKTAIL_TARGET='${{ matrix.target }}' \
+            scripts/package-agent.sh pkg target/release/blaktaild dist
+          )"
+          xcrun notarytool submit "$package" \
+            --key "$BLAKTAIL_NOTARY_KEY" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$package"
+          xcrun stapler validate "$package"
+          pkgutil --check-signature "$package"
+          spctl --assess --type install "$package"
+
+      - name: Attest macOS package
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/blaktaild-${{ matrix.target }}.pkg
+
+      - name: Upload macOS package
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-macos-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
+          path: dist/blaktaild-${{ matrix.target }}.pkg
+
+      - name: Remove temporary signing material
+        if: always()
+        shell: bash
+        run: |
+          if test -n "$BLAKTAIL_RELEASE_KEYCHAIN"; then
+            security delete-keychain "$BLAKTAIL_RELEASE_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-key.p8"
+
+  publish:
+    name: Publish complete immutable release
+    needs: [preflight, linux, macos]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout exact tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Download every native package
+        uses: actions/download-artifact@v4
+        with:
+          pattern: agent-*
+          path: dist
+          merge-multiple: true
+
+      - name: Require the complete release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          for asset in \
+            blaktaild-aarch64-apple-darwin.pkg \
+            blaktaild-x86_64-apple-darwin.pkg \
+            blaktaild-aarch64-unknown-linux-gnu.deb \
+            blaktaild-x86_64-unknown-linux-gnu.deb \
+            blaktaild-aarch64-unknown-linux-gnu.rpm \
+            blaktaild-x86_64-unknown-linux-gnu.rpm; do
+            test -f "dist/$asset"
+          done
+          test "$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')" = 6
+          scripts/agent-checksums.sh dist
+          cd dist
+          sha256sum --check SHA256SUMS
+
+      - name: Attest checksum manifest
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/SHA256SUMS
+
+      - name: Create draft, upload once, then publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --json isDraft >/dev/null 2>&1; then
+            test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          else
+            prerelease=
+            case '${{ needs.preflight.outputs.version }}' in
+              0.*) prerelease=--prerelease ;;
+            esac
+            gh release create "$RELEASE_TAG" --verify-tag --draft $prerelease \
+              --title "BlakTail agent $RELEASE_TAG" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false
+
+      - name: Re-download and verify published bytes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir published
+          gh release download "$RELEASE_TAG" --dir published
+          cd published
+          sha256sum --check SHA256SUMS
+          for asset in blaktaild-*; do
+            gh attestation verify "$asset" --repo "$GITHUB_REPOSITORY"
+          done

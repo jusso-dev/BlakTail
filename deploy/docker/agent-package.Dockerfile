@@ -1,7 +1,7 @@
 FROM amazonlinux:2023 AS build
 
 ARG TARGETARCH
-RUN test "$TARGETARCH" = arm64 \
+RUN case "$TARGETARCH" in arm64|amd64) ;; *) exit 2 ;; esac \
  && dnf install -y ca-certificates gcc gcc-c++ gzip make tar \
  && dnf clean all \
  && curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
@@ -20,6 +20,8 @@ RUN cargo build --locked --release -p blaktaild -p blaktail-config \
 
 FROM debian:12-slim AS package
 
+ARG TARGETARCH
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends dpkg-dev rpm \
  && rm -rf /var/lib/apt/lists/*
@@ -31,10 +33,15 @@ COPY packaging/systemd/blaktaild.service ./packaging/systemd/blaktaild.service
 COPY docs/linux-agent.md ./docs/linux-agent.md
 COPY --from=build /src/target/release/blaktaild ./blaktaild
 COPY --from=build /src/target/release/blaktail-config ./blaktail-config
-RUN mkdir /out \
- && BLAKTAIL_TARGET=aarch64-unknown-linux-gnu scripts/package-agent.sh \
+RUN case "$TARGETARCH" in \
+      arm64) target=aarch64-unknown-linux-gnu ;; \
+      amd64) target=x86_64-unknown-linux-gnu ;; \
+      *) exit 2 ;; \
+    esac \
+ && mkdir /out \
+ && BLAKTAIL_TARGET="$target" scripts/package-agent.sh \
       deb ./blaktaild /out \
- && BLAKTAIL_TARGET=aarch64-unknown-linux-gnu scripts/package-agent.sh \
+ && BLAKTAIL_TARGET="$target" scripts/package-agent.sh \
       rpm ./blaktaild /out \
  && scripts/agent-checksums.sh /out \
  && cd /out \

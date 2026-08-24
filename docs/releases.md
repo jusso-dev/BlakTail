@@ -34,10 +34,33 @@ enrol the node or enable the service. Join secrets never enter package metadata,
 argv, or an environment file.
 
 Public macOS packages must be built with
+both `BLAKTAIL_APPLICATION_IDENTITY="Developer ID Application: …"` and
 `BLAKTAIL_INSTALLER_IDENTITY="Developer ID Installer: …"`, notarised, and stapled.
 The installer rejects an unsigned package. Linux artifacts are verified against the
 release's `SHA256SUMS`; this detects corruption but is not a substitute for protecting
 the GitHub release account.
+
+`.github/workflows/agent-release.yml` is the only publication path. It builds each
+target on its native GitHub runner, signs and notarises both macOS packages, builds
+Linux on the Amazon Linux 2023 glibc baseline, creates GitHub OIDC provenance
+attestations, requires all six fixed package names, creates a draft release, uploads
+the complete set, and publishes only after re-downloading and verifying the bytes.
+Enable GitHub release immutability before the first tag so the published tag and
+assets cannot later be replaced.
+
+The macOS jobs fail closed unless these Actions secrets exist:
+
+- `MACOS_DEVELOPER_CERTIFICATES_P12_BASE64`
+- `MACOS_DEVELOPER_CERTIFICATES_PASSWORD`
+- `MACOS_APPLICATION_IDENTITY`
+- `MACOS_INSTALLER_IDENTITY`
+- `APPLE_NOTARY_KEY_P8_BASE64`
+- `APPLE_NOTARY_KEY_ID`
+- `APPLE_NOTARY_ISSUER_ID`
+
+The P12 must contain the named Developer ID Application and Developer ID Installer
+identities. The App Store Connect API key must be authorised for notarisation. Never
+store either file in the repository or a workflow artifact.
 
 After collecting all native artifacts:
 
@@ -45,6 +68,16 @@ After collecting all native artifacts:
 scripts/agent-checksums.sh dist
 gh release create v0.1.0 dist/blaktaild-* dist/SHA256SUMS \
   --title "BlakTail agent v0.1.0" --notes-file RELEASE_NOTES.md
+```
+
+That manual command is retained only as an explanation of the asset set; public
+releases must use the guarded workflow. Push an existing, exact-version tag, or
+dispatch the workflow against that tag with `publish=true`. Verify downloaded
+packages with:
+
+```sh
+gh attestation verify blaktaild-aarch64-unknown-linux-gnu.deb \
+  --repo jusso-dev/BlakTail
 ```
 
 Before calling the release usable, install the pinned tag on clean Debian/Ubuntu,

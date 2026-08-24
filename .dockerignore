@@ -1,7 +1,13 @@
 .git
-target
-node_modules
-apps/console/.next
-apps/console/node_modules
+**/target
+**/node_modules
+**/.next
+**/.build
+**/DerivedData
+**/.terraform
+**/.work
+**/*.tfstate
+**/*.tfstate.*
+session-*.md
 **/*.sqlite3*
 certs

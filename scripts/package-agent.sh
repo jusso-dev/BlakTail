@@ -8,6 +8,7 @@ usage: scripts/package-agent.sh <pkg|deb|rpm> [binary] [output-directory]
 Environment:
   BLAKTAIL_VERSION             package version; defaults to Cargo.toml
   BLAKTAIL_TARGET              Rust target triple; defaults to this host
+  BLAKTAIL_APPLICATION_IDENTITY optional Developer ID Application identity for pkg
   BLAKTAIL_INSTALLER_IDENTITY  optional Developer ID Installer identity for pkg
 EOF
   exit 2
@@ -90,12 +91,27 @@ asset="$output_dir/blaktaild-$target.$format"
 
 package_pkg() {
   command -v pkgbuild >/dev/null 2>&1 || die "pkgbuild is required for pkg output"
+  case "${BLAKTAIL_APPLICATION_IDENTITY:+set}:${BLAKTAIL_INSTALLER_IDENTITY:+set}" in
+    :) ;;
+    set:set) ;;
+    *) die "public pkg signing requires both application and installer identities" ;;
+  esac
   root="$work/root"
   install -d "$root/usr/local/bin" "$root/Library/LaunchDaemons"
   install -m 0755 "$binary" "$root/usr/local/bin/blaktaild"
   install -m 0755 "$config_binary" "$root/usr/local/bin/blaktail-config"
   install -m 0644 "$repo_root/packaging/macos/com.blaktail.agent.plist" \
     "$root/Library/LaunchDaemons/com.blaktail.agent.plist"
+  if [ -n "${BLAKTAIL_APPLICATION_IDENTITY:-}" ]; then
+    codesign --force --options runtime --timestamp \
+      --sign "$BLAKTAIL_APPLICATION_IDENTITY" \
+      "$root/usr/local/bin/blaktaild"
+    codesign --force --options runtime --timestamp \
+      --sign "$BLAKTAIL_APPLICATION_IDENTITY" \
+      "$root/usr/local/bin/blaktail-config"
+    codesign --verify --strict --verbose=2 "$root/usr/local/bin/blaktaild"
+    codesign --verify --strict --verbose=2 "$root/usr/local/bin/blaktail-config"
+  fi
   if command -v xattr >/dev/null 2>&1; then
     xattr -cr "$root"
   fi
