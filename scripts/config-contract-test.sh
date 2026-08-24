@@ -9,7 +9,7 @@ die() {
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 config_binary=${1:-"$repo_root/target/debug/blaktail-config"}
 coord_binary=${2:-"$repo_root/target/debug/blaktail-coord"}
-for command_name in jq grep sed; do
+for command_name in curl jq grep openssl sed; do
   command -v "$command_name" >/dev/null 2>&1 || die "$command_name is required"
 done
 for binary in "$config_binary" "$coord_binary"; do
@@ -17,7 +17,12 @@ for binary in "$config_binary" "$coord_binary"; do
 done
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/blaktail-config-test.XXXXXX")
+coord_pid=
 cleanup() {
+  if [ -n "$coord_pid" ]; then
+    kill "$coord_pid" 2>/dev/null || true
+    wait "$coord_pid" 2>/dev/null || true
+  fi
   case "${work:-}" in
     "${TMPDIR:-/tmp}"/blaktail-config-test.*) rm -rf -- "$work" ;;
     *) die "refusing unsafe test cleanup" ;;
@@ -30,9 +35,28 @@ printf '%s\n' "$secret_marker" >"$work/console-hmac"
 printf '%s\n' "RELAY_${secret_marker}" >"$work/relay-hmac"
 printf '%s\n' "AUTH_${secret_marker}" >"$work/better-auth"
 printf '%s\n' "postgres://blaktail:${secret_marker}@db.example/blaktail" >"$work/database-url"
-printf '%s\n' 'test certificate' >"$work/tls.crt"
-printf '%s\n' 'test private key' >"$work/tls.key"
+cat >"$work/openssl.cnf" <<'EOF'
+[req]
+distinguished_name = subject
+x509_extensions = server
+prompt = no
+
+[subject]
+CN = localhost
+
+[server]
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:localhost,IP:127.0.0.1
+EOF
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj '/CN=localhost' \
+  -config "$work/openssl.cnf" -keyout "$work/tls.key" -out "$work/tls.crt" \
+  >/dev/null 2>&1
 chmod 0600 "$work"/*
+
+api_port=$((20000 + ($$ % 10000)))
+metrics_port=$((api_port + 1))
 
 config="$work/blaktail.toml"
 cat >"$config" <<EOF
@@ -43,6 +67,8 @@ profile = "production"
 
 [coordinator]
 region = "ap-southeast-2"
+bind = "127.0.0.1:$api_port"
+metrics_bind = "127.0.0.1:$metrics_port"
 database = "$work/coordinator.sqlite3"
 tls_cert = "$work/tls.crt"
 tls_key = "file:$work/tls.key"
@@ -102,6 +128,31 @@ if grep -F "$secret_marker" "$runtime_log" >/dev/null; then
   die "console runtime adapter logged a secret marker"
 fi
 
+"$coord_binary" --config "$config" migrate >/dev/null
+"$coord_binary" --config "$config" serve >"$work/coord.stdout" 2>"$work/coord.stderr" &
+coord_pid=$!
+coord_ready=false
+attempt=0
+while [ "$attempt" -lt 10 ]; do
+  attempt=$((attempt + 1))
+  if curl --fail --insecure --silent --max-time 1 \
+    "https://127.0.0.1:$api_port/health" >/dev/null; then
+    coord_ready=true
+    break
+  fi
+  if ! kill -0 "$coord_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
+if [ "$coord_ready" != true ]; then
+  cat "$work/coord.stderr" >&2
+  die "coordinator TLS runtime did not become healthy"
+fi
+kill "$coord_pid"
+wait "$coord_pid" 2>/dev/null || true
+coord_pid=
+
 printf '%s\n' \
   "owner@example.com token=$secret_marker peer=203.0.113.7 ipv6=2001:db8::7 id=7d9d69ab-1bc5-4d73-9492-d3df8f06b834 database_url=postgres://owner:password@db.example/blaktail enroll=https://console.example/enroll?code=ABCD-EFGH" \
   >"$work/service.log"
@@ -124,11 +175,12 @@ fi
 [ "$bundle_mode" = 600 ] || die "support bundle mode is $bundle_mode, expected 600"
 
 invalid="$work/invalid.toml"
-sed 's/ap-southeast-2/us-east-1/' "$config" >"$invalid"
+sed -e 's/ap-southeast-2/us-east-1/' \
+  -e 's/coordinator[.]sqlite3/invalid.sqlite3/' "$config" >"$invalid"
 if "$coord_binary" --config "$invalid" serve >"$work/invalid.stdout" 2>"$work/invalid.stderr"; then
   die "coordinator accepted invalid region"
 fi
-[ ! -e "$work/coordinator.sqlite3" ] || die "invalid coordinator startup created or migrated state"
+[ ! -e "$work/invalid.sqlite3" ] || die "invalid coordinator startup created or migrated state"
 grep -q 'coordinator.region' "$work/invalid.stderr" || die "invalid startup lacked field-specific error"
 
 unknown="$work/unknown.toml"
