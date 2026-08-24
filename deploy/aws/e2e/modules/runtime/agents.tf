@@ -38,8 +38,16 @@ resource "aws_instance" "ubuntu_agent" {
     #!/bin/bash
     set -euxo pipefail
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y awscli ca-certificates curl jq openssh-server wireguard-tools
+    package_ready=false
+    for attempt in {1..30}; do
+      if apt-get update -o Acquire::ForceIPv4=true && \
+        apt-get install -y ca-certificates curl jq openssh-server wireguard-tools; then
+        package_ready=true
+        break
+      fi
+      sleep 10
+    done
+    [ "$package_ready" = true ]
     systemctl enable --now ssh
     snap list amazon-ssm-agent >/dev/null 2>&1 || snap install amazon-ssm-agent --classic
     systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service || true
@@ -77,9 +85,25 @@ resource "aws_instance" "al2023_agent" {
   user_data = <<-USER_DATA
     #!/bin/bash
     set -euxo pipefail
-    dnf install -y amazon-ssm-agent awscli2 ca-certificates curl jq openssh-server wireguard-tools
+    package_ready=false
+    for attempt in {1..30}; do
+      if dnf install -y amazon-ssm-agent ca-certificates jq openssh-server wireguard-tools; then
+        package_ready=true
+        break
+      fi
+      sleep 10
+    done
+    [ "$package_ready" = true ]
     systemctl enable --now sshd
     systemctl enable --now amazon-ssm-agent
+    systemctl enable --now systemd-resolved
+    if grep -Eq '^[[:space:]]*hosts:[[:space:]]+files[[:space:]]+dns[[:space:]]+myhostname[[:space:]]*$' /etc/nsswitch.conf; then
+      sed -i -E 's/^[[:space:]]*hosts:[[:space:]]+files[[:space:]]+dns[[:space:]]+myhostname[[:space:]]*$/hosts:      files resolve [!UNAVAIL=return] dns myhostname/' /etc/nsswitch.conf
+    elif ! grep -Eq '^[[:space:]]*hosts:.*[[:space:]]resolve([[:space:]]|$)' /etc/nsswitch.conf; then
+      echo 'unsupported AL2023 hosts configuration' >&2
+      exit 1
+    fi
+    ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf
   USER_DATA
 
   tags = merge(var.tags, {

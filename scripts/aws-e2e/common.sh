@@ -237,16 +237,22 @@ prepare_git_context() {
 wait_ssm_command() {
   command_id=$1
   instance_id=$2
-  if ! aws_cli ssm wait command-executed --command-id "$command_id" --instance-id "$instance_id"; then
+  ssm_command_timeout=${SSM_COMMAND_TIMEOUT:-900}
+  case "$ssm_command_timeout" in '' | *[!0-9]*) die "SSM_COMMAND_TIMEOUT must be seconds" ;; esac
+  [ "$ssm_command_timeout" -ge 60 ] && [ "$ssm_command_timeout" -le 900 ] || \
+    die "SSM_COMMAND_TIMEOUT must be between 60 and 900 seconds"
+  command_deadline=$(( $(date -u +%s) + ssm_command_timeout ))
+  while [ "$(date -u +%s)" -lt "$command_deadline" ]; do
     command_status=$(aws_cli ssm get-command-invocation \
       --command-id "$command_id" --instance-id "$instance_id" \
-      --query Status --output text 2>/dev/null || printf Unknown)
-    die "SSM command failed for $instance_id: $command_status"
-  fi
-  command_status=$(aws_cli ssm get-command-invocation \
-    --command-id "$command_id" --instance-id "$instance_id" \
-    --query Status --output text)
-  [ "$command_status" = Success ] || die "SSM command failed for $instance_id: $command_status"
+      --query Status --output text 2>/dev/null || printf Pending)
+    case "$command_status" in
+      Success) return 0 ;;
+      Pending | InProgress | Delayed) sleep 5 ;;
+      *) die "SSM command failed for $instance_id: $command_status" ;;
+    esac
+  done
+  die "SSM command timed out for $instance_id after $ssm_command_timeout seconds"
 }
 
 ssm_send_script() {

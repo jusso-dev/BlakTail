@@ -4,7 +4,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/common.sh"
 
 validate_base_inputs
-for command_name in aws jq terraform; do
+for command_name in aws awk base64 jq terraform tr; do
   require_command "$command_name"
 done
 assert_aws_identity
@@ -24,29 +24,66 @@ instance_json=$(tf_output_json agent_instance_ids)
 remote_body=$(cat <<'REMOTE'
 set -eu
 umask 077
-command -v aws >/dev/null 2>&1 || { echo 'AWS CLI missing on agent' >&2; exit 1; }
 if command -v cloud-init >/dev/null 2>&1; then
-  cloud-init status --wait >/dev/null
+  cloud-init status --wait >/dev/null 2>&1 || true
 fi
+
+package_ready=false
+if [ -f /etc/debian_version ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if apt-get update -o Acquire::ForceIPv4=true -qq && \
+      apt-get install -y -qq ca-certificates curl iproute2 iptables iputils-ping jq \
+        openssh-server procps wireguard-tools; then
+      package_ready=true
+      break
+    fi
+    sleep 10
+  done
+else
+  for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    if dnf install -y -q ca-certificates iproute iptables iputils jq openssh-server \
+      procps-ng wireguard-tools; then
+      package_ready=true
+      break
+    fi
+    sleep 10
+  done
+fi
+[ "$package_ready" = true ] || { echo 'agent dependency bootstrap failed' >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo 'curl missing on agent' >&2; exit 1; }
+
 work=$(mktemp -d /var/tmp/blaktail-package.XXXXXX)
 cleanup() { rm -rf -- "$work"; }
 trap cleanup EXIT HUP INT TERM
 
-aws s3 cp "s3://$ARTIFACT_BUCKET/$RUN_ID/SHA256SUMS" "$work/SHA256SUMS" --only-show-errors
+sha256_url=$(printf '%s' "$SHA256_URL_B64" | base64 --decode)
+package_url=$(printf '%s' "$PACKAGE_URL_B64" | base64 --decode)
+curl --fail --silent --show-error --location --max-time 180 \
+  --output "$work/SHA256SUMS" "$sha256_url"
 if [ -f /etc/debian_version ]; then
   package=blaktaild-aarch64-unknown-linux-gnu.deb
-  aws s3 cp "s3://$ARTIFACT_BUCKET/$RUN_ID/$package" "$work/$package" --only-show-errors
+  [ "$PACKAGE_NAME" = "$package" ] || exit 1
+  curl --fail --silent --show-error --location --max-time 180 \
+    --output "$work/$package" "$package_url"
   (cd "$work" && sha256sum --check --ignore-missing SHA256SUMS)
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq iproute2 wireguard-tools iptables iputils-ping jq procps openssh-server
   dpkg -i "$work/$package"
   ssh_service=ssh
 else
   package=blaktaild-aarch64-unknown-linux-gnu.rpm
-  aws s3 cp "s3://$ARTIFACT_BUCKET/$RUN_ID/$package" "$work/$package" --only-show-errors
+  [ "$PACKAGE_NAME" = "$package" ] || exit 1
+  curl --fail --silent --show-error --location --max-time 180 \
+    --output "$work/$package" "$package_url"
   (cd "$work" && sha256sum --check --ignore-missing SHA256SUMS)
-  dnf install -y -q "$work/$package" iputils jq openssh-server
+  dnf install -y -q "$work/$package"
+  systemctl enable --now systemd-resolved
+  if grep -Eq '^[[:space:]]*hosts:[[:space:]]+files[[:space:]]+dns[[:space:]]+myhostname[[:space:]]*$' /etc/nsswitch.conf; then
+    sed -i -E 's/^[[:space:]]*hosts:[[:space:]]+files[[:space:]]+dns[[:space:]]+myhostname[[:space:]]*$/hosts:      files resolve [!UNAVAIL=return] dns myhostname/' /etc/nsswitch.conf
+  elif ! grep -Eq '^[[:space:]]*hosts:.*[[:space:]]resolve([[:space:]]|$)' /etc/nsswitch.conf; then
+    echo 'unsupported AL2023 hosts configuration' >&2
+    exit 1
+  fi
+  ln -sfn /run/systemd/resolve/resolv.conf /etc/resolv.conf
   ssh_service=sshd
 fi
 
@@ -63,19 +100,37 @@ systemctl enable --now "$ssh_service"
 REMOTE
 )
 
+install_tmp=$(mktemp "$WORK_DIR/agent-install.XXXXXX")
+cleanup_install() {
+  rm -f -- "$install_tmp"
+}
+trap cleanup_install EXIT HUP INT TERM
 for agent_name in ubuntu al2023; do
   instance_id=$(printf '%s' "$instance_json" | jq -er --arg key "$agent_name" '.[$key]')
   assert_ssm_online "$instance_id"
-  remote_script="RUN_ID=$RUN_ID
-ARTIFACT_BUCKET=$artifact_bucket
+  case "$agent_name" in
+    ubuntu) package_name=blaktaild-aarch64-unknown-linux-gnu.deb ;;
+    al2023) package_name=blaktaild-aarch64-unknown-linux-gnu.rpm ;;
+    *) die "unsupported agent platform: $agent_name" ;;
+  esac
+  sha256_url=$(aws_cli s3 presign "s3://$artifact_bucket/$RUN_ID/SHA256SUMS" --expires-in 900)
+  package_url=$(aws_cli s3 presign "s3://$artifact_bucket/$RUN_ID/$package_name" --expires-in 900)
+  sha256_url_b64=$(printf '%s' "$sha256_url" | base64 | tr -d '\n')
+  package_url_b64=$(printf '%s' "$package_url" | base64 | tr -d '\n')
+  remote_script="SHA256_URL_B64=$sha256_url_b64
+PACKAGE_URL_B64=$package_url_b64
+PACKAGE_NAME=$package_name
 $remote_body"
   ssm_send_script "$instance_id" "BlakTail E2E package install $RUN_ID" "$remote_script"
   wait_ssm_command "$SSM_COMMAND_ID" "$instance_id"
-  version_output=$(ssm_command_output "$SSM_COMMAND_ID" "$instance_id" | tail -n 1)
+  version_output=$(ssm_command_output "$SSM_COMMAND_ID" "$instance_id" | \
+    tr -d '\r' | awk '/^blaktaild [0-9]+\.[0-9]+\.[0-9]+$/ { version = $0 } END { print version }')
   case "$version_output" in
     blaktaild\ *) ;;
     *) die "agent version proof missing for $agent_name" ;;
   esac
-  printf '%s\n' "$instance_id $version_output" >>"$WORK_DIR/agent-install.ok"
+  printf '%s\n' "$instance_id $version_output" >>"$install_tmp"
 done
+mv -- "$install_tmp" "$WORK_DIR/agent-install.ok"
+trap - EXIT HUP INT TERM
 printf 'agent packages installed through SSM\n'

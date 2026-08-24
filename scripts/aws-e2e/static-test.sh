@@ -57,6 +57,8 @@ if grep -Eq '^  (push|pull_request|schedule):' "$REPO_ROOT/.github/workflows/aws
   die "AWS E2E workflow must remain manual-only"
 fi
 grep -q 'CONFIRM_DESTROY' "$SCRIPT_DIR/destroy.sh"
+grep -q 'partial destroy requires protected destroy context' "$SCRIPT_DIR/destroy.sh"
+grep -q 'delete-task-definitions' "$SCRIPT_DIR/destroy.sh"
 grep -q 'PublicIpAddress == null' "$SCRIPT_DIR/common.sh"
 grep -q 'covers_ssh' "$SCRIPT_DIR/common.sh"
 grep -q 'assignPublicIp:"DISABLED"' "$SCRIPT_DIR/migrate-console.sh"

@@ -1,0 +1,152 @@
+# AWS Fargate smoke run — 23–24 August 2026
+
+This is the public, credential-free record for disposable run
+`20260823t120928z`. It proves the browser onboarding and private-node remote-access
+slice of [#34](https://github.com/jusso-dev/BlakTail/issues/34); it does not close
+that issue's release-grade lifecycle matrix.
+
+## Result
+
+```text
+run_id: 20260823t120928z
+region: ap-southeast-2
+harness: passed
+control_plane_and_login: passed
+agent_remote_access: passed
+network_lifecycle: partial
+readme_and_checks: passed
+teardown: passed (active-resource scope)
+overall_issue_acceptance: partial
+```
+
+The AWS account allowlist and live caller identity matched before each mutation;
+the account number is redacted here. Evidence was captured at
+`3a3be505aedbdaf6b7fbb07cee802e0d189c4618`. The run began at
+`2026-08-23T12:09:28Z`, evidence was sealed at `2026-08-23T23:48:52Z`, and final
+active-resource absence was verified on `2026-08-24` UTC.
+
+## Deployed shape
+
+- Dedicated two-AZ VPC in Sydney.
+- Public AWS API Gateway HTTPS endpoint using AWS's trusted certificate, privately
+  integrated through a VPC link to an internal ALB.
+- Private ARM64 Fargate services for console, coordinator, coordinator TLS bridge,
+  and UDP relay. Coordinator and relay stayed at one task.
+- Private RDS Postgres for console identity and membership; EFS-backed coordinator
+  SQLite for this short smoke run.
+- One private Ubuntu ARM64 agent and one private Amazon Linux 2023 ARM64 agent,
+  each using a separate NAT-instance route. Neither had a public address or inbound
+  TCP/22 rule. Agents stayed on EC2 because faithful `blaktaild` operation needs a
+  TUN device, routes, firewall changes, and `CAP_NET_ADMIN`, which Fargate cannot
+  provide.
+- SSM performed package bootstrap only. Acceptance SSH used a BlakTail MagicDNS
+  name and a route owned by `blaktail0`.
+
+The control-plane image references were immutable:
+
+```text
+console:     sha256:27cd9896a62ee47a4d856ebb0fa84961cf48b524e7ab89d8464b2bd990dff5b1
+coordinator: sha256:336058394266ad2db40661ee80d95e3a5dc4ac82bbfbd78db12f8d00deafc663
+relay:       sha256:bae97669fba90ad8e113162feb2a7333543ded975ee4f18afee777601fd96911
+TLS bridge:  sha256:3214e863db4bb6c0a547faf290d782e547752f6c7aa3039ae433f1977d00a073
+```
+
+Both agents reported `blaktaild 0.1.0`. Commit-built package checksums were:
+
+```text
+RPM: 35123f1f4c5b81084236598fef2845e6876697046b906d801520674118da9ffe
+DEB: 7f714933db1cdb3578df7d23673d9357227a0e59d56cd71459052a8b38f4a622
+```
+
+The configured remote ARM64 Docker host became unavailable during bring-up.
+Run-scoped CodeBuild projects rebuilt the coordinator and console images; their
+projects, roles, policies, logs, and source objects were deleted and independently
+checked absent. The normal harness still fails closed unless its named ARM64 Docker
+context is available.
+
+## Browser and data-plane evidence
+
+The password was generated in browser-process memory, never printed or saved, and
+became unusable when the stack was destroyed. Better Auth created the credential;
+a one-shot Fargate task linked that real user to the coordinator organisation as
+owner. A fresh browser then signed in and observed both approved agents.
+
+![Real email/password sign-in](../images/aws-e2e/sign-in.png)
+
+![Ubuntu and Amazon Linux agents active after browser approval](../images/aws-e2e/devices.png)
+
+![Coordinator health and Sydney region](../images/aws-e2e/status.png)
+
+![Actor-attributed browser approval events](../images/aws-e2e/audit.png)
+
+![Public deployment data-handling statement](../images/aws-e2e/privacy.png)
+
+For both directions, the remote proof required all of these markers before saving
+evidence:
+
+```text
+ssh=ok (aarch64)
+ipv4=ok
+ipv6=ok
+magicdns=ok
+relay_configured=ok
+overlay_routes=ok
+```
+
+Ubuntu received `100.64.0.1/32` and
+`fddd:dc4c:f487:72ee::1/128`; Amazon Linux received `100.64.0.2/32` and
+`fddd:dc4c:f487:72ee::2/128`. Both MagicDNS names resolved to their overlay A and
+AAAA records. The SSH destination route named `blaktail0`; no VPC address or SSM
+session substituted for it. After the Amazon Linux instance stop/start, its
+mode-`0600` state and systemd service resumed, and the complete bidirectional proof
+passed again.
+
+No password, cookie, enrolment code, join-key value, node private key, SSH private
+key, or cloud secret appears in these screenshots or the collected evidence.
+
+## Validation
+
+Passed locally after the run:
+
+- Terraform formatting and validation for `deploy/aws/e2e`.
+- POSIX shell parsing, ShellCheck warning level, fail-closed static tests, and
+  actionlint.
+- Rust formatting, workspace clippy with warnings denied, and 55 tests across nine
+  suites.
+- Console lint, typecheck, and production build. Lint retained two pre-existing
+  warnings in the desktop auth page and no errors.
+
+The local machine had only Apple Command Line Tools, so it could not import
+`XCTest`; the repository's macOS job remains the authoritative Swift test gate.
+
+## Teardown evidence
+
+Guarded destroy used the exact account, region, run ID, Terraform state, and
+confirmation token. An expired short-lived provider token interrupted the first
+wait after RDS deletion had started; the resumable destroy context then completed
+the remaining state safely. Final checks found:
+
+- empty Terraform state;
+- zero live run VPCs, EC2 instances, ECS clusters or active task definitions, RDS
+  instances, EFS file systems, load balancers, API Gateway APIs, ECR repositories,
+  S3 buckets, Secrets Manager secrets, CloudWatch log groups, or IAM roles;
+- all nine inactive ECS task-definition revisions explicitly queued for deletion;
+- no active object among the RunId-tagged inventory.
+
+AWS's Resource Groups Tagging API still returned 23 historical records at the last
+check: four terminated EC2 instances, six stopped ECS tasks, nine task definitions
+queued for deletion, three inactive ECS services, and one inactive cluster. Their
+service APIs reported only terminated, stopped, inactive, or deletion-queued state;
+AWS returned no exact purge timestamp. Strict zero-tag-history acceptance therefore
+remains pending even though no live or billable run infrastructure remained.
+
+## Work still open in #34
+
+This run did not prove a published release artifact, forced relay packet flow and
+metric delta, direct-path restoration, Ubuntu reboot persistence, stopping SSM
+during SSH, coordinator/console restart persistence, code reuse/outsider cases,
+revocation, or browser re-enrolment. Coordinator SQLite-on-EFS and generated secrets
+inside protected local Terraform state are smoke-only boundaries. Public signup and
+the unauthenticated coordinator organisation-bootstrap endpoint also need
+production hardening. Cost Explorer data was not yet available. These gaps keep
+#34 open.

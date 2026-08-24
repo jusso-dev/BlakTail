@@ -18,6 +18,10 @@ case "$public_url" in
 esac
 instance_json=$(tf_output_json agent_instance_ids)
 started_tmp=$(mktemp "$WORK_DIR/enrolment-started.XXXXXX")
+cleanup_started() {
+  rm -f -- "$started_tmp"
+}
+trap cleanup_started EXIT HUP INT TERM
 printf '{' >"$started_tmp"
 separator=
 
@@ -30,9 +34,14 @@ NODE_NAME=$node_name
 UNIT_NAME=$unit_name
 set -eu
 [ ! -e /var/lib/blaktail/state.json ] || { echo 'existing enrollment refused' >&2; exit 1; }
+if systemctl show \$UNIT_NAME --property=ActiveState --value 2>/dev/null | \
+  grep -Eq '^(active|activating)$'; then
+  printf 'browser enrollment already active: %s\\n' \$NODE_NAME
+  exit 0
+fi
 log=/var/log/blaktail-enrolment.log
 install -m 0600 /dev/null \"\$log\"
-systemd-run --quiet --collect --unit=\"\$UNIT_NAME\" --property=Type=oneshot \\
+systemd-run --quiet --collect --no-block --unit=\"\$UNIT_NAME\" --property=Type=oneshot \\
   /bin/sh -c 'exec >>\"\$1\" 2>&1; /usr/local/bin/blaktaild up --coord \"\$2\" --name \"\$3\" --exit-after-join && systemctl enable --now blaktaild' \\
   sh \"\$log\" \"\$PUBLIC_URL\" \"\$NODE_NAME\"
 printf 'browser enrollment started: %s\\n' \"\$NODE_NAME\""
@@ -43,5 +52,5 @@ printf 'browser enrollment started: %s\\n' \"\$NODE_NAME\""
 done
 printf '}\n' >>"$started_tmp"
 mv "$started_tmp" "$WORK_DIR/enrolment-started.json"
+trap - EXIT HUP INT TERM
 printf '%s\n' 'Browser enrollment started. Use ssm-show-enrolment.sh locally; approval remains manual.'
-

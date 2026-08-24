@@ -4,7 +4,7 @@ SCRIPT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/common.sh"
 
 validate_base_inputs
-for command_name in aws jq terraform; do
+for command_name in aws awk grep jq terraform tr; do
   require_command "$command_name"
 done
 assert_aws_identity
@@ -57,8 +57,13 @@ make_key() {
   ssm_send_script "$key_instance_id" "Create ephemeral BlakTail E2E SSH proof key $RUN_ID" \
     "install -d -m 0700 /var/lib/blaktail-e2e; test -f /var/lib/blaktail-e2e/id_ed25519 || ssh-keygen -q -t ed25519 -N '' -f /var/lib/blaktail-e2e/id_ed25519; cat /var/lib/blaktail-e2e/id_ed25519.pub"
   wait_ssm_command "$SSM_COMMAND_ID" "$key_instance_id"
-  PROOF_PUBLIC_KEY=$(ssm_command_output "$SSM_COMMAND_ID" "$key_instance_id" | tail -n 1)
-  case "$PROOF_PUBLIC_KEY" in ssh-ed25519\ *) ;; *) die "invalid SSH proof public key" ;; esac
+  PROOF_PUBLIC_KEY=$(ssm_command_output "$SSM_COMMAND_ID" "$key_instance_id" | \
+    tr -d '\r' | awk '/^ssh-ed25519 / { key = $0 } END { print key }')
+  case "$PROOF_PUBLIC_KEY" in
+    *"'"*) die "invalid SSH proof public key" ;;
+    ssh-ed25519\ *) ;;
+    *) die "invalid SSH proof public key" ;;
+  esac
 }
 
 install_key() {

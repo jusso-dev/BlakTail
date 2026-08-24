@@ -80,6 +80,26 @@ The Compose/AWS files are deployment inputs, not evidence of a running productio
 service. Verify TLS, health, metrics, storage, backups, privacy contact/retention,
 and an enrolled node on the actual destination.
 
+### Verified AWS smoke run
+
+Disposable run `20260823t120928z` deployed the console, coordinator, and relay as
+ARM64 Fargate services in Sydney, then used a real Better Auth owner session to
+browser-approve Ubuntu and Amazon Linux agents on private EC2 instances. Both
+agents passed bidirectional IPv4, IPv6, MagicDNS, overlay-route, and SSH checks over
+`blaktail0`; the Amazon Linux agent also recovered after a stop/start without
+re-enrolment. All live run resources were then destroyed.
+
+![BlakTail sign-in served by the disposable AWS stack](docs/images/aws-e2e/sign-in.png)
+
+![Two browser-enrolled private agents active in the BlakTail console](docs/images/aws-e2e/devices.png)
+
+![Sydney coordinator health shown in the BlakTail console](docs/images/aws-e2e/status.png)
+
+See the [redacted run report](docs/e2e/aws-fargate-run.md) and
+[#34](https://github.com/jusso-dev/BlakTail/issues/34). This was a current-commit
+smoke run, not release proof: forced relay traffic, revocation/re-enrolment, all
+restart cases, and a published agent package remain open acceptance work.
+
 ## Stack (locked for first cut)
 
 - Rust workspace: `blaktaild` (node agent), `blaktail-coord`, `blaktail-relay`
