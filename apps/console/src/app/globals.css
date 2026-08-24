@@ -261,6 +261,23 @@ h2 {
   min-width: 10rem;
 }
 
+.device-name-editor,
+.device-name-readonly {
+  display: grid;
+  gap: 0.4rem;
+  min-width: 12rem;
+}
+
+.device-name-editor label > span,
+.device-technical-name {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.device-name-editor button {
+  justify-self: start;
+}
+
 .route-option {
   grid-template-columns: auto 1fr;
   align-items: center;

@@ -8,6 +8,7 @@ import {
   mintJoinKey,
   putAcl,
   revokeNode,
+  updateNodeFriendlyName,
   type DeviceTag,
 } from "@/lib/coord";
 import { canMutateTailnet, requireConsoleContext } from "@/lib/session";
@@ -94,6 +95,39 @@ export async function revokeDeviceAction(
     return {
       ok: false,
       error: error instanceof Error ? error.message : "Could not revoke device.",
+    };
+  }
+}
+
+export async function updateDeviceFriendlyNameAction(
+  formData: FormData,
+): Promise<ActionResult<{ friendlyName: string | null }>> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (!canMutateTailnet(ctx.role)) {
+      return { ok: false, error: "Only owners and admins can rename devices." };
+    }
+    const nodeId = String(formData.get("nodeId") ?? "");
+    if (!nodeId) {
+      return { ok: false, error: "Choose a device to rename." };
+    }
+    const friendlyName = String(formData.get("friendlyName") ?? "").trim();
+    if ([...friendlyName].length > 64) {
+      return {
+        ok: false,
+        error: "Friendly names must be 64 characters or fewer.",
+      };
+    }
+    await updateNodeFriendlyName(ctx, nodeId, friendlyName);
+    revalidatePath("/devices");
+    return {
+      ok: true,
+      data: { friendlyName: friendlyName || null },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Could not rename device.",
     };
   }
 }

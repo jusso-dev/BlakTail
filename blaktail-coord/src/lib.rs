@@ -28,13 +28,14 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+const CURRENT_SCHEMA_VERSION: i64 = 2;
 const DEFAULT_NODE_KEY_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_NODE_KEY_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_NODE_KEY_TTL_SECS: i64 = 365 * 24 * 60 * 60;
 const DEVICE_AUTH_TTL_SECS: i64 = 10 * 60;
 const DEVICE_AUTH_POLL_SECS: u64 = 2;
 const MAX_PENDING_DEVICE_AUTHS: i64 = 1_000;
+const MAX_FRIENDLY_NAME_CHARS: usize = 64;
 const DEFAULT_CONSOLE_URL: &str = "https://console.invalid";
 #[derive(Clone)]
 pub struct Store(Arc<Mutex<Connection>>);
@@ -57,11 +58,18 @@ struct Migration {
     apply: fn(&Connection) -> Result<(), rusqlite::Error>,
 }
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "consolidated SQLite baseline",
-    apply: migrate_to_v1,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "consolidated SQLite baseline",
+        apply: migrate_to_v1,
+    },
+    Migration {
+        version: 2,
+        name: "friendly device names",
+        apply: migrate_to_v2,
+    },
+];
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -169,6 +177,10 @@ fn migrate_to_v1(db: &Connection) -> Result<(), rusqlite::Error> {
         "CREATE UNIQUE INDEX IF NOT EXISTS nodes_dns_name_org_idx ON nodes(org_id,dns_name) WHERE dns_name<>''",
     )?;
     Ok(())
+}
+
+fn migrate_to_v2(db: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(db, "nodes", "display_name", "TEXT")
 }
 
 fn normalise_dns_names(db: &Connection) -> Result<(), rusqlite::Error> {
@@ -357,6 +369,10 @@ pub fn app_with_relays_console_and_metrics(
         )
         .route("/v1/orgs/:org_id/nodes", get(list_nodes))
         .route("/v1/orgs/:org_id/nodes/:node_id", delete(admin_revoke_node))
+        .route(
+            "/v1/orgs/:org_id/nodes/:node_id/friendly-name",
+            put(update_node_friendly_name),
+        )
         .route(
             "/v1/orgs/:org_id/nodes/:node_id/routes",
             put(approve_node_routes),
@@ -1702,6 +1718,7 @@ async fn revoke_node(
 struct NodeRow {
     id: Uuid,
     name: String,
+    display_name: Option<String>,
     wg_public_key: String,
     endpoint: Option<String>,
     allowed_ips: Vec<String>,
@@ -1726,7 +1743,7 @@ async fn list_nodes(
     console_session(&s, &headers, org_id)?;
     let db = s.store.0.lock().unwrap();
     let mut query = db.prepare(
-        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,credential_expires_at,credential_expires_at<=?2,credential_expires_at<=?3,revoked_at IS NOT NULL,advertised_routes_json,approved_routes_json FROM nodes WHERE org_id=?1 ORDER BY name",
+        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,created_at,credential_expires_at,credential_expires_at<=?2,credential_expires_at<=?3,revoked_at IS NOT NULL,advertised_routes_json,approved_routes_json,display_name FROM nodes WHERE org_id=?1 ORDER BY COALESCE(NULLIF(TRIM(display_name),''),name) COLLATE NOCASE,name",
     )?;
     let rows = query
         .query_map(
@@ -1736,6 +1753,7 @@ async fn list_nodes(
                 Ok(NodeRow {
                     id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap(),
                     name: r.get(1)?,
+                    display_name: r.get(16)?,
                     wg_public_key: r.get(2)?,
                     endpoint: r.get(3)?,
                     allowed_ips: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
@@ -1757,6 +1775,76 @@ async fn list_nodes(
         )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(rows))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FriendlyNameUpdate {
+    friendly_name: String,
+}
+
+fn normalise_friendly_name(value: &str) -> Result<Option<String>, ApiError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if value.chars().count() > MAX_FRIENDLY_NAME_CHARS {
+        return Err(ApiError::BadRequest(format!(
+            "friendly_name must be at most {MAX_FRIENDLY_NAME_CHARS} characters"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "friendly_name cannot contain control characters".into(),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+async fn update_node_friendly_name(
+    State(s): State<AppState>,
+    UrlPath((org_id, node_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(input): Json<FriendlyNameUpdate>,
+) -> Result<StatusCode, ApiError> {
+    let session = console_session(&s, &headers, org_id)?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    let friendly_name = normalise_friendly_name(&input.friendly_name)?;
+    let mut db = s.store.0.lock().unwrap();
+    let tx = db.transaction()?;
+    let current: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT name,display_name FROM nodes WHERE id=?1 AND org_id=?2 AND revoked_at IS NULL",
+            params![node_id.to_string(), org_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (technical_name, previous_friendly_name) = current.ok_or(ApiError::NotFound)?;
+    if previous_friendly_name == friendly_name {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    tx.execute(
+        "UPDATE nodes SET display_name=?1 WHERE id=?2 AND org_id=?3",
+        params![friendly_name, node_id.to_string(), org_id.to_string()],
+    )?;
+    append_audit(
+        &tx,
+        org_id,
+        &session,
+        "node.friendly_name_updated",
+        "node",
+        Some(&node_id.to_string()),
+        &serde_json::json!({
+            "friendly_name": friendly_name,
+            "previous_friendly_name": previous_friendly_name,
+            "technical_name": technical_name,
+        }),
+    )?;
+    tx.commit()?;
+    info!(%node_id, %org_id, "node friendly name updated");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn admin_revoke_node(
@@ -2458,6 +2546,156 @@ mod tests {
         assert!(metrics_text
             .contains("blaktail_coord_requests_total{operation=\"revoke\",result=\"success\"} 1"));
         assert!(metrics_text.contains("blaktail_coord_active_nodes 0"));
+    }
+
+    #[tokio::test]
+    async fn friendly_names_are_admin_scoped_audited_and_do_not_change_network_identity() {
+        let store = Store::memory().unwrap();
+        let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org: OrgResponse = body(
+            call(
+                &router,
+                Method::POST,
+                "/v1/orgs",
+                serde_json::json!({"name":"friendly-name-org"}),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let admin = signed_session(org.id, "admin-1", Role::Admin, now() + 60);
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let node =
+            register_test_node(&router, org.id, &owner, "field-tablet-01", "key-1", &[]).await;
+        let path = format!("/v1/orgs/{}/nodes/{}/friendly-name", org.id, node.id);
+
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &path,
+                serde_json::json!({"friendly_name":"Ranger Mary's tablet"}),
+                Some(&member),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &path,
+                serde_json::json!({"friendly_name":"x".repeat(MAX_FRIENDLY_NAME_CHARS + 1)}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &path,
+                serde_json::json!({"friendly_name":"line\nbreak"}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &path,
+                serde_json::json!({"friendly_name":"  Ranger Mary's tablet  "}),
+                Some(&admin),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &path,
+                serde_json::json!({"friendly_name":"Ranger Mary's tablet"}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let renamed: Vec<NodeRow> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(renamed[0].name, "field-tablet-01");
+        assert_eq!(
+            renamed[0].display_name.as_deref(),
+            Some("Ranger Mary's tablet")
+        );
+        assert_eq!(renamed[0].dns_name, node.dns_name);
+
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &path,
+                serde_json::json!({"friendly_name":""}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let cleared: Vec<NodeRow> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(cleared[0].display_name, None);
+
+        let audit: Vec<AuditEvent> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/audit", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let name_updates = audit
+            .iter()
+            .filter(|event| event.action == "node.friendly_name_updated")
+            .collect::<Vec<_>>();
+        assert_eq!(name_updates.len(), 2);
+        assert!(name_updates
+            .iter()
+            .any(|event| event.details["friendly_name"] == serde_json::Value::Null));
+        assert!(name_updates
+            .iter()
+            .any(|event| event.details["friendly_name"] == "Ranger Mary's tablet"));
     }
 
     #[tokio::test]
@@ -3864,6 +4102,17 @@ mod tests {
             .unwrap();
         assert_eq!(ttl, DEFAULT_NODE_KEY_TTL_SECS);
         assert_eq!(expires, created_at + DEFAULT_NODE_KEY_TTL_SECS);
+        let display_name: Option<String> = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT display_name FROM nodes WHERE id='node'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(display_name, None);
         let dns_names = {
             let db = store.0.lock().unwrap();
             let mut query = db

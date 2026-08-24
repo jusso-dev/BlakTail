@@ -53,6 +53,7 @@ Audited actions are:
 - `device_authorization.approved`
 - `node.routes_updated`
 - `node.revoked` (console administration)
+- `node.friendly_name_updated`
 - `acl.updated`
 - `security.updated`
 

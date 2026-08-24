@@ -7,6 +7,7 @@ export type DeviceTag = "office" | "ranger" | "store";
 export type CoordNode = {
   id: string;
   name: string;
+  display_name: string | null;
   wg_public_key: string;
   endpoint: string | null;
   allowed_ips: string[];
@@ -135,6 +136,27 @@ export async function revokeNode(
     method: "DELETE",
     sessionToken: ctx.coordAssertion,
   });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+}
+
+export async function updateNodeFriendlyName(
+  ctx: ConsoleContext,
+  nodeId: string,
+  friendlyName: string,
+): Promise<void> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot rename devices.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/nodes/${nodeId}/friendly-name`,
+    {
+      method: "PUT",
+      sessionToken: ctx.coordAssertion,
+      body: JSON.stringify({ friendly_name: friendlyName }),
+    },
+  );
   if (!res.ok) {
     throw new Error(await readError(res));
   }

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   approveNodeRoutesAction,
   revokeDeviceAction,
+  updateDeviceFriendlyNameAction,
 } from "@/app/actions";
 import type { CoordNode } from "@/lib/coord";
 
@@ -32,10 +33,11 @@ export function DeviceActions({
 
   return (
     <div className="stack">
-      <table className="table">
+      <div className="table-wrap">
+        <table className="table">
         <thead>
           <tr>
-            <th>Name</th>
+            <th>Device</th>
             <th>DNS</th>
             <th>Addresses</th>
             <th>Advertised routes</th>
@@ -48,7 +50,64 @@ export function DeviceActions({
         <tbody>
           {nodes.map((node) => (
             <tr key={node.id}>
-              <td>{node.name}</td>
+              <td>
+                {canMutate && !node.revoked ? (
+                  <form
+                    className="device-name-editor"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      const formData = new FormData(event.currentTarget);
+                      setMessage(null);
+                      startTransition(async () => {
+                        const result =
+                          await updateDeviceFriendlyNameAction(formData);
+                        setMessage({
+                          text: result.ok
+                            ? result.data.friendlyName
+                              ? `${node.name} is now shown as ${result.data.friendlyName}.`
+                              : `${node.name} now uses its original name.`
+                            : result.error,
+                          error: !result.ok,
+                        });
+                        if (result.ok) router.refresh();
+                      });
+                    }}
+                  >
+                    <input type="hidden" name="nodeId" value={node.id} />
+                    <label>
+                      <span>Friendly name</span>
+                      <input
+                        name="friendlyName"
+                        type="text"
+                        maxLength={64}
+                        defaultValue={node.display_name ?? ""}
+                        placeholder={node.name}
+                        aria-label={`Friendly name for ${node.name}`}
+                        disabled={pending}
+                      />
+                    </label>
+                    <button
+                      type="submit"
+                      className="secondary"
+                      disabled={pending}
+                    >
+                      Save name
+                    </button>
+                    <span className="device-technical-name mono">
+                      Agent: {node.name}
+                    </span>
+                  </form>
+                ) : (
+                  <div className="device-name-readonly">
+                    <strong>{node.display_name || node.name}</strong>
+                    {node.display_name ? (
+                      <span className="device-technical-name mono">
+                        Agent: {node.name}
+                      </span>
+                    ) : null}
+                  </div>
+                )}
+              </td>
               <td className="mono">{node.dns_name || "—"}</td>
               <td className="mono">{node.allowed_ips.join(", ") || "—"}</td>
               <td>
@@ -65,7 +124,7 @@ export function DeviceActions({
                         const result = await approveNodeRoutesAction(formData);
                         setMessage({
                           text: result.ok
-                            ? `${node.name} route approvals saved.`
+                            ? `${node.display_name || node.name} route approvals saved.`
                             : result.error,
                           error: !result.ok,
                         });
@@ -150,7 +209,9 @@ export function DeviceActions({
                       startTransition(async () => {
                         const result = await revokeDeviceAction(formData);
                         setMessage({
-                          text: result.ok ? `${node.name} revoked.` : result.error,
+                          text: result.ok
+                            ? `${node.display_name || node.name} revoked.`
+                            : result.error,
                           error: !result.ok,
                         });
                         if (result.ok) router.refresh();
@@ -164,9 +225,16 @@ export function DeviceActions({
             </tr>
           ))}
         </tbody>
-      </table>
+        </table>
+      </div>
       {message ? (
-        <p className={message.error ? "error" : "muted"}>{message.text}</p>
+        <p
+          className={message.error ? "error" : "muted"}
+          role={message.error ? "alert" : "status"}
+          aria-live="polite"
+        >
+          {message.text}
+        </p>
       ) : null}
     </div>
   );

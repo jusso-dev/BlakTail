@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS device_authorizations (
 );
 CREATE TABLE IF NOT EXISTS nodes (
  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
- name TEXT NOT NULL, wg_public_key TEXT NOT NULL,
+ name TEXT NOT NULL, display_name TEXT, wg_public_key TEXT NOT NULL,
  endpoint TEXT,
  allowed_ips_json TEXT NOT NULL CHECK (json_valid(allowed_ips_json)),
  token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, revoked_at TEXT,

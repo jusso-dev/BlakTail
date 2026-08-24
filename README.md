@@ -1,10 +1,43 @@
 # BlakTail
 
-Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.
+![BlakTail — secure, open and self-hosted private networking in Australia](docs/images/blaktail-banner.png)
 
-A WireGuard mesh VPN for Indigenous organisations. Same job as Tailscale: devices join a tailnet, talk peer to peer, fall back through a relay you run, resolve each other by name. The control plane and relays stay in Australia. The org holds the keys. The code is public.
+## A private path between your organisation's devices
 
-https://github.com/jusso-dev/BlakTail
+BlakTail is open, self-hosted private networking designed for Indigenous
+Australian organisations. It connects laptops, field devices, servers, and sites
+with encrypted WireGuard links while keeping control of identity, policy, keys,
+and operational data with the organisation.
+
+Built by Indigenous Australians for Indigenous Australian organisations. The
+project is designed for onshore operation, organisation control, and public-code
+transparency.
+
+The idea is closer to a **BlakPath** than a generic VPN: a trusted path between
+the people, devices, services, and places an organisation already manages. The
+repository, console, and binaries retain the **BlakTail** name during pre-release
+so operators have one consistent technical identity.
+
+### What that means in practice
+
+- **Your network:** each organisation has its own private address space, device
+  inventory, MagicDNS names, routes, and access rules.
+- **Your rules:** owners and admins approve enrolment, assign tags, give devices
+  friendly names, approve routes, audit changes, and revoke access.
+- **Your country:** the supplied cloud deployment is pinned to Sydney, and the
+  project documents which data and supporting systems must remain onshore.
+- **Your choice:** run it yourself, inspect the code, and move between supported
+  hosts without depending on a closed SaaS control plane.
+
+## How onboarding feels
+
+1. Run `blaktaild up` on a new Linux or macOS device.
+2. Open the short browser link it prints and sign in to the organisation portal.
+3. Check the requested device name and WireGuard-key fingerprint, then approve it.
+4. Give the device a clear friendly name such as “Community office iMac” or
+   “Ranger ute tablet”. The technical hostname and MagicDNS identity stay stable.
+5. Connect by private address or name. Direct UDP is preferred; the Australian
+   relay is the encrypted fallback.
 
 ## Project status
 
@@ -12,21 +45,25 @@ BlakTail is pre-release. There are no published agent tags or install artifacts 
 build from source until the release checklist in
 [docs/releases.md](docs/releases.md) has been completed on clean hosts.
 
-Direct candidates, an Australian relay fallback, and nonce-confirmed UDP hole
-punching are implemented and covered by local tests. The literal two-independent-NAT
-deployment proof is still pending in
+Browser onboarding, friendly device names, direct candidates, an Australian relay
+fallback, and nonce-confirmed UDP hole punching are implemented. The literal
+forced-relay proof across two independent NAT paths is still pending in
 [#24](https://github.com/jusso-dev/BlakTail/issues/24), so NAT traversal is not yet a
-production-verified claim. Dual-stack code is also awaiting its two-node IPv6-only
-deployment drill in [#32](https://github.com/jusso-dev/BlakTail/issues/32).
+production-verified claim. Dual-stack traffic passed on two private AWS agents, but
+the IPv6-only drill with each BlakTail IPv4 address removed remains open in
+[#32](https://github.com/jusso-dev/BlakTail/issues/32).
 
 “Onshore” is a deployment responsibility as well as a product rule. Included AWS
 infrastructure is pinned to Sydney and the relay rejects non-Australian cloud region
 identifiers; self-hosters must independently keep the console database, coordinator
 state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 
-## What v1 does
+## What works today
 
-- Org tailnet: approve devices, issue join keys, revoke a node
+- Browser-based device enrolment without copying a join key
+- Organisation device inventory with stable technical identity and editable,
+  audited friendly names
+- Join-key enrolment for automation, tags, route approval, ACLs, and revocation
 - Next.js 16.3 console: Drizzle ORM, Better Auth, talks to the Rust control plane for auth and ACLs
 - WireGuard agents for Linux and macOS; Windows is not implemented
 - A macOS desktop app that drives the local agent; Windows and Linux desktop apps
@@ -37,10 +74,12 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 - Dual-stack tailnets with an organisation ULA `/64` and one `/128` per node
 - Prometheus coordinator/relay metrics and an actor-attributed admin audit log
 
-## What v1 does not do
+## Current boundaries
 
 - No SaaS control plane outside Australia
 - No closed-source agent
+- No published release artifacts yet; source builds are the supported pre-release path
+- No Windows agent or Linux desktop tray yet
 - Not a file sync tool (that is BlakSync)
 - Not a clone of Tailscale's trademark or UI assets
 - No Go or Zig
@@ -128,10 +167,6 @@ Do not commit:
 - Live WireGuard configs (`wg*.conf`)
 
 `.gitignore` blocks the common filename patterns. CI runs gitleaks on every push, plus `cargo deny` against `deny.toml`. A throwaway branch that commits a dummy secret is required to fail that job (`scripts/ci/prove-gitleaks-detects-dummy.sh`). If a real secret lands in git, rotate it; deleting the file in a later commit does not erase the blob.
-
-## Tagline (do not rewrite)
-
-Made by indigenous Australians, for indigenous Australia's. Data remains onshore and in control of indigenous Australia orgs, code is public for full transparency.
 
 ## macOS desktop
 
