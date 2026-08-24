@@ -1,5 +1,82 @@
 # AWS Fargate smoke runs — 23–24 August 2026
 
+## Operator configuration and portal rerun — `20260824i41a`
+
+Run `20260824i41a` exercised the schema-v1 configuration, hardened container, and
+browser onboarding boundaries in [#41](https://github.com/jusso-dev/BlakTail/issues/41).
+Credential-free evidence was sealed at `2026-08-24T08:57:44Z` from commit
+`1cc043e5459029b5634d9842387d39c604a921f7`. Guarded teardown then destroyed 97
+resources and returned zero exact scoped residue.
+
+```text
+region: ap-southeast-2
+offline_and_startup_config_validation: passed
+redacted_effective_config: passed
+explicit_coord_and_console_migrations: passed
+public_signup: HTTP 400 EMAIL_PASSWORD_SIGN_UP_DISABLED
+owner_login: HTTP 200
+browser_device_approval: passed
+friendly_device_names: passed
+private_agent_enrollment: passed
+bidirectional_ipv4_ipv6: passed
+magicdns_overlay_routes_ssh: passed
+teardown: 97 destroyed, scoped_residue=0
+```
+
+The coordinator migration log recorded schema version 4 and the console migration
+recorded `configuration valid: schema 1, service console` before touching Postgres.
+Its effective-source map distinguished defaults from environment overrides and
+replaced authentication, database, diagnostics, relay, and TLS values with explicit
+redaction markers. The collected evidence passed the harness credential scanner.
+
+The first console migration attempt exposed a real hardening defect: Fargate mounted
+the anonymous `/tmp` volume as root-owned, so the non-root console process could not
+create `/tmp/tsx-999`. Commit `1cc043e` added a nonessential, one-shot initializer
+that changes ownership only on `/tmp` and `/app/.next/cache`; the application
+container remained non-root with a read-only root filesystem. The second explicit
+migration and normal service startup passed. This failure remains in the redacted
+run log so the report shows the defect and repair instead of hiding the first attempt.
+
+The portal signed in through Better Auth, approved both short-lived device requests,
+and displayed two active private nodes. It then saved `Sydney Ubuntu Agent` and
+`Sydney AL2023 Agent` as friendly names while retaining each agent hostname and
+MagicDNS identity. Neither enrollment URL nor device code was stored in public
+evidence.
+
+![Current-run sign-in before credentials were entered](../images/aws-e2e/sign-in-20260824i41a.png)
+
+![Current-run agents with editable friendly names](../images/aws-e2e/devices-20260824i41a.png)
+
+The immutable image digests were:
+
+```text
+console:     sha256:2bf629648e8620cf7b66eee4751cb241398e1309b3fe07013cb8320e54131c7f
+coordinator: sha256:994d05c9fd0e8a40ed50c89d8fef40a768b71f1b9e0b206cb64ceaf3533e7a50
+relay:       sha256:e31f148884d6decbc121608e3601408d702f42ace194a48d20c88bb5f3d4cd27
+TLS bridge:  sha256:3214e863db4bb6c0a547faf290d782e547752f6c7aa3039ae433f1977d00a073
+```
+
+The ARM64 package checksums were:
+
+```text
+RPM: a0a7ccaabf87e8ddb18d7760d3de3b98f98a06acc2f486644ce4fdb44068f4f7
+DEB: db051e3e6d9554ddaeb864666b2dd56c27583ca2b60826cadf0a092fb3ce8eb4
+```
+
+Both agent EC2 instances had no public IP and no inbound SSH rule. SSM installed
+the commit-built packages, but acceptance traffic and remote login used their
+BlakTail addresses and MagicDNS names. The proof required IPv4, IPv6, DNS,
+`blaktail0` route ownership, relay configuration, and SSH markers in both directions.
+
+The managed Chrome-control bridge was unavailable because its privileged runtime
+rejected the bundled client's `node:process` import. A clean, temporary local Chrome
+profile with Puppeteer Core rendered the same live portal instead. It read the owner
+password and enrollment URLs only from mode-protected run files, never printed them,
+captured the sign-in page before typing credentials, and removed its profile and
+runtime after the screenshots were reviewed. The guarded destroy removed the owner
+password, enrollment URLs, Terraform state and backup, and destroy context; its
+post-destroy AWS inventory reported `scoped_residue=0`.
+
 ## Hardened first-owner rerun — `20260824i35a`
 
 Run `20260824i35a` exercised the supported [#35](https://github.com/jusso-dev/BlakTail/issues/35)

@@ -140,28 +140,31 @@ and an enrolled node on the actual destination.
 
 ### Verified AWS smoke run
 
-Hardened rerun `20260824i35a` deployed immutable ARM64 console, coordinator, and
-relay images in Sydney. The supported one-shot ceremony created and locked exactly
-one owner; live HTTP proof then rejected public signup with
-`EMAIL_PASSWORD_SIGN_UP_DISABLED`, signed that owner in, and loaded the authenticated
-Devices page. Private Ubuntu and Amazon Linux agents passed bidirectional IPv4,
-IPv6, MagicDNS, overlay-route, and SSH checks over `blaktail0`. Terraform destroyed
-all 95 resources, the residue guard returned zero, and local cookies, enrollment
-URLs, passwords, and Terraform state backups were removed.
+Hardened rerun `20260824i41a` deployed immutable ARM64 console, coordinator, and
+relay images in Sydney from commit `1cc043e`. Configuration schema v1 validated and
+printed only redacted effective values before the explicit coordinator and console
+migrations. The run found a real non-root Fargate defect in the console migration's
+anonymous `/tmp` volume, added a narrow one-shot volume initializer, rebuilt the task
+definition, and then passed migration and startup with a read-only root filesystem.
 
-The screenshots below are visual evidence from earlier disposable browser run
-`20260823t120928z`, not screenshots from the hardened rerun. Current-run screenshot
-capture failed before browser control began because the managed Chrome runtime could
-not import `node:process`; the run report records that gap instead of relabelling old
-images as new evidence.
+The supported first-owner ceremony locked after one owner. Live HTTP checks rejected
+public signup, signed that owner in, and loaded the authenticated Devices page. The
+portal approved private Ubuntu and Amazon Linux agents, renamed them to friendly
+operator-facing names, and retained their stable technical identities. Both nodes
+then passed bidirectional IPv4, IPv6, MagicDNS, overlay-route, and SSH checks over
+`blaktail0`. Terraform destroyed all 97 resources; the scoped residue check returned
+zero and removed local passwords, enrollment URLs, cookies, and Terraform state.
 
-![BlakTail sign-in served by the disposable AWS stack](docs/images/aws-e2e/sign-in.png)
+These screenshots are from that exact disposable run. The sign-in image was taken
+before credentials were entered; the device image contains no enrollment code,
+WireGuard fingerprint, cookie, key, or cloud secret.
 
-![Two browser-enrolled private agents active in the BlakTail console](docs/images/aws-e2e/devices.png)
+![BlakTail sign-in served by AWS run 20260824i41a](docs/images/aws-e2e/sign-in-20260824i41a.png)
 
-![Historical coordinator status screenshot; current builds expose status only](docs/images/aws-e2e/status.png)
+![Two private agents with editable friendly names in AWS run 20260824i41a](docs/images/aws-e2e/devices-20260824i41a.png)
 
 See the [redacted run report](docs/e2e/aws-fargate-run.md),
+[#41](https://github.com/jusso-dev/BlakTail/issues/41),
 [#35](https://github.com/jusso-dev/BlakTail/issues/35), and
 [#34](https://github.com/jusso-dev/BlakTail/issues/34). These are current-commit
 smoke proofs, not release proof: forced relay traffic, revocation/re-enrolment, all
