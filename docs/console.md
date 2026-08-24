@@ -65,7 +65,10 @@ are rejected. Admins and members cannot create or revoke invitations.
 
 ## Multiple workspaces in one session
 
-One Better Auth user can hold memberships in many organisation workspaces. The
+This is a product invariant: a person's login identity and an organisation's
+network account are different records. One Better Auth user can hold memberships
+in many organisation workspaces, and membership in a second network never requires
+logging out of the first. The
 sidebar workspace selector persists an active workspace in an HTTP-only cookie;
 the cookie is only a preference, and every request rechecks the selected ID against
 the signed-in user's live memberships. Invalid or removed workspace selections

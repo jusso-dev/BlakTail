@@ -62,8 +62,8 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 ## What works today
 
 - Browser-based device enrolment without copying a join key
-- One login across multiple organisation workspaces, with an all-networks machine
-  inventory and instant workspace switching instead of logout/login churn
+- One session across multiple network accounts, with every machine in one
+  all-networks inventory and instant workspace switching—never logout/login churn
 - Stable device identity with editable, audited friendly names
 - Join-key enrolment for automation, tags, route approval, ACLs, and revocation
 - Bun 1.4-hosted Next.js 16.3 console: Bun SQL, Drizzle ORM, Better Auth, and
@@ -97,7 +97,8 @@ See [docs/console.md](docs/console.md).
 Fresh deployments use one explicit, time-limited first-owner ceremony from the
 console host. Public Better Auth sign-up is disabled at the HTTP endpoint. After
 bootstrap locks, owners add people with one-use, organisation-bound invitations.
-An existing account can join more workspaces without creating another login or
+BlakTail separates a person's identity from the network accounts they can access.
+An existing identity can join more workspaces without creating another login or
 ending its current session; lost sole-owner access requires an audited on-host recovery. See
 [First owner and invitations](docs/console.md#first-owner-and-invitations).
 
