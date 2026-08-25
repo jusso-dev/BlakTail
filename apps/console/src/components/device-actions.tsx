@@ -7,18 +7,13 @@ import {
   revokeDeviceAction,
   updateDeviceFriendlyNameAction,
 } from "@/app/actions";
-import type { CoordNode } from "@/lib/coord";
-
-export type InventoryNode = CoordNode & {
-  organisationId: string;
-  organisationName: string;
-  canMutate: boolean;
-};
+import type { NetworkNode } from "@/lib/coord";
+import { canMutateTailnet } from "@/lib/roles";
 
 export function DeviceActions({
   nodes,
 }: {
-  nodes: InventoryNode[];
+  nodes: NetworkNode[];
 }) {
   const router = useRouter();
   const [message, setMessage] = useState<{
@@ -41,8 +36,8 @@ export function DeviceActions({
         <table className="table">
         <thead>
           <tr>
+            <th>Network account</th>
             <th>Device</th>
-            <th>Network</th>
             <th>DNS</th>
             <th>Addresses</th>
             <th>Advertised routes</th>
@@ -54,9 +49,15 @@ export function DeviceActions({
         </thead>
         <tbody>
           {nodes.map((node) => (
-            <tr key={`${node.organisationId}:${node.id}`}>
+            <tr key={`${node.organisation_id}:${node.id}`}>
               <td>
-                {node.canMutate && !node.revoked ? (
+                <strong>{node.network_account_name}</strong>
+                <span className="device-technical-name">
+                  {node.organisation_name}
+                </span>
+              </td>
+              <td>
+                {canMutateTailnet(node.effective_role) && !node.revoked ? (
                   <form
                     className="device-name-editor"
                     onSubmit={(event) => {
@@ -82,7 +83,7 @@ export function DeviceActions({
                     <input
                       type="hidden"
                       name="organisationId"
-                      value={node.organisationId}
+                      value={node.organisation_id}
                     />
                     <label>
                       <span>Friendly name</span>
@@ -118,9 +119,6 @@ export function DeviceActions({
                   </div>
                 )}
               </td>
-              <td>
-                <strong>{node.organisationName}</strong>
-              </td>
               <td className="mono">{node.dns_name || "—"}</td>
               <td className="mono">{node.allowed_ips.join(", ") || "—"}</td>
               <td>
@@ -149,7 +147,7 @@ export function DeviceActions({
                     <input
                       type="hidden"
                       name="organisationId"
-                      value={node.organisationId}
+                      value={node.organisation_id}
                     />
                     {node.advertised_routes.map((route) => (
                       <label key={route} className="route-option mono">
@@ -159,7 +157,7 @@ export function DeviceActions({
                           value={route}
                           defaultChecked={node.approved_routes.includes(route)}
                           disabled={
-                            !node.canMutate ||
+                            !canMutateTailnet(node.effective_role) ||
                             pending ||
                             node.revoked ||
                             (node.expired &&
@@ -169,7 +167,7 @@ export function DeviceActions({
                         {route === "0.0.0.0/0" ? "Exit node" : route}
                       </label>
                     ))}
-                    {node.canMutate &&
+                    {canMutateTailnet(node.effective_role) &&
                     !node.revoked &&
                     (!node.expired || node.approved_routes.length > 0) ? (
                       <button
@@ -215,7 +213,7 @@ export function DeviceActions({
                 )}
               </td>
               <td>
-                {node.canMutate && !node.revoked ? (
+                {canMutateTailnet(node.effective_role) && !node.revoked ? (
                   <button
                     type="button"
                     className="secondary"
@@ -223,7 +221,7 @@ export function DeviceActions({
                     onClick={() => {
                       const formData = new FormData();
                       formData.set("nodeId", node.id);
-                      formData.set("organisationId", node.organisationId);
+                      formData.set("organisationId", node.organisation_id);
                       setMessage(null);
                       startTransition(async () => {
                         const result = await revokeDeviceAction(formData);

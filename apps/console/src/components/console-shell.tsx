@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { roleLabel } from "@/lib/roles";
-import type { ConsoleContext } from "@/lib/session";
+import type { ConsoleContext, PersonSessionContext } from "@/lib/session";
 import { OrganisationSwitcher } from "./organisation-switcher";
 
 const links = [
@@ -17,10 +17,18 @@ export function ConsoleShell({
   current,
   children,
 }: {
-  ctx: ConsoleContext;
+  ctx: ConsoleContext | PersonSessionContext;
   current: (typeof links)[number]["href"];
   children: React.ReactNode;
 }) {
+  const selectedId =
+    "organisationId" in ctx
+      ? ctx.organisationId
+      : ctx.organisations[0]?.organisationId;
+  const selected = ctx.organisations.find(
+    (organisation) => organisation.organisationId === selectedId,
+  );
+
   return (
     <div className="shell">
       <aside className="nav">
@@ -29,7 +37,7 @@ export function ConsoleShell({
         </Link>
         <OrganisationSwitcher
           organisations={ctx.organisations}
-          activeOrganisationId={ctx.organisationId}
+          activeOrganisationId={selectedId ?? ctx.organisations[0]!.organisationId}
         />
         <nav aria-label="Console">
           {links.map((link) => (
@@ -44,7 +52,8 @@ export function ConsoleShell({
         </nav>
         <div className="muted">
           <div>
-            {ctx.name} · {roleLabel(ctx.role)}
+            {ctx.name}
+            {selected ? ` · ${roleLabel(selected.role)}` : ""}
           </div>
           <div>
             <Link href="/privacy">Privacy and data handling</Link>

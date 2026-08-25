@@ -3,6 +3,7 @@ import {
   bigint,
   boolean,
   check,
+  index,
   integer,
   jsonb,
   pgTable,
@@ -17,7 +18,7 @@ export const user = pgTable("user", {
   email: text("email").notNull().unique(),
   emailVerified: boolean("email_verified").notNull().default(false),
   image: text("image"),
-    createdAt: timestamp("created_at").notNull().defaultNow(),
+  createdAt: timestamp("created_at").notNull().defaultNow(),
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
@@ -29,9 +30,9 @@ export const session = pgTable("session", {
   updatedAt: timestamp("updated_at").notNull().defaultNow(),
   ipAddress: text("ip_address"),
   userAgent: text("user_agent"),
-    userId: text("user_id")
-      .notNull()
-      .references(() => user.id, { onDelete: "cascade" }),
+  userId: text("user_id")
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
 });
 
 export const account = pgTable(
@@ -91,6 +92,51 @@ export const organisation = pgTable("organisation", {
   createdAt: timestamp("created_at").notNull().defaultNow(),
 });
 
+/** A human principal. Better Auth users remain immutable login identities. */
+export const person = pgTable("person", {
+  id: text("id").primaryKey(),
+  displayName: text("display_name").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
+/** The live link graph from a person to independently authenticated identities. */
+export const personLoginIdentity = pgTable(
+  "person_login_identity",
+  {
+    id: text("id").primaryKey(),
+    personId: text("person_id")
+      .notNull()
+      .references(() => person.id, { onDelete: "cascade" }),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    status: text("status")
+      .notNull()
+      .$type<"active" | "suspended">()
+      .default("active"),
+    linkedAt: timestamp("linked_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    suspendedAt: timestamp("suspended_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("person_login_identity_user_unique").on(table.userId),
+    index("person_login_identity_person_status_idx").on(
+      table.personId,
+      table.status,
+    ),
+    check(
+      "person_login_identity_status_check",
+      sql.raw("\"status\" in ('active', 'suspended')"),
+    ),
+  ],
+);
+
 export const membership = pgTable(
   "membership",
   {
@@ -112,6 +158,161 @@ export const membership = pgTable(
     check(
       "membership_role_check",
       sql.raw("\"role\" in ('owner', 'admin', 'member')"),
+    ),
+  ],
+);
+
+/** A named network account backed by one identity's organisation membership. */
+export const networkAccount = pgTable(
+  "network_account",
+  {
+    id: text("id").primaryKey(),
+    membershipId: text("membership_id")
+      .notNull()
+      .references(() => membership.id, { onDelete: "cascade" }),
+    loginIdentityUserId: text("login_identity_user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    organisationId: text("organisation_id")
+      .notNull()
+      .references(() => organisation.id, { onDelete: "cascade" }),
+    name: text("name").notNull(),
+    status: text("status")
+      .notNull()
+      .$type<"active" | "revoked">()
+      .default("active"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("network_account_membership_unique").on(table.membershipId),
+    index("network_account_organisation_idx").on(table.organisationId),
+    index("network_account_identity_active_idx").on(
+      table.loginIdentityUserId,
+      table.status,
+    ),
+    check(
+      "network_account_status_check",
+      sql.raw("\"status\" in ('active', 'revoked')"),
+    ),
+  ],
+);
+
+export const identityLinkChallenge = pgTable(
+  "identity_link_challenge",
+  {
+    id: text("id").primaryKey(),
+    tokenHash: text("token_hash").notNull().unique(),
+    requesterPersonId: text("requester_person_id")
+      .notNull()
+      .references(() => person.id, { onDelete: "cascade" }),
+    requesterUserId: text("requester_user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    requesterSessionId: text("requester_session_id")
+      .notNull()
+      .references(() => session.id, { onDelete: "cascade" }),
+    targetUserId: text("target_user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    status: text("status")
+      .notNull()
+      .$type<
+        "pending" | "awaiting_owner" | "succeeded" | "rejected" | "expired"
+      >()
+      .default("pending"),
+    failureCode: text("failure_code"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    authenticatedAt: timestamp("authenticated_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("identity_link_challenge_open_person_unique")
+      .on(table.requesterPersonId)
+      .where(sql.raw("\"status\" in ('pending', 'awaiting_owner')")),
+    check(
+      "identity_link_challenge_status_check",
+      sql.raw(
+        "\"status\" in ('pending', 'awaiting_owner', 'succeeded', 'rejected', 'expired')",
+      ),
+    ),
+  ],
+);
+
+export const identityLinkConflict = pgTable(
+  "identity_link_conflict",
+  {
+    id: text("id").primaryKey(),
+    challengeId: text("challenge_id")
+      .notNull()
+      .references(() => identityLinkChallenge.id, { onDelete: "cascade" }),
+    organisationId: text("organisation_id")
+      .notNull()
+      .references(() => organisation.id, { onDelete: "cascade" }),
+    requesterRole: text("requester_role")
+      .notNull()
+      .$type<"owner" | "admin" | "member">(),
+    targetRole: text("target_role")
+      .notNull()
+      .$type<"owner" | "admin" | "member">(),
+    resolvedRole: text("resolved_role").$type<"owner" | "admin" | "member">(),
+    resolvedByUserId: text("resolved_by_user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("identity_link_conflict_challenge_org_unique").on(
+      table.challengeId,
+      table.organisationId,
+    ),
+    check(
+      "identity_link_conflict_roles_check",
+      sql.raw(
+        "\"requester_role\" in ('owner', 'admin', 'member') AND \"target_role\" in ('owner', 'admin', 'member') AND (\"resolved_role\" IS NULL OR \"resolved_role\" in ('owner', 'admin', 'member'))",
+      ),
+    ),
+  ],
+);
+
+/** Owner-approved effective role while the underlying memberships stay intact. */
+export const membershipRoleResolution = pgTable(
+  "membership_role_resolution",
+  {
+    id: text("id").primaryKey(),
+    personId: text("person_id")
+      .notNull()
+      .references(() => person.id, { onDelete: "cascade" }),
+    organisationId: text("organisation_id")
+      .notNull()
+      .references(() => organisation.id, { onDelete: "cascade" }),
+    effectiveRole: text("effective_role")
+      .notNull()
+      .$type<"owner" | "admin" | "member">(),
+    membershipSignature: text("membership_signature").notNull(),
+    resolvedByUserId: text("resolved_by_user_id").references(() => user.id, {
+      onDelete: "set null",
+    }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("membership_role_resolution_person_org_unique").on(
+      table.personId,
+      table.organisationId,
+    ),
+    check(
+      "membership_role_resolution_role_check",
+      sql.raw("\"effective_role\" in ('owner', 'admin', 'member')"),
     ),
   ],
 );

@@ -23,6 +23,11 @@ so operators have one consistent technical identity.
 
 - **Your network:** each organisation has its own private address space, device
   inventory, MagicDNS names, routes, and access rules.
+- **One live session:** one person can explicitly link independently
+  authenticated login identities and see every accessible network account in one
+  **All networks** machine view. Linking never copies provider credentials,
+  tokens, or MFA state, and reaching another network never requires
+  logout/login profile switching.
 - **Your rules:** owners and admins approve enrolment, assign tags, give devices
   friendly names, approve routes, audit changes, and revoke access.
 - **Your country:** the supplied cloud deployment is pinned to Sydney, and the
@@ -62,9 +67,9 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 ## What works today
 
 - Browser-based device enrolment without copying a join key
-- One session across multiple network accounts, with every machine in one
-  all-networks inventory and instant workspace switching, without logout/login churn
-- Stable device identity with editable, audited friendly names
+- One person, many explicitly linked network accounts, and one concurrent
+  all-machines inventory with a visible network name on every row
+- Stable technical device identity and editable, audited friendly names
 - Join-key enrolment for automation, tags, route approval, ACLs, and revocation
 - Bun 1.4-hosted Next.js 16.3 console: Bun SQL, Drizzle ORM, Better Auth, and
   the Rust control plane for auth and ACLs
@@ -102,6 +107,9 @@ BlakTail separates a person's identity from the network accounts they can access
 An existing identity can join more workspaces without creating another login or
 ending its current session; lost sole-owner access requires an audited on-host recovery. See
 [First owner and invitations](docs/console.md#first-owner-and-invitations).
+Login identities can then be linked only by freshly authenticating both the
+current and other identity. Organisation memberships, roles, ACLs, address spaces, keys, and audit
+histories remain separate.
 
 Metrics, audit coverage, and alert examples: [docs/observability.md](docs/observability.md).
 The public data-handling page is `/privacy`; operator duties and current retention

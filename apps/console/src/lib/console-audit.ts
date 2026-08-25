@@ -26,6 +26,13 @@ export async function listConsoleAuditEvents(
       result, target_type, target_id, details, created_at
     FROM console_audit_event
     WHERE organisation_id = ${ctx.organisationId}
+      OR (
+        organisation_id IS NULL
+        AND actor_user_id IN (
+          SELECT user_id FROM person_login_identity
+          WHERE person_id = ${ctx.personId}
+        )
+      )
     ORDER BY created_at DESC, id DESC
     LIMIT 100
   `;

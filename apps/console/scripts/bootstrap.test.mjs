@@ -19,6 +19,7 @@ const migrations = [
   "0001_auth_membership_constraints.sql",
   "0002_account_issuer.sql",
   "0003_secure_bootstrap.sql",
+  "0004_linked_identities.sql",
 ];
 
 async function resetThrough(sql, selectedMigrations) {
@@ -176,6 +177,9 @@ test(
         (SELECT count(*)::int FROM "user") AS users,
         (SELECT count(*)::int FROM account) AS accounts,
         (SELECT count(*)::int FROM organisation) AS organisations,
+        (SELECT count(*)::int FROM person) AS people,
+        (SELECT count(*)::int FROM person_login_identity) AS identities,
+        (SELECT count(*)::int FROM network_account) AS network_accounts,
         (SELECT count(*)::int FROM membership WHERE role = 'owner') AS owners
     `;
       assert.deepEqual(
@@ -183,9 +187,20 @@ test(
           users: counts.users,
           accounts: counts.accounts,
           organisations: counts.organisations,
+          people: counts.people,
+          identities: counts.identities,
+          networkAccounts: counts.network_accounts,
           owners: counts.owners,
         },
-        { users: 1, accounts: 1, organisations: 1, owners: 1 },
+        {
+          users: 1,
+          accounts: 1,
+          organisations: 1,
+          people: 1,
+          identities: 1,
+          networkAccounts: 1,
+          owners: 1,
+        },
       );
       const status = await bootstrapStatus(sql);
       assert.equal(status.status, "locked");
@@ -332,6 +347,30 @@ test(
       );
       const repairedStatus = await bootstrapStatus(sql);
       assert.equal(repairedStatus.status, "locked");
+
+      const linkedIdentityMigration = await readFile(
+        new URL("../drizzle/0004_linked_identities.sql", import.meta.url),
+        "utf8",
+      );
+      for (const statement of linkedIdentityMigration.split(
+        "--> statement-breakpoint",
+      )) {
+        if (statement.trim()) await sql.unsafe(statement);
+      }
+      const [linkedGraph] = await sql`
+        SELECT
+          (SELECT count(*)::int FROM person) AS people,
+          (SELECT count(*)::int FROM person_login_identity) AS identities,
+          (SELECT count(*)::int FROM network_account) AS network_accounts
+      `;
+      assert.deepEqual(
+        {
+          people: linkedGraph.people,
+          identities: linkedGraph.identities,
+          networkAccounts: linkedGraph.network_accounts,
+        },
+        { people: 1, identities: 1, networkAccounts: 1 },
+      );
     } finally {
       await sql.close({ timeout: 5 });
     }

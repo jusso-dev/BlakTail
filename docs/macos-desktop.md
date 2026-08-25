@@ -63,6 +63,11 @@ ID, organisation name, and mutation permission. Mutation requests must send that
 organisation ID in `X-BlakTail-Organisation`; the server resolves membership again
 and refuses cross-network or member-only changes.
 
+When a person links another login in the web console, the Mac app keeps the same
+Better Auth session and the next refresh includes the linked identity's network
+accounts and endpoints. The local Mac still has one active data-plane enrolment;
+the endpoint manager can inspect and administer every authorised network at once.
+
 ## Sign in and connect
 
 1. Set the onshore console URL in Settings (Australian-hosted HTTPS only).

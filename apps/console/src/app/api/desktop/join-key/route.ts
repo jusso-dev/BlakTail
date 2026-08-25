@@ -5,7 +5,10 @@ import {
   sessionFromBearer,
 } from "@/lib/desktop-auth";
 import { canMutateTailnet } from "@/lib/roles";
-import { activeOrganisationIdFromRequest } from "@/lib/session";
+import {
+  activeOrganisationIdFromRequest,
+  OrganisationAccessError,
+} from "@/lib/session";
 
 function isDeviceTag(value: string): value is DeviceTag {
   return value === "office" || value === "ranger" || value === "store";
@@ -17,9 +20,15 @@ export async function POST(request: Request) {
     if (!session) {
       return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
     }
+    const body = (await request.json().catch(() => ({}))) as {
+      organisationId?: string;
+      expiresInSeconds?: number;
+      singleUse?: boolean;
+      tags?: string[];
+    };
     const ctx = await requireConsoleContextFromSession(
       session,
-      activeOrganisationIdFromRequest(request),
+      activeOrganisationIdFromRequest(request) ?? body.organisationId,
     );
     if (!canMutateTailnet(ctx.role)) {
       return NextResponse.json(
@@ -27,12 +36,6 @@ export async function POST(request: Request) {
         { status: 403 },
       );
     }
-
-    const body = (await request.json().catch(() => ({}))) as {
-      expiresInSeconds?: number;
-      singleUse?: boolean;
-      tags?: string[];
-    };
     const tags = (body.tags ?? []).map(String).filter(isDeviceTag);
     const result = await mintJoinKey(ctx, {
       expiresInSeconds: body.expiresInSeconds ?? 600,
@@ -55,7 +58,12 @@ export async function POST(request: Request) {
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Could not mint join key.";
-    const status = message.toLowerCase().includes("unauthor") ? 401 : 400;
+    const status =
+      error instanceof OrganisationAccessError
+        ? 403
+        : message.toLowerCase().includes("unauthor")
+          ? 401
+          : 400;
     return NextResponse.json({ error: message }, { status });
   }
 }

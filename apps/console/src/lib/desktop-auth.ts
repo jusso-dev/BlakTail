@@ -1,14 +1,18 @@
 import { auth, type Session } from "@/lib/auth";
 import {
   consoleContextFromSession,
+  resolveSessionContext,
   type ConsoleContext,
+  type PersonSessionContext,
 } from "@/lib/session";
 
 /**
  * Resolve a Better Auth session from an Authorization Bearer token issued to the Mac app.
  * Cookie name matches Better Auth defaults; try the Secure prefix used on HTTPS consoles.
  */
-export async function sessionFromBearer(request: Request): Promise<Session | null> {
+export async function sessionFromBearer(
+  request: Request,
+): Promise<Session | null> {
   const header = request.headers.get("authorization") ?? "";
   const match = /^Bearer\s+(.+)$/i.exec(header.trim());
   if (!match) {
@@ -36,13 +40,19 @@ export async function sessionFromBearer(request: Request): Promise<Session | nul
   return null;
 }
 
+export async function requirePersonContextFromSession(
+  session: Session,
+): Promise<PersonSessionContext> {
+  return resolveSessionContext(session);
+}
+
 export async function requireConsoleContextFromSession(
   session: Session,
-  selectedOrganisationId?: string,
+  organisationId?: string,
 ): Promise<ConsoleContext> {
   return consoleContextFromSession(
     session,
-    selectedOrganisationId,
-    selectedOrganisationId !== undefined,
+    organisationId,
+    organisationId !== undefined,
   );
 }

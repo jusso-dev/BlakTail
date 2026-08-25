@@ -1,6 +1,8 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
 import {
   approveDeviceAuthorization,
   approveNodeRoutes,
@@ -13,8 +15,10 @@ import {
 } from "@/lib/coord";
 import {
   canMutateTailnet,
+  ORGANISATION_COOKIE,
   requireConsoleContext,
-  requireConsoleContextForOrganisation,
+  requireOrganisationContext,
+  requirePersonSessionContext,
 } from "@/lib/session";
 import {
   createInvitation,
@@ -31,10 +35,12 @@ function isDeviceTag(value: string): value is DeviceTag {
   return value === "office" || value === "ranger" || value === "store";
 }
 
-async function deviceActionContext(formData: FormData) {
-  return requireConsoleContextForOrganisation(
-    String(formData.get("organisationId") ?? ""),
-  );
+function owningOrganisation(formData: FormData): string {
+  const organisationId = String(formData.get("organisationId") ?? "").trim();
+  if (!organisationId) {
+    throw new Error("The device's network account is required.");
+  }
+  return organisationId;
 }
 
 export async function mintJoinKeyAction(
@@ -96,7 +102,9 @@ export async function revokeDeviceAction(
   formData: FormData,
 ): Promise<ActionResult> {
   try {
-    const ctx = await deviceActionContext(formData);
+    const ctx = await requireOrganisationContext(
+      owningOrganisation(formData),
+    );
     if (!canMutateTailnet(ctx.role)) {
       return { ok: false, error: "Only owners and admins can revoke devices." };
     }
@@ -119,7 +127,9 @@ export async function updateDeviceFriendlyNameAction(
   formData: FormData,
 ): Promise<ActionResult<{ friendlyName: string | null }>> {
   try {
-    const ctx = await deviceActionContext(formData);
+    const ctx = await requireOrganisationContext(
+      owningOrganisation(formData),
+    );
     if (!canMutateTailnet(ctx.role)) {
       return { ok: false, error: "Only owners and admins can rename devices." };
     }
@@ -152,7 +162,9 @@ export async function approveNodeRoutesAction(
   formData: FormData,
 ): Promise<ActionResult> {
   try {
-    const ctx = await deviceActionContext(formData);
+    const ctx = await requireOrganisationContext(
+      owningOrganisation(formData),
+    );
     if (!canMutateTailnet(ctx.role)) {
       return {
         ok: false,
@@ -269,4 +281,35 @@ export async function revokeInvitationAction(
           : "Could not revoke invitation.",
     };
   }
+}
+
+const consolePaths = new Set([
+  "/devices",
+  "/join-keys",
+  "/acls",
+  "/audit",
+  "/status",
+  "/settings",
+]);
+
+export async function selectOrganisationAction(formData: FormData) {
+  const person = await requirePersonSessionContext();
+  const organisationId = String(formData.get("organisationId") ?? "");
+  if (
+    !person.organisations.some(
+      (organisation) => organisation.organisationId === organisationId,
+    )
+  ) {
+    throw new Error("That network account is no longer accessible.");
+  }
+  const jar = await cookies();
+  jar.set(ORGANISATION_COOKIE, organisationId, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: "/",
+    maxAge: 60 * 60 * 24 * 365,
+  });
+  const requestedPath = String(formData.get("returnPath") ?? "/devices");
+  redirect(consolePaths.has(requestedPath) ? requestedPath : "/devices");
 }
