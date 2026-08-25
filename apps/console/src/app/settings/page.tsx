@@ -79,7 +79,7 @@ export default async function SettingsPage() {
           <ApiClientManager clients={apiClients} />
         ) : null}
         {ctx.role === "owner" ? (
-          <InvitationManager>
+          <InvitationManager
             invitations={invitations.map((invitation) => ({
               id: invitation.id,
               email: invitation.email,
