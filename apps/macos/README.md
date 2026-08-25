@@ -1,6 +1,8 @@
 # BlakTail for macOS
 
-SwiftUI menu bar + status window. See [`docs/macos-desktop.md`](../../docs/macos-desktop.md).
+Native SwiftUI menu bar + endpoint manager. One session searches and manages
+machines across every authorised network workspace, while **This Mac** controls
+the local tunnel. See [`docs/macos-desktop.md`](../../docs/macos-desktop.md).
 
 ```sh
 swift test

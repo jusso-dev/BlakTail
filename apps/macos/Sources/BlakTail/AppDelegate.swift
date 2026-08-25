@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 /// Ensures quit clears transient UI state without leaving join-key material in process argv/env.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var model: AppModel?
 

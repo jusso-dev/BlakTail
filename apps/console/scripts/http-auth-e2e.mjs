@@ -73,6 +73,16 @@ function cookies(response) {
     .join("; ");
 }
 
+function cookieValue(cookieHeader, names) {
+  for (const part of cookieHeader.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    const name = part.slice(0, separator).trim();
+    if (names.includes(name)) return part.slice(separator + 1).trim();
+  }
+  return null;
+}
+
 async function jsonRequest(baseUrl, path, options = {}) {
   const response = await fetch(`${baseUrl}${path}`, {
     method: options.method ?? "POST",
@@ -80,6 +90,10 @@ async function jsonRequest(baseUrl, path, options = {}) {
       origin: options.origin ?? baseUrl,
       "content-type": "application/json",
       ...(options.cookie ? { cookie: options.cookie } : {}),
+      ...(options.bearer ? { authorization: `Bearer ${options.bearer}` } : {}),
+      ...(options.organisationId
+        ? { "x-blaktail-organisation": options.organisationId }
+        : {}),
     },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     redirect: "manual",
@@ -124,6 +138,7 @@ const sql = new SQL(databaseUrl, {
   max: 10,
   prepare: false,
 });
+const coordinatorDevices = new Map();
 const coordinator = createServer(async (request, response) => {
   let raw = "";
   for await (const chunk of request) raw += chunk;
@@ -136,6 +151,12 @@ const coordinator = createServer(async (request, response) => {
   const nodesMatch = request.url?.match(/^\/v1\/orgs\/([^/]+)\/nodes$/u);
   if (request.method === "GET" && nodesMatch) {
     const coordOrgId = nodesMatch[1];
+    const node = coordinatorDevices.get(coordOrgId) ?? {
+      displayName: null,
+      approvedRoutes: [],
+      revoked: false,
+    };
+    coordinatorDevices.set(coordOrgId, node);
     response.writeHead(200, { "content-type": "application/json" });
     response.end(
       JSON.stringify([
@@ -145,12 +166,12 @@ const coordinator = createServer(async (request, response) => {
             coordOrgId === secondOwner.coordOrgId
               ? "ranger-field-laptop"
               : "community-office-server",
-          display_name: null,
+          display_name: node.displayName,
           wg_public_key: "test-public-key",
           endpoint: null,
           allowed_ips: ["100.64.0.1/32"],
-          advertised_routes: [],
-          approved_routes: [],
+          advertised_routes: ["10.42.0.0/24"],
+          approved_routes: node.approvedRoutes,
           dns_name: "test.blaktail.internal",
           user_id: "test-user",
           user_role: "member",
@@ -159,9 +180,69 @@ const coordinator = createServer(async (request, response) => {
           credential_expires_at: 2_000_000_000,
           expired: false,
           expires_soon: false,
-          revoked: false,
+          revoked: node.revoked,
         },
       ]),
+    );
+    return;
+  }
+  const friendlyNameMatch = request.url?.match(
+    /^\/v1\/orgs\/([^/]+)\/nodes\/([^/]+)\/friendly-name$/u,
+  );
+  if (request.method === "PUT" && friendlyNameMatch) {
+    const node = coordinatorDevices.get(friendlyNameMatch[1]) ?? {
+      displayName: null,
+      approvedRoutes: [],
+      revoked: false,
+    };
+    node.displayName = JSON.parse(raw).friendly_name || null;
+    coordinatorDevices.set(friendlyNameMatch[1], node);
+    response.writeHead(204);
+    response.end();
+    return;
+  }
+  const routesMatch = request.url?.match(
+    /^\/v1\/orgs\/([^/]+)\/nodes\/([^/]+)\/routes$/u,
+  );
+  if (request.method === "PUT" && routesMatch) {
+    const node = coordinatorDevices.get(routesMatch[1]) ?? {
+      displayName: null,
+      approvedRoutes: [],
+      revoked: false,
+    };
+    node.approvedRoutes = JSON.parse(raw).approved_routes;
+    coordinatorDevices.set(routesMatch[1], node);
+    response.writeHead(204);
+    response.end();
+    return;
+  }
+  const revokeNodeMatch = request.url?.match(
+    /^\/v1\/orgs\/([^/]+)\/nodes\/([^/]+)$/u,
+  );
+  if (request.method === "DELETE" && revokeNodeMatch) {
+    const node = coordinatorDevices.get(revokeNodeMatch[1]) ?? {
+      displayName: null,
+      approvedRoutes: [],
+      revoked: false,
+    };
+    node.revoked = true;
+    coordinatorDevices.set(revokeNodeMatch[1], node);
+    response.writeHead(204);
+    response.end();
+    return;
+  }
+  const joinKeysMatch = request.url?.match(
+    /^\/v1\/orgs\/([^/]+)\/join-keys$/u,
+  );
+  if (request.method === "POST" && joinKeysMatch) {
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        id: `join-key-${joinKeysMatch[1]}`,
+        key: "btj_http-e2e-single-use",
+        expires_at: Math.floor(Date.now() / 1000) + 600,
+        single_use: true,
+      }),
     );
     return;
   }
@@ -414,6 +495,145 @@ try {
     );
   }
 
+  const sessionCookieNames = [
+    "better-auth.session_token",
+    "__Secure-better-auth.session_token",
+  ];
+  const memberBearer = cookieValue(memberCookie, sessionCookieNames);
+  const ownerBearer = cookieValue(ownerCookie, sessionCookieNames);
+  assert.ok(memberBearer);
+  assert.ok(ownerBearer);
+
+  const cookieOnlyDesktopInventory = await fetch(
+    `${baseUrl}/api/desktop/devices`,
+    { headers: { cookie: memberCookie } },
+  );
+  assert.equal(cookieOnlyDesktopInventory.status, 401);
+
+  const desktopMe = await jsonRequest(baseUrl, "/api/desktop/me", {
+    method: "GET",
+    bearer: memberBearer,
+  });
+  assert.equal(desktopMe.response.status, 200, JSON.stringify(desktopMe.body));
+  assert.equal(desktopMe.body.organisations.length, 2);
+
+  const desktopInventory = await jsonRequest(
+    baseUrl,
+    "/api/desktop/devices",
+    { method: "GET", bearer: memberBearer },
+  );
+  assert.equal(
+    desktopInventory.response.status,
+    200,
+    JSON.stringify(desktopInventory.body),
+  );
+  assert.equal(desktopInventory.body.devices.length, 2);
+  assert.deepEqual(desktopInventory.body.errors, []);
+  const memberNetworkDevice = desktopInventory.body.devices.find(
+    (device) => device.organisation_name === owner.organisation,
+  );
+  const adminNetworkDevice = desktopInventory.body.devices.find(
+    (device) => device.organisation_id === secondOwner.organisationId,
+  );
+  assert.ok(memberNetworkDevice);
+  assert.ok(adminNetworkDevice);
+  assert.equal(memberNetworkDevice.can_mutate, false);
+  assert.equal(adminNetworkDevice.can_mutate, true);
+
+  const deniedDesktopRename = await jsonRequest(
+    baseUrl,
+    `/api/desktop/devices/${memberNetworkDevice.id}`,
+    {
+      method: "PATCH",
+      bearer: memberBearer,
+      organisationId: memberNetworkDevice.organisation_id,
+      body: { operation: "rename", friendlyName: "Not authorised" },
+    },
+  );
+  assert.equal(deniedDesktopRename.response.status, 403);
+
+  const crossNetworkDesktopRename = await jsonRequest(
+    baseUrl,
+    `/api/desktop/devices/${adminNetworkDevice.id}`,
+    {
+      method: "PATCH",
+      bearer: ownerBearer,
+      organisationId: secondOwner.organisationId,
+      body: { operation: "rename", friendlyName: "Cross-network failure" },
+    },
+  );
+  assert.equal(crossNetworkDesktopRename.response.status, 403);
+
+  const desktopRename = await jsonRequest(
+    baseUrl,
+    `/api/desktop/devices/${adminNetworkDevice.id}`,
+    {
+      method: "PATCH",
+      bearer: memberBearer,
+      organisationId: secondOwner.organisationId,
+      body: { operation: "rename", friendlyName: "Ranger MacBook" },
+    },
+  );
+  assert.equal(desktopRename.response.status, 204);
+
+  const desktopRoutes = await jsonRequest(
+    baseUrl,
+    `/api/desktop/devices/${adminNetworkDevice.id}`,
+    {
+      method: "PATCH",
+      bearer: memberBearer,
+      organisationId: secondOwner.organisationId,
+      body: { operation: "routes", approvedRoutes: ["10.42.0.0/24"] },
+    },
+  );
+  assert.equal(desktopRoutes.response.status, 204);
+
+  const selectedNetworkJoin = await jsonRequest(
+    baseUrl,
+    "/api/desktop/join-key",
+    {
+      bearer: memberBearer,
+      organisationId: secondOwner.organisationId,
+      body: { expiresInSeconds: 600, singleUse: true, tags: [] },
+    },
+  );
+  assert.equal(selectedNetworkJoin.response.status, 200);
+  assert.equal(selectedNetworkJoin.body.key, "btj_http-e2e-single-use");
+
+  const refreshedDesktopInventory = await jsonRequest(
+    baseUrl,
+    "/api/desktop/devices",
+    { method: "GET", bearer: memberBearer },
+  );
+  const updatedAdminDevice = refreshedDesktopInventory.body.devices.find(
+    (device) => device.organisation_id === secondOwner.organisationId,
+  );
+  assert.equal(updatedAdminDevice.display_name, "Ranger MacBook");
+  assert.deepEqual(updatedAdminDevice.approved_routes, ["10.42.0.0/24"]);
+
+  const desktopRevoke = await jsonRequest(
+    baseUrl,
+    `/api/desktop/devices/${adminNetworkDevice.id}`,
+    {
+      method: "DELETE",
+      bearer: memberBearer,
+      organisationId: secondOwner.organisationId,
+    },
+  );
+  assert.equal(desktopRevoke.response.status, 204);
+
+  const revokedDesktopInventory = await jsonRequest(
+    baseUrl,
+    "/api/desktop/devices",
+    { method: "GET", bearer: memberBearer },
+  );
+  assert.equal(
+    revokedDesktopInventory.body.devices.find(
+      (device) => device.organisation_id === secondOwner.organisationId,
+    ).revoked,
+    true,
+  );
+
   const switched = await jsonRequest(
     baseUrl,
     "/api/organisations/active",
@@ -537,6 +757,7 @@ try {
       invitationRevocation: "enforced",
       existingAccountJoin: "same-session",
       allNetworksInventory: "two-workspaces",
+      desktopEndpointManager: "multi-workspace-mutations-isolated",
       workspaceIsolation: "enforced",
       memberAuthorisation: "denied",
       sessionExpiry: "enforced",

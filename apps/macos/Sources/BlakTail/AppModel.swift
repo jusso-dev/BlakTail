@@ -1,20 +1,28 @@
 import BlakTailCore
 import Foundation
-import SwiftUI
+import Observation
 
 @MainActor
-final class AppModel: ObservableObject {
-    @Published var preferences: Preferences
-    @Published var session: DesktopSession?
-    @Published var connectionState: ConnectionState = .disconnected
-    @Published var agentStatus: AgentStatus = .disconnected
-    @Published var lastError: String?
-    @Published var isBusy = false
+@Observable
+final class AppModel {
+    var preferences: Preferences
+    var session: DesktopSession?
+    var connectionState: ConnectionState = .disconnected
+    var agentStatus: AgentStatus = .disconnected
+    var devices: [EndpointDevice] = []
+    var inventoryErrors: [String] = []
+    var lastError: String?
+    var feedbackMessage: String?
+    var isBusy = false
+    var isLoadingDevices = false
+    var pendingDeviceID: String?
+    var lastRefreshedAt: Date?
 
-    private let keychain: KeychainStore
-    private let agent: AgentController
-    private let browserSignIn: BrowserSignIn
-    private var statusTask: Task<Void, Never>?
+    @ObservationIgnored let keychain: KeychainStore
+    @ObservationIgnored let agent: AgentController
+    @ObservationIgnored let browserSignIn: BrowserSignIn
+    @ObservationIgnored var statusTask: Task<Void, Never>?
+    @ObservationIgnored var hasBootstrapped = false
 
     init(
         preferences: Preferences = .load(),
@@ -29,17 +37,48 @@ final class AppModel: ObservableObject {
     }
 
     var isSignedIn: Bool { session != nil }
+
     var menuBarSymbol: String {
-        connectionState == .connected ? "network" : "network.slash"
+        switch connectionState {
+        case .connected: return "network"
+        case .connecting, .disconnecting: return "network.badge.shield.half.filled"
+        case .disconnected: return "network.slash"
+        }
+    }
+
+    var selectedOrganisation: DesktopOrganisation? {
+        guard let session else { return nil }
+        return session.organisations.first(where: { $0.id == preferences.selectedOrganisationID })
+            ?? session.organisations.first
+    }
+
+    var localDevice: EndpointDevice? {
+        guard let nodeID = agentStatus.nodeID else { return nil }
+        return devices.first(where: { $0.nodeID == nodeID })
+    }
+
+    var activeDeviceCount: Int {
+        devices.filter { !$0.expired && !$0.revoked }.count
+    }
+
+    var consoleBaseURL: URL? {
+        guard let url = URL(string: preferences.consoleBaseURL),
+              url.scheme == "https" || url.host == "127.0.0.1" || url.host == "localhost"
+        else {
+            return nil
+        }
+        return url
     }
 
     func bootstrap() {
+        guard !hasBootstrapped else { return }
+        hasBootstrapped = true
         refreshAgentStatus()
-        statusTask?.cancel()
         statusTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
-                await MainActor.run { self?.refreshAgentStatus() }
+                guard !Task.isCancelled else { return }
+                self?.refreshAgentStatus()
             }
         }
         Task { await restoreSessionIfPossible() }
@@ -48,130 +87,19 @@ final class AppModel: ObservableObject {
     func prepareToQuit() {
         statusTask?.cancel()
         statusTask = nil
-        // Session token remains in Keychain. Any in-flight join key lives only in local
-        // connect() scope and is scrubbed before return — quit must not leave it in argv/env.
         lastError = nil
+        feedbackMessage = nil
     }
 
     func savePreferences() {
         preferences.save()
     }
 
-    func signIn() async {
-        isBusy = true
-        lastError = nil
-        defer { isBusy = false }
-        do {
-            guard let base = URL(string: preferences.consoleBaseURL) else {
-                lastError = "Set a valid onshore console URL first."
-                return
-            }
-            let token = try await browserSignIn.signIn(consoleBaseURL: base)
-            try keychain.save(token)
-            let client = ConsoleClient(sessionToken: token, baseURL: base)
-            let desktop = try await client.fetchSession()
-            session = desktop
-            if let coordinator = desktop.coordinatorURL, !coordinator.isEmpty {
-                preferences.coordinatorURL = coordinator
-                preferences.save()
-            }
-        } catch let error as BrowserSignInError where error == .cancelled {
-            // User cancelled — no error banner.
-        } catch {
-            lastError = error.localizedDescription
-            session = nil
-        }
-    }
-
-    func signOut() {
-        try? keychain.delete()
-        session = nil
-        lastError = nil
-    }
-
-    func connect() async {
-        guard let token = try? keychain.load(), !token.isEmpty else {
-            lastError = "Sign in before connecting."
+    func selectOrganisation(_ organisationID: String) {
+        guard session?.organisations.contains(where: { $0.id == organisationID }) == true else {
             return
         }
-        guard let base = URL(string: preferences.consoleBaseURL) else {
-            lastError = "Set a valid onshore console URL first."
-            return
-        }
-
-        isBusy = true
-        connectionState = .connecting
-        lastError = nil
-        defer { isBusy = false }
-
-        var material: JoinKeyMaterial?
-        do {
-            let client = ConsoleClient(sessionToken: token, baseURL: base)
-            material = try await client.mintJoinKey()
-            var join = material!
-            let coordinator = join.coordinatorURL.isEmpty ? preferences.coordinatorURL : join.coordinatorURL
-            preferences.coordinatorURL = coordinator
-            preferences.save()
-
-            try agent.connect(
-                joinKey: join.key,
-                coordinator: coordinator,
-                name: preferences.deviceName
-            )
-            join.scrub()
-            material?.scrub()
-
-            connectionState = .connected
-            refreshAgentStatus()
-        } catch {
-            material?.scrub()
-            connectionState = .disconnected
-            lastError = error.localizedDescription
-            refreshAgentStatus()
-        }
-    }
-
-    func disconnect() {
-        isBusy = true
-        connectionState = .disconnecting
-        lastError = nil
-        defer { isBusy = false }
-        do {
-            try agent.disconnect()
-            connectionState = .disconnected
-            agentStatus = .disconnected
-        } catch {
-            lastError = error.localizedDescription
-            refreshAgentStatus()
-        }
-    }
-
-    private func restoreSessionIfPossible() async {
-        guard let token = try? keychain.load(), !token.isEmpty else { return }
-        guard let base = URL(string: preferences.consoleBaseURL) else { return }
-        do {
-            let desktop = try await ConsoleClient(sessionToken: token, baseURL: base).fetchSession()
-            session = desktop
-            if let coordinator = desktop.coordinatorURL, !coordinator.isEmpty {
-                preferences.coordinatorURL = coordinator
-            }
-        } catch {
-            try? keychain.delete()
-            session = nil
-        }
-    }
-
-    private func refreshAgentStatus() {
-        do {
-            let status = try agent.status()
-            agentStatus = status
-            if status.connected {
-                connectionState = .connected
-            } else if connectionState == .connected {
-                connectionState = .disconnected
-            }
-        } catch {
-            // Status probe failures are soft; surface only when the user acts.
-        }
+        preferences.selectedOrganisationID = organisationID
+        preferences.save()
     }
 }

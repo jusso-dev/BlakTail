@@ -73,6 +73,72 @@ final class JoinKeySafetyTests: XCTestCase {
         XCTAssertEqual(up.stdin.flatMap { String(data: $0, encoding: .utf8) }, joinKey)
         XCTAssertTrue(up.privileged)
     }
+
+    func testPauseRetainsEnrollmentInsteadOfCallingDown() throws {
+        let runner = RecordingRunner()
+        let agentPath = makeTempExecutable()
+        defer { try? FileManager.default.removeItem(atPath: agentPath) }
+        let controller = AgentController(
+            agentPath: agentPath,
+            launchDaemonLabel: "com.blaktail.agent",
+            launchDaemonPlist: "/Library/LaunchDaemons/com.blaktail.agent.plist",
+            runner: runner
+        )
+
+        try controller.pause()
+
+        XCTAssertTrue(runner.calls.contains(where: { $0.arguments == ["pause"] }))
+        XCTAssertFalse(runner.calls.contains(where: { $0.arguments == ["down"] }))
+        XCTAssertTrue(
+            runner.calls.contains(where: {
+                $0.executable == "/bin/launchctl" &&
+                    $0.arguments == ["bootout", "system/com.blaktail.agent"]
+            })
+        )
+    }
+
+    func testResumeBootstrapsSavedEnrollmentWithoutJoinKey() throws {
+        let runner = RecordingRunner()
+        let agentPath = makeTempExecutable()
+        defer { try? FileManager.default.removeItem(atPath: agentPath) }
+        let controller = AgentController(
+            agentPath: agentPath,
+            launchDaemonLabel: "com.blaktail.agent",
+            launchDaemonPlist: "/Library/LaunchDaemons/com.blaktail.agent.plist",
+            runner: runner
+        )
+
+        try controller.resume()
+
+        XCTAssertTrue(
+            runner.calls.contains(where: {
+                $0.executable == "/bin/launchctl" &&
+                    $0.arguments == [
+                        "bootstrap",
+                        "system",
+                        "/Library/LaunchDaemons/com.blaktail.agent.plist"
+                    ]
+            })
+        )
+        XCTAssertFalse(runner.calls.contains(where: { $0.stdin != nil }))
+    }
+
+    func testPausedStatusRetainsNodeIdentity() throws {
+        let agentPath = makeTempExecutable()
+        defer { try? FileManager.default.removeItem(atPath: agentPath) }
+        let controller = AgentController(
+            agentPath: agentPath,
+            launchDaemonLabel: "com.blaktail.agent",
+            launchDaemonPlist: "/Library/LaunchDaemons/com.blaktail.agent.plist",
+            runner: PausedStatusRunner()
+        )
+
+        let status = try controller.status()
+
+        XCTAssertFalse(status.connected)
+        XCTAssertEqual(status.nodeID, "00000000-0000-0000-0000-000000000001")
+        XCTAssertEqual(status.address, "100.64.0.1/32")
+    }
 }
 
 final class TaglineTests: XCTestCase {
@@ -96,6 +162,98 @@ final class BrowserSignInTokenTests: XCTestCase {
     }
 }
 
+final class DesktopEndpointTests: XCTestCase {
+    func testDecodesMultiNetworkEndpointInventory() throws {
+        let data = Data(
+            """
+            {
+              "devices": [{
+                "id": "node-one",
+                "name": "technical-mac",
+                "display_name": "Community office Mac",
+                "wg_public_key": "public-key",
+                "endpoint": "203.0.113.8:51820",
+                "allowed_ips": ["100.64.0.1/32", "fd7a:115c:a1e0::1/128"],
+                "advertised_routes": ["10.42.0.0/24"],
+                "approved_routes": [],
+                "dns_name": "technical-mac.example.blaktail.internal",
+                "tags": ["office"],
+                "created_at": 1700000000,
+                "credential_expires_at": 2000000000,
+                "expired": false,
+                "expires_soon": true,
+                "revoked": false,
+                "organisation_id": "org-one",
+                "organisation_name": "Community Services",
+                "can_mutate": true
+              }],
+              "errors": []
+            }
+            """.utf8
+        )
+
+        let inventory = try JSONDecoder().decode(DesktopInventory.self, from: data)
+        let device = try XCTUnwrap(inventory.devices.first)
+        XCTAssertEqual(device.id, "org-one:node-one")
+        XCTAssertEqual(device.displayName, "Community office Mac")
+        XCTAssertEqual(device.credentialState, .expiresSoon)
+        XCTAssertEqual(device.organisationName, "Community Services")
+        XCTAssertTrue(device.canMutate)
+    }
+
+    func testPreferencesPersistSelectedNetwork() {
+        let suiteName = "BlakTailTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let preferences = Preferences(
+            consoleBaseURL: "https://console.example.org.au",
+            coordinatorURL: "https://coord.example.org.au",
+            deviceName: "field-mac",
+            selectedOrganisationID: "org-ranger"
+        )
+
+        preferences.save(defaults: defaults)
+
+        XCTAssertEqual(Preferences.load(defaults: defaults), preferences)
+    }
+
+    func testDesktopMutationScopesBearerToNetwork() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RecordingURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        RecordingURLProtocol.handler = { request in
+            XCTAssertEqual(request.httpMethod, "PATCH")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer session-token")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-BlakTail-Organisation"), "org-ranger")
+            let body = try XCTUnwrap(request.httpBody)
+            let payload = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: body) as? [String: String]
+            )
+            XCTAssertEqual(payload["operation"], "rename")
+            XCTAssertEqual(payload["friendlyName"], "Ranger MacBook")
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 204,
+                    httpVersion: nil,
+                    headerFields: nil
+                )!,
+                Data()
+            )
+        }
+
+        try await ConsoleClient(
+            sessionToken: "session-token",
+            baseURL: URL(string: "https://console.example.org.au")!,
+            urlSession: session
+        ).updateFriendlyName(
+            nodeID: "node-one",
+            organisationID: "org-ranger",
+            friendlyName: "Ranger MacBook"
+        )
+    }
+}
+
 private final class RecordingRunner: ProcessRunner, @unchecked Sendable {
     struct Call {
         var executable: String
@@ -109,6 +267,46 @@ private final class RecordingRunner: ProcessRunner, @unchecked Sendable {
     func run(executable: String, arguments: [String], stdin: Data?, privileged: Bool) throws -> ProcessResult {
         calls.append(Call(executable: executable, arguments: arguments, stdin: stdin, privileged: privileged))
         return ProcessResult(exitCode: 0, stdout: "ok\n", stderr: "")
+    }
+}
+
+private final class RecordingURLProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        do {
+            let handler = try XCTUnwrap(Self.handler)
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+private struct PausedStatusRunner: ProcessRunner {
+    func run(executable: String, arguments: [String], stdin: Data?, privileged: Bool) throws -> ProcessResult {
+        if arguments == ["status"] {
+            return ProcessResult(
+                exitCode: 0,
+                stdout: """
+                joined
+                node: 00000000-0000-0000-0000-000000000001
+                address: 100.64.0.1/32
+                coordinator: https://coord.example.org.au
+                """,
+                stderr: ""
+            )
+        }
+        return ProcessResult(exitCode: 1, stdout: "", stderr: "service not loaded")
     }
 }
 

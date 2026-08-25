@@ -77,6 +77,8 @@ enum Command {
     },
     /// Show persisted node and peer status without exposing credentials.
     Status,
+    /// Stop the local tunnel while retaining enrollment for a later resume.
+    Pause,
     /// Revoke this node and remove its WireGuard interface.
     Down,
 }
@@ -117,7 +119,7 @@ impl AgentOverrides {
                 }
             }
             Command::Run { poll_seconds } => overrides.poll_seconds = *poll_seconds,
-            Command::Reauth { .. } | Command::Status | Command::Down => {}
+            Command::Reauth { .. } | Command::Status | Command::Pause | Command::Down => {}
         }
         overrides
     }
@@ -1088,6 +1090,29 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                 );
             }
         }
+        Command::Pause => {
+            let state = read_state(state_dir)?;
+            if let Some(domain) = dns_domain(&state.dns_name) {
+                remove_system_dns(
+                    state_dir,
+                    &state.interface,
+                    &domain,
+                    state.dns_mode.as_deref(),
+                )?;
+            }
+            let mut network = make_network();
+            network.configure_router(
+                &state.interface,
+                &state.advertised_routes,
+                &[],
+                state.router_previous_ipv4_forward,
+            )?;
+            network.down(&state.interface)?;
+            println!(
+                "tunnel paused; enrollment for node {} retained",
+                state.node_id
+            );
+        }
         Command::Down => {
             let state = read_state(state_dir)?;
             if let Some(domain) = dns_domain(&state.dns_name) {
@@ -1129,6 +1154,14 @@ fn credential_status(expires_at: i64, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pause_is_distinct_from_destructive_down() {
+        let paused = Cli::try_parse_from(["blaktaild", "pause"]).expect("pause command");
+        let down = Cli::try_parse_from(["blaktaild", "down"]).expect("down command");
+        assert!(matches!(paused.command, Command::Pause));
+        assert!(matches!(down.command, Command::Down));
+    }
 
     #[test]
     fn relayed_handshake_does_not_masquerade_as_direct_recovery() {

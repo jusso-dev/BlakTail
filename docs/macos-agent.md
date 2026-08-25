@@ -50,6 +50,15 @@ tailnet IP or WireGuard key, mint a fresh join key and pipe it to the agent:
 printf '%s' "$BLAKTAIL_JOIN_KEY" | sudo /usr/local/bin/blaktaild reauth
 ```
 
+To pause the local tunnel without revoking the node or deleting its enrolment,
+unload the daemon and run `pause`. Bootstrap the same LaunchDaemon to resume:
+
+```sh
+sudo launchctl bootout system/com.blaktail.agent
+sudo /usr/local/bin/blaktaild pause
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.blaktail.agent.plist
+```
+
 To leave the tailnet, unload the daemon first so launchd cannot restart it, then revoke and erase local state:
 
 ```sh

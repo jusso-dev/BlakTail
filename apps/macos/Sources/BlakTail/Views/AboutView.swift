@@ -9,7 +9,7 @@ struct AboutView: View {
             Text(Tagline.text)
                 .font(.body)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("macOS desktop shell · minimum macOS 14 Sonoma")
+            Text("Native endpoint manager · minimum macOS 14 Sonoma")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)

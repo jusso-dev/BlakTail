@@ -147,7 +147,16 @@ public struct AgentController: Sendable {
         if result.exitCode != 0 {
             return .disconnected
         }
-        return AgentStatus.parse(result.stdout)
+        var status = AgentStatus.parse(result.stdout)
+        guard status.nodeID != nil else { return .disconnected }
+        let daemon = try? runner.run(
+            executable: "/bin/launchctl",
+            arguments: ["print", "system/\(launchDaemonLabel)"],
+            stdin: nil,
+            privileged: false
+        )
+        status.connected = daemon?.exitCode == 0
+        return status
     }
 
     public func connect(joinKey: String, coordinator: String, name: String) throws {
@@ -172,6 +181,40 @@ public struct AgentController: Sendable {
             throw AgentControllerError.failed(message.isEmpty ? "Could not connect the local agent." : message)
         }
 
+        try startLaunchDaemon()
+    }
+
+    public func resume() throws {
+        guard FileManager.default.isExecutableFile(atPath: agentPath) else {
+            throw AgentControllerError.agentMissing
+        }
+        try startLaunchDaemon()
+    }
+
+    public func pause() throws {
+        _ = try? runner.run(
+            executable: "/bin/launchctl",
+            arguments: ["bootout", "system/\(launchDaemonLabel)"],
+            stdin: nil,
+            privileged: true
+        )
+        if FileManager.default.isExecutableFile(atPath: agentPath) {
+            let down = try runner.run(
+                executable: agentPath,
+                arguments: ["pause"],
+                stdin: nil,
+                privileged: true
+            )
+            if down.exitCode != 0 {
+                let message = down.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                throw AgentControllerError.failed(
+                    message.isEmpty ? "Could not pause the local agent." : message
+                )
+            }
+        }
+    }
+
+    private func startLaunchDaemon() throws {
         _ = try? runner.run(
             executable: "/bin/launchctl",
             arguments: ["bootout", "system/\(launchDaemonLabel)"],
@@ -188,32 +231,9 @@ public struct AgentController: Sendable {
             let message = boot.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             throw AgentControllerError.failed(
                 message.isEmpty
-                    ? "Agent joined, but the LaunchDaemon could not be started."
+                    ? "The local agent could not be started."
                     : message
             )
-        }
-    }
-
-    public func disconnect() throws {
-        _ = try? runner.run(
-            executable: "/bin/launchctl",
-            arguments: ["bootout", "system/\(launchDaemonLabel)"],
-            stdin: nil,
-            privileged: true
-        )
-        if FileManager.default.isExecutableFile(atPath: agentPath) {
-            let down = try runner.run(
-                executable: agentPath,
-                arguments: ["down"],
-                stdin: nil,
-                privileged: true
-            )
-            if down.exitCode != 0 {
-                let message = down.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                throw AgentControllerError.failed(
-                    message.isEmpty ? "Could not disconnect the local agent." : message
-                )
-            }
         }
     }
 }

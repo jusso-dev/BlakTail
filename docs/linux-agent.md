@@ -13,6 +13,7 @@ blaktail-config check-config --service agent
 sudo blaktaild up --coord https://coord.example.org \
   --endpoint 203.0.113.10:51820
 sudo blaktaild status
+sudo blaktaild pause  # reversible; keeps enrolment
 sudo blaktaild down
 ```
 

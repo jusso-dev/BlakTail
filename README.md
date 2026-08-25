@@ -1,6 +1,6 @@
 # BlakTail
 
-![BlakTail — secure, open and self-hosted private networking in Australia](docs/images/blaktail-banner.png)
+![BlakTail: secure, open and self-hosted private networking in Australia](docs/images/blaktail-banner.png)
 
 ## A private path between your organisation's devices
 
@@ -63,14 +63,15 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 
 - Browser-based device enrolment without copying a join key
 - One session across multiple network accounts, with every machine in one
-  all-networks inventory and instant workspace switching—never logout/login churn
+  all-networks inventory and instant workspace switching, without logout/login churn
 - Stable device identity with editable, audited friendly names
 - Join-key enrolment for automation, tags, route approval, ACLs, and revocation
 - Bun 1.4-hosted Next.js 16.3 console: Bun SQL, Drizzle ORM, Better Auth, and
   the Rust control plane for auth and ACLs
 - WireGuard agents for Linux and macOS; Windows is not implemented
-- A macOS desktop app that drives the local agent; Windows and Linux desktop apps
-  are not implemented
+- A native macOS endpoint manager with all-network search, local connect controls,
+  friendly-name and route administration, guarded revoke, Keychain auth, and a
+  menu-bar quick view; Windows and Linux desktop apps are not implemented
 - Coordination server and AU relay the org runs
 - SQLx coordinator storage: SQLite for a single host or PostgreSQL for concurrent replicas
 - MagicDNS-style names and tag ACLs (office, ranger, store)
@@ -216,7 +217,18 @@ Do not commit:
 
 ## macOS desktop
 
-SwiftUI menu bar app in `apps/macos`. Minimum **macOS 14 Sonoma**. Signs in via Better Auth (ASWebAuthenticationSession), stores the session token in Keychain, and starts/stops local `blaktaild` without the terminal. Join keys travel on stdin only and are not left in argv on quit.
+Native SwiftUI endpoint manager in `apps/macos`. Minimum **macOS 14 Sonoma**.
+One Better Auth session shows every machine across every authorised workspace in
+a searchable split view. Owners and admins can change friendly names, approve
+advertised routes, and revoke endpoints without losing sight of the machine's
+stable technical and MagicDNS identity. The same app starts and stops local
+`blaktaild`, stores its session token in Keychain, and keeps join keys on stdin
+only, never argv or persistent preferences. Disconnect is reversible: it pauses
+the tunnel but keeps enrolment; revoke remains a separate confirmed action.
+
+The interface follows [Apple's Human Interface Guidelines](https://developer.apple.com/design/human-interface-guidelines/):
+native sidebars, lists, Settings, menus, keyboard commands, semantic system colours,
+VoiceOver labels, non-colour status symbols, and reduced-motion-safe state changes.
 
 See [`docs/macos-desktop.md`](docs/macos-desktop.md) for build steps, manual validation, and **notarisation** notes (do not buy signing certificates in CI).
 
