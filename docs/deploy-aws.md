@@ -90,6 +90,7 @@ See [configuration.md](configuration.md),
 ```sh
 export EXPECTED_AWS_ACCOUNT=123456789012 AWS_REGION=ap-southeast-2
 export RUN_ID=20260824config01 EXPIRES_AT=2026-08-25T00:00:00Z
+export OWNER_EMAIL=owner@example.org.au
 export WORK_DIR=/tmp/blaktail-e2e-$RUN_ID TF_DIR=deploy/aws/e2e
 scripts/aws-e2e/preflight.sh
 ```
@@ -107,6 +108,18 @@ scripts/aws-e2e/upload-agent-packages.sh
 scripts/aws-e2e/terraform-apply.sh prepare
 scripts/aws-e2e/migrate-console.sh
 scripts/aws-e2e/terraform-apply.sh activate
+scripts/aws-e2e/bootstrap-owner.sh
+scripts/aws-e2e/verify-auth.sh
+scripts/aws-e2e/ssm-install-agents.sh
+scripts/aws-e2e/ssm-start-enrolment.sh
+scripts/aws-e2e/ssm-show-enrolment.sh # approve both links in the portal; do not save codes
+scripts/aws-e2e/ssm-wait-enrolment.sh
+scripts/aws-e2e/prove-network.sh
+scripts/aws-e2e/prove-coord-ha.sh
+scripts/aws-e2e/prove-db-restore.sh
+scripts/aws-e2e/collect-evidence.sh
+# Finish with the exact CONFIRM_DESTROY value printed by preflight:
+scripts/aws-e2e/destroy.sh
 ```
 
 After explicit migrations, execute the supported `bootstrap.mjs init`/`claim`
@@ -117,10 +130,20 @@ this as `scripts/aws-e2e/bootstrap-owner.sh`: it uses a short-lived encrypted S3
 object readable only by the console task role, deletes it on exit, keeps the
 bootstrap token inside the task, and writes a credential-free evidence marker.
 `scripts/aws-e2e/verify-auth.sh` then proves that public signup is disabled and
-that the generated owner can reach the authenticated Devices page without writing
+that the generated owner can reach the authenticated All networks page without writing
 the password, session body, or cookie jar to evidence. Successful teardown removes
 the local password, cookie, enrollment URLs, Terraform state and state backup after
 AWS absence checks pass.
+
+`prove-coord-ha.sh` requires the coordinator service to begin at 2/2, continuously
+probes public health while stopping one exact service task, and fails unless every
+probe succeeds and ECS returns to two tasks. `prove-db-restore.sh` then creates an
+encrypted manual snapshot, restores it into a temporary non-public RDS instance,
+uses a private Fargate task and Bun's native SQL client to verify coordinator schema
+and row data plus console identity data, and deletes the restored instance and
+snapshot. Its cleanup trap remains armed on failure. Persistent operators should
+run both drills after every material database, task-definition, or load-balancer
+change and retain credential-free evidence outside the disposable work directory.
 
 Requirements before treating either root as a persistent AWS deployment:
 

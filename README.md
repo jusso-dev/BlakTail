@@ -147,35 +147,41 @@ and an enrolled node on the actual destination.
 
 ### Verified AWS smoke run
 
-Hardened rerun `20260824i41a` deployed immutable ARM64 console, coordinator, and
-relay images in Sydney from commit `1cc043e`. Configuration schema v1 validated and
-printed only redacted effective values before the explicit coordinator and console
-migrations. The run found a real non-root Fargate defect in the console migration's
-anonymous `/tmp` volume, added a narrow one-shot volume initializer, rebuilt the task
-definition, and then passed migration and startup with a read-only root filesystem.
+Run `20260824ma1` deployed immutable ARM64 console, two coordinator replicas, and
+the relay in Sydney from source commit `07e5b05`. Schema-v1 configuration emitted
+only redacted effective values before explicit SQLx and Drizzle migrations. Both
+coordinators then served schema-v4 PostgreSQL concurrently behind the load balancer.
 
 The supported first-owner ceremony locked after one owner. Live HTTP checks rejected
-public signup, signed that owner in, and loaded the authenticated Devices page. The
-portal approved private Ubuntu and Amazon Linux agents, renamed them to friendly
-operator-facing names, and retained their stable technical identities. Both nodes
-then passed bidirectional IPv4, IPv6, MagicDNS, overlay-route, and SSH checks over
-`blaktail0`. Terraform destroyed all 97 resources; the scoped residue check returned
-zero and removed local passwords, enrollment URLs, cookies, and Terraform state.
+public signup, signed that owner in, and loaded the authenticated **All networks**
+page. The portal approved private Ubuntu and Amazon Linux agents, saved “Sydney
+Ubuntu Agent” and “Sydney AL2023 Agent” as friendly names, and retained each stable
+technical/MagicDNS identity. Both nodes passed bidirectional IPv4, IPv6, MagicDNS,
+overlay-route, and SSH checks over `blaktail0` with no public IP or inbound SSH.
+
+The HA drill stopped one coordinator during 113 continuous public health requests:
+zero failed and ECS returned to 2/2 tasks. An encrypted private RDS snapshot was
+restored into a temporary instance, then a private Bun task verified coordinator
+schema version 4, two node rows, and console identity/membership rows. The temporary
+restore and snapshot were deleted. Guarded Terraform teardown destroyed all 92
+resources; native service checks found zero active scoped residue and local
+passwords, enrolment material, cookies, state, browser profiles, and registry login
+were removed.
 
 These screenshots are from that exact disposable run. The sign-in image was taken
 before credentials were entered; the device image contains no enrollment code,
 WireGuard fingerprint, cookie, key, or cloud secret.
 
-![BlakTail sign-in served by AWS run 20260824i41a](docs/images/aws-e2e/sign-in-20260824i41a.png)
+![BlakTail sign-in served by AWS run 20260824ma1](docs/images/aws-e2e/sign-in-20260824ma1.png)
 
-![Two private agents with editable friendly names in AWS run 20260824i41a](docs/images/aws-e2e/devices-20260824i41a.png)
+![Two private agents with editable friendly names in AWS run 20260824ma1](docs/images/aws-e2e/devices-20260824ma1.png)
 
 See the [redacted run report](docs/e2e/aws-fargate-run.md),
-[#41](https://github.com/jusso-dev/BlakTail/issues/41),
-[#35](https://github.com/jusso-dev/BlakTail/issues/35), and
-[#34](https://github.com/jusso-dev/BlakTail/issues/34). These are current-commit
-smoke proofs, not release proof: forced relay traffic, revocation/re-enrolment, all
-restart cases, and a published agent package remain open acceptance work.
+[#27](https://github.com/jusso-dev/BlakTail/issues/27), and
+[#34](https://github.com/jusso-dev/BlakTail/issues/34). This is source-commit smoke
+proof, not release proof: forced relay traffic, IPv6-only operation,
+revocation/re-enrolment, published signed agent packages, and secure linking of
+pre-existing distinct login identities remain open acceptance work.
 
 ## Stack (locked for first cut)
 

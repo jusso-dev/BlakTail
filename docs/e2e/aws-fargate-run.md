@@ -1,10 +1,95 @@
-# AWS Fargate smoke runs — 23–24 August 2026
+# AWS Fargate smoke runs — 23–25 August 2026
 
-The archived runs below used the coordinator storage shape recorded in each run.
-The current harness has since replaced SQLite/EFS with two coordinator tasks on
-Multi-AZ RDS PostgreSQL. That change has local SQLx cross-replica evidence but is
-not attributed to these older AWS screenshots; a new run must append its own task,
-failover, snapshot-restore, and teardown identifiers.
+Run `20260824ma1` is the first archived proof of the current SQLx/PostgreSQL shape.
+Older runs below retain the coordinator storage and product boundaries that were
+true when each screenshot was taken.
+
+## SQLx HA, restore, and portal run — `20260824ma1`
+
+Run `20260824ma1` exercised the disposable Sydney stack from source commit
+`07e5b05ffb51d192475e61eca0ddb909259dfb24`. Credential-free evidence was sealed
+at `2026-08-25T01:31:59Z`. Teardown destroyed 92 Terraform resources across one
+credential-safe resume and returned zero active scoped residue.
+
+```text
+region: ap-southeast-2
+immutable_arm64_images: passed
+explicit_sqlx_and_drizzle_migrations: passed
+coordinator_replicas: 2/2 on PostgreSQL schema 4
+public_signup: HTTP 400 EMAIL_PASSWORD_SIGN_UP_DISABLED
+owner_login: HTTP 200
+browser_device_approval: passed
+friendly_device_names: passed and persisted after reload
+private_agent_enrollment: passed
+bidirectional_ipv4_ipv6: passed
+magicdns_overlay_routes_ssh: passed
+coordinator_failover: 113 health probes, 0 failures, restored 2/2
+snapshot_restore: schema 4, 2 nodes, 1 user, 1 membership
+temporary_restore_resources: deleted
+teardown: 92 destroyed, active_scoped_residue=0
+```
+
+The first activation exposed two deployment defects. The console image no longer
+contained the AWS CLI used by the bootstrap task, so the runtime gained a small
+Bun/Node SigV4 S3 reader that uses only the ECS task-role credential endpoint. The
+coordinator then exposed mixed rustls crypto providers from SQLx and the HTTP
+server. SQLx was aligned on AWS-LC and the operator contract gained a real TLS
+startup regression test. Registry-native, digest-pinned image patches let the
+expiring disposable run continue without weakening immutability.
+
+The supported first-owner task locked after creating one owner. Public signup was
+still disabled at the HTTP endpoint. An isolated local Chrome profile approved both
+short-lived browser requests because the managed Chrome bridge rejected its bundled
+client before connection. No enrolment page was captured. The saved screenshots
+show the blank sign-in form and the post-enrolment inventory only, and the temporary
+profile/runtime were deleted.
+
+The portal saved `Sydney Ubuntu Agent` and `Sydney AL2023 Agent`, reloaded the page,
+and verified the values persisted while the technical hostnames and MagicDNS names
+remained unchanged. The live run used one workspace; the separate PostgreSQL HTTP
+test covers one session aggregating machines across two workspace memberships.
+
+![Current-run sign-in before credentials were entered](../images/aws-e2e/sign-in-20260824ma1.png)
+
+![Current-run agents with persisted friendly names](../images/aws-e2e/devices-20260824ma1.png)
+
+The immutable image digests were:
+
+```text
+console:     sha256:905317f4e85b787b17332f6e15688bac040ed0e358cc2748cd35ac5599edf2fd
+coordinator: sha256:548effdfcc9dc085e1f8c2eb22b418e02cb75fb62ce2b80b4c14b13d29b0c94c
+relay:       sha256:97f621ea5ba7fcb8a4853dc34a95fa7d0bd435ca7bdb062ca0a5c6a2afcad7de
+TLS bridge:  sha256:3214e863db4bb6c0a547faf290d782e547752f6c7aa3039ae433f1977d00a073
+```
+
+The ARM64 package checksums were:
+
+```text
+RPM: 43bd19fec7fd17d399c2e39fd50ce7598ff2ba6696dd17d05ba6cfc8d4896060
+DEB: b195a6a7a6232f5ffaa71a28b73b77b11e879951f7591d2d56ade2ad66d12294
+```
+
+For HA, the harness first required the tagged coordinator service to be stable at
+2/2 on the exact task-definition revision. It continuously requested public
+`/health`, stopped one service task, verified the stop identity, waited for a new
+task, and required the replacement set to return to 2/2. All 113 requests returned
+HTTP 200.
+
+For restore, the harness created an encrypted manual snapshot of the private
+Multi-AZ source, restored it into the same private database subnets, and launched a
+one-off console task using Bun's native SQL client. The task verified coordinator
+schema version 4, two enrolled node rows, one Better Auth user, and one membership.
+The first validation attempt correctly cleaned its restore after discovering that
+the hardened runtime intentionally lacked `psql`; the Bun-native retry passed, and
+both the temporary database and snapshot were deleted before evidence collection.
+
+The initial destroy credential expired while Terraform was waiting for the already
+deleting RDS instance. The AWS CLI refreshed the same account identity, the guarded
+partial-destroy context resumed with 11 resources, and teardown completed. RDS,
+VPC, ECR, load balancers, running compute, secrets, logs, and state were absent.
+AWS's tagging API temporarily retained 18 provider tombstones; native APIs resolved
+them only as terminated EC2 instances, inactive ECS services/cluster/task
+definitions, and stopped tasks—not active or billable stack resources.
 
 ## Operator configuration and portal rerun — `20260824i41a`
 

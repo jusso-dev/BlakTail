@@ -92,8 +92,19 @@ if grep -q 'aws s3 cp.*CREDENTIAL_KEY' "$SCRIPT_DIR/bootstrap-owner.sh"; then
   die "owner task must not depend on the AWS CLI"
 fi
 grep -q 'EMAIL_PASSWORD_SIGN_UP_DISABLED' "$SCRIPT_DIR/verify-auth.sh"
+grep -q '>All networks<' "$SCRIPT_DIR/verify-auth.sh"
 grep -q 'owner-auth.ok' "$SCRIPT_DIR/verify-auth.sh"
 grep -q 'owner-auth.ok' "$SCRIPT_DIR/collect-evidence.sh"
+grep -q 'coord-ha.ok' "$SCRIPT_DIR/collect-evidence.sh"
+grep -q 'ecs stop-task' "$SCRIPT_DIR/prove-coord-ha.sh"
+grep -q 'failed_health_probes' "$SCRIPT_DIR/prove-coord-ha.sh"
+grep -q 'restore-db-instance-from-db-snapshot' "$SCRIPT_DIR/prove-db-restore.sh"
+grep -q 'temporary_resources_deleted' "$SCRIPT_DIR/prove-db-restore.sh"
+grep -q 'db-restore.ok' "$SCRIPT_DIR/collect-evidence.sh"
+grep -q 'scripts/aws-e2e/prove-coord-ha.sh' "$REPO_ROOT/.github/workflows/aws-e2e.yml"
+grep -q 'scripts/aws-e2e/prove-db-restore.sh' "$REPO_ROOT/.github/workflows/aws-e2e.yml"
+grep -q 'Refresh short-lived AWS credentials for teardown' \
+  "$REPO_ROOT/.github/workflows/aws-e2e.yml"
 if grep -E 'sign-up/email|INSERT INTO membership|DELETE FROM membership' \
   "$SCRIPT_DIR/bootstrap-owner.sh" "$SCRIPT_DIR/recover-owner.sh" >/dev/null; then
   die "AWS owner ceremony must use supported bootstrap CLI only"

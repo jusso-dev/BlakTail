@@ -58,7 +58,7 @@ login_status=$(curl --silent --show-error --output "$login_response" \
 devices_status=$(curl --silent --show-error --output "$devices_page" \
   --max-time 20 --write-out '%{http_code}' --cookie "$cookie_jar" "$public_url/devices")
 [ "$devices_status" = 200 ] || die "authenticated devices page returned HTTP $devices_status"
-grep -q '>Devices<' "$devices_page" || die "authenticated devices heading missing"
+grep -q '>All networks<' "$devices_page" || die "authenticated all-networks heading missing"
 if grep -q '>Sign in<' "$devices_page"; then
   die "authenticated devices request rendered sign-in"
 fi

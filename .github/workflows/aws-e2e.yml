@@ -110,8 +110,29 @@ jobs:
       - name: Prove private agent connectivity and remote SSH
         run: scripts/aws-e2e/prove-network.sh
 
+      - name: Refresh short-lived AWS credentials for HA and restore drills
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_E2E_ROLE_ARN }}
+          role-session-name: blaktail-e2e-proof-${{ inputs.run_id }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Prove coordinator failover without health loss
+        run: scripts/aws-e2e/prove-coord-ha.sh
+
+      - name: Prove encrypted PostgreSQL snapshot restore
+        run: scripts/aws-e2e/prove-db-restore.sh
+
       - name: Collect credential-free evidence
         run: scripts/aws-e2e/collect-evidence.sh
+
+      - name: Refresh short-lived AWS credentials for teardown
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_E2E_ROLE_ARN }}
+          role-session-name: blaktail-e2e-destroy-${{ inputs.run_id }}
+          aws-region: ${{ inputs.aws_region }}
 
       - name: Guarded teardown
         if: always()

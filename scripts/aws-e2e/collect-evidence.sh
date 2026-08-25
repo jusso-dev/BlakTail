@@ -23,6 +23,8 @@ for required_file in \
   "$WORK_DIR/enrolment-al2023.ok" \
   "$WORK_DIR/network-proof-ubuntu.ok" \
   "$WORK_DIR/network-proof-al2023.ok" \
+  "$WORK_DIR/coord-ha.ok" \
+  "$WORK_DIR/db-restore.ok" \
   "$PACKAGE_DIR/SHA256SUMS"; do
   [ -s "$required_file" ] || die "required evidence missing: $required_file"
 done
@@ -93,6 +95,8 @@ cp "$WORK_DIR/enrolment-ubuntu.ok" "$evidence_dir/enrolment-ubuntu.txt"
 cp "$WORK_DIR/enrolment-al2023.ok" "$evidence_dir/enrolment-al2023.txt"
 cp "$WORK_DIR/network-proof-ubuntu.ok" "$evidence_dir/network-proof-ubuntu.txt"
 cp "$WORK_DIR/network-proof-al2023.ok" "$evidence_dir/network-proof-al2023.txt"
+cp "$WORK_DIR/coord-ha.ok" "$evidence_dir/coord-ha.json"
+cp "$WORK_DIR/db-restore.ok" "$evidence_dir/db-restore.json"
 
 commit_sha=$(git -C "$REPO_ROOT" rev-parse HEAD)
 generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -113,7 +117,9 @@ jq -n \
       "schema-v1 config validated before migrations", "redacted effective config stored",
       "no public agent IP", "no inbound SSH",
       "immutable ARM64 images", "bidirectional IPv4", "bidirectional IPv6",
-      "MagicDNS", "relay endpoint configured", "overlay routes", "SSH over BlakTail"]}' >"$evidence_dir/manifest.json"
+      "MagicDNS", "relay endpoint configured", "overlay routes", "SSH over BlakTail",
+      "two-task coordinator failover with zero failed health probes",
+      "encrypted private PostgreSQL snapshot restore with schema and row checks"]}' >"$evidence_dir/manifest.json"
 
 if grep -R -E '(Code: [A-Z0-9-]{8,}|/enroll\?code=|device_code|join[_ -]?key|private[_ -]?key|secret[_ -]?access)' \
   "$evidence_dir" >/dev/null 2>&1; then
