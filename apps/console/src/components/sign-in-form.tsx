@@ -6,9 +6,17 @@ import { useState, useTransition } from "react";
 import { authClient } from "@/lib/auth-client";
 import { TAGLINE } from "@/lib/tagline";
 
-export function SignInForm({ nextPath = "/devices" }: { nextPath?: string }) {
+export function SignInForm({
+  nextPath = "/devices",
+  errorMessage,
+  organisationId,
+}: {
+  nextPath?: string;
+  errorMessage?: string;
+  organisationId?: string;
+}) {
   const router = useRouter();
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(errorMessage ?? null);
   const [pending, startTransition] = useTransition();
 
   return (
@@ -68,10 +76,24 @@ export function SignInForm({ nextPath = "/devices" }: { nextPath?: string }) {
               {pending ? "Signing in…" : "Sign in"}
             </button>
           </form>
+          <form action="/api/oidc/start" method="get">
+            <input type="hidden" name="redirect" value={nextPath} />
+            <label>
+              Organisation ID for SSO
+              <input
+                name="organisation"
+                defaultValue={organisationId ?? ""}
+                placeholder="Workspace UUID"
+              />
+            </label>
+            <button type="submit" className="secondary">
+              Continue with organisation SSO
+            </button>
+          </form>
           <p className="muted">
-            Email and password only for now. Sessions stay in your onshore
-            Postgres. The Rust coordinator checks them before it changes the
-            tailnet.
+            Password accounts remain the break-glass path. Organisation SSO uses
+            Authorization Code + PKCE against an owner-configured HTTPS issuer.
+            Sessions stay in onshore Postgres.
           </p>
           <p className="muted">
             <Link href="/privacy">Privacy and data handling</Link>

@@ -11,14 +11,29 @@ function safeNext(value: string | string[] | undefined): string {
 export default async function SignInPage({
   searchParams,
 }: {
-  searchParams: Promise<{ next?: string | string[] }>;
+  searchParams: Promise<{
+    next?: string | string[];
+    error?: string | string[];
+    organisation?: string | string[];
+  }>;
 }) {
-  const nextPath = safeNext((await searchParams).next);
+  const params = await searchParams;
+  const nextPath = safeNext(params.next);
+  const error = Array.isArray(params.error) ? params.error[0] : params.error;
+  const organisation = Array.isArray(params.organisation)
+    ? params.organisation[0]
+    : params.organisation;
   const session = await auth.api.getSession({
     headers: await headers(),
   });
   if (session) {
     redirect(nextPath);
   }
-  return <SignInForm nextPath={nextPath} />;
+  return (
+    <SignInForm
+      nextPath={nextPath}
+      errorMessage={error}
+      organisationId={organisation}
+    />
+  );
 }

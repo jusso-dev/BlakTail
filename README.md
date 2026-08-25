@@ -83,6 +83,9 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 - Owner-approved Linux subnet routers and opt-in IPv4 exit nodes
 - Dual-stack tailnets with an organisation ULA `/64` and one `/128` per node
 - Prometheus coordinator/relay metrics and an actor-attributed admin audit log
+  with cursor pagination and 90-day default retention
+- Device inventory with last-seen/online, OS/agent posture, search, revoke, and
+  tombstone; versioned `/api/v1` automation credentials for owners
 
 ## Current boundaries
 

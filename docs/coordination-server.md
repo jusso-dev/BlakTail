@@ -100,8 +100,11 @@ rechecks the survivor.
 - `PUT /v1/orgs/{org_id}/nodes/{node_id}/routes` — owner/admin approval of an exact subset of advertised routes
 - `GET /v1/orgs/{org_id}/security` — any org user session; read node-key lifetime policy
 - `PUT /v1/orgs/{org_id}/security` — owner/admin session; set node-key lifetime from 1 to 365 days
-- `GET /v1/orgs/{org_id}/audit` — any org user session; latest audit events (`limit=1..200`)
+- `GET /v1/orgs/{org_id}/audit` — any org user session; latest audit events (`limit=1..200`, optional `before=created_at:id`)
 - `DELETE /v1/orgs/{org_id}/nodes/{node_id}` — owner/admin session; revoke a device
+- `POST /v1/orgs/{org_id}/nodes/{node_id}/tombstone` — owner/admin session; remove a device from default inventory
+- `GET/POST /v1/orgs/{org_id}/api-clients` and `DELETE /v1/orgs/{org_id}/api-clients/{id}` — owner-created automation credentials
+- `/api/v1/*` — versioned admin API; `Authorization: Bearer bta_…` plus `X-BlakTail-Organisation`; OpenAPI in [docs/openapi/admin-v1.yaml](openapi/admin-v1.yaml); compatibility policy in [admin-api.md](admin-api.md)
 - `POST /v1/nodes/register` — join key, name, WG public key, and optional public endpoint; the server allocates a tailnet IP
 - `GET /v1/nodes/{node_id}/peers` — bearer node token; active peers only
 - `PUT /v1/nodes/{node_id}/routes` — bearer node token; replace route advertisements and drop stale approvals

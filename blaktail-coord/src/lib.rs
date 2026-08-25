@@ -1,3 +1,4 @@
+mod admin;
 mod metrics;
 
 pub use metrics::CoordMetrics;
@@ -31,7 +32,10 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+const DEFAULT_AUDIT_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
+const NODE_ONLINE_SECS: i64 = 90;
+const EPHEMERAL_OFFLINE_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_NODE_KEY_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MIN_NODE_KEY_TTL_SECS: i64 = 24 * 60 * 60;
 const MAX_NODE_KEY_TTL_SECS: i64 = 365 * 24 * 60 * 60;
@@ -55,7 +59,7 @@ pub enum DatabaseBackend {
 
 #[derive(Clone)]
 pub struct Store {
-    pool: AnyPool,
+    pub(crate) pool: AnyPool,
     backend: DatabaseBackend,
 }
 
@@ -99,6 +103,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "bootstrap reservations and device poll throttling",
         postgres_sql: include_str!("../migrations/postgres/0004_bootstrap_and_poll_throttling.sql"),
+    },
+    Migration {
+        version: 5,
+        name: "device inventory, audit retention, and automation clients",
+        postgres_sql: include_str!("../migrations/postgres/0005_inventory_admin_api.sql"),
     },
 ];
 
@@ -289,6 +298,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             2 => migrate_sqlite_to_v2(&mut tx).await?,
             3 => migrate_sqlite_to_v3(&mut tx).await?,
             4 => migrate_sqlite_to_v4(&mut tx).await?,
+            5 => migrate_sqlite_to_v5(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -298,6 +308,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             2 => "PRAGMA user_version=2",
             3 => "PRAGMA user_version=3",
             4 => "PRAGMA user_version=4",
+            5 => "PRAGMA user_version=5",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -505,6 +516,70 @@ async fn migrate_sqlite_to_v4(
     Ok(())
 }
 
+async fn migrate_sqlite_to_v5(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    ensure_column(
+        tx,
+        "orgs",
+        "audit_retention_seconds",
+        "INTEGER NOT NULL DEFAULT 7776000",
+    )
+    .await?;
+    ensure_column(tx, "nodes", "last_seen_at", "INTEGER").await?;
+    ensure_column(tx, "nodes", "os", "TEXT").await?;
+    ensure_column(tx, "nodes", "os_version", "TEXT").await?;
+    ensure_column(tx, "nodes", "agent_version", "TEXT").await?;
+    ensure_column(tx, "nodes", "hostname", "TEXT").await?;
+    ensure_column(
+        tx,
+        "nodes",
+        "capabilities_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )
+    .await?;
+    ensure_column(tx, "nodes", "ephemeral", "INTEGER NOT NULL DEFAULT 0").await?;
+    ensure_column(tx, "nodes", "deleted_at", "INTEGER").await?;
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS api_clients (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            token_hash TEXT NOT NULL UNIQUE,
+            token_prefix TEXT NOT NULL,
+            scopes_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(scopes_json)),
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER,
+            expires_at INTEGER,
+            revoked_at INTEGER,
+            UNIQUE(org_id,name)
+        );
+        CREATE INDEX IF NOT EXISTS api_clients_org_idx ON api_clients(org_id, revoked_at);
+        CREATE TABLE IF NOT EXISTS api_idempotency (
+            org_id TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            key_hash TEXT NOT NULL,
+            method TEXT NOT NULL,
+            path TEXT NOT NULL,
+            request_hash TEXT NOT NULL DEFAULT '',
+            status INTEGER NOT NULL,
+            body_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (org_id, client_id, key_hash)
+        );",
+    )
+    .execute(&mut **tx)
+    .await?;
+    ensure_column(
+        tx,
+        "api_idempotency",
+        "request_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    Ok(())
+}
+
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
     let rows =
         sqlx::query("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")
@@ -596,7 +671,7 @@ async fn ensure_column(
     Ok(())
 }
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     store: Store,
     metrics: Arc<CoordMetrics>,
     auth_hmac_secret: Arc<[u8]>,
@@ -689,6 +764,10 @@ pub fn app_with_relays_console_and_metrics(
         .route("/v1/orgs/:org_id/nodes", get(list_nodes))
         .route("/v1/orgs/:org_id/nodes/:node_id", delete(admin_revoke_node))
         .route(
+            "/v1/orgs/:org_id/nodes/:node_id/tombstone",
+            post(admin_tombstone_node),
+        )
+        .route(
             "/v1/orgs/:org_id/nodes/:node_id/friendly-name",
             put(update_node_friendly_name),
         )
@@ -701,6 +780,15 @@ pub fn app_with_relays_console_and_metrics(
         .route("/v1/orgs/:org_id/security", get(get_security_policy))
         .route("/v1/orgs/:org_id/security", put(put_security_policy))
         .route("/v1/orgs/:org_id/audit", get(list_audit_events))
+        .route(
+            "/v1/orgs/:org_id/api-clients",
+            get(admin::list_api_clients).post(admin::create_api_client),
+        )
+        .route(
+            "/v1/orgs/:org_id/api-clients/:client_id",
+            delete(admin::revoke_api_client),
+        )
+        .merge(admin::api_routes())
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/:node_id/reauth", post(reauth_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
@@ -820,7 +908,7 @@ async fn record_metrics(State(state): State<AppState>, request: Request, next: N
     response
 }
 #[derive(Debug, Error)]
-enum ApiError {
+pub(crate) enum ApiError {
     #[error("{0}")]
     BadRequest(String),
     #[error("authentication failed")]
@@ -837,6 +925,8 @@ enum ApiError {
     TooManyRequests,
     #[error("service unavailable")]
     Unavailable,
+    #[error("precondition failed")]
+    PreconditionFailed,
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("database error")]
@@ -853,12 +943,34 @@ impl IntoResponse for ApiError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::Gone => StatusCode::GONE,
+            Self::PreconditionFailed => StatusCode::PRECONDITION_FAILED,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Database(_) | Self::CorruptData => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        (status, Json(serde_json::json!({"error":self.to_string()}))).into_response()
+        let code = match self {
+            Self::BadRequest(_) => "bad_request",
+            Self::Unauthorized | Self::CredentialExpired => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::Gone => "gone",
+            Self::PreconditionFailed => "precondition_failed",
+            Self::TooManyRequests => "rate_limited",
+            Self::Unavailable => "unavailable",
+            Self::Conflict(_) => "conflict",
+            Self::Database(_) | Self::CorruptData => "internal_error",
+        };
+        (
+            status,
+            Json(serde_json::json!({
+                "error": self.to_string(),
+                "code": code,
+                "message": self.to_string(),
+                "request_id": Uuid::new_v4(),
+            })),
+        )
+            .into_response()
     }
 }
 #[derive(Serialize)]
@@ -1462,7 +1574,7 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         .is_some_and(|error| error.is_unique_violation())
 }
 
-fn conflict(message: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
+pub(crate) fn conflict(message: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
     move |error| {
         if is_unique_violation(&error) {
             ApiError::Conflict(message.into())
@@ -1569,6 +1681,18 @@ struct RegisterNode {
     allowed_ips: Vec<String>,
     #[serde(default)]
     advertised_routes: Vec<String>,
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    os_version: Option<String>,
+    #[serde(default)]
+    agent_version: Option<String>,
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    ephemeral: bool,
 }
 
 struct RegistrationGrant {
@@ -1592,7 +1716,7 @@ pub enum Role {
     Member,
 }
 impl Role {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Owner => "owner",
             Self::Admin => "admin",
@@ -1622,6 +1746,30 @@ fn canonical_tags(mut tags: Vec<DeviceTag>) -> Vec<DeviceTag> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn normalise_inventory_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().chars().take(64).collect::<String>())
+        .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+}
+
+fn canonical_capabilities(mut capabilities: Vec<String>) -> Vec<String> {
+    capabilities = capabilities
+        .into_iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 32
+                && value
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+        .collect();
+    capabilities.sort();
+    capabilities.dedup();
+    capabilities.truncate(16);
+    capabilities
 }
 #[derive(Serialize, Deserialize)]
 struct RegisterResponse {
@@ -1706,7 +1854,8 @@ async fn register_node(
     let dns_name = magic_dns_name(input.name.trim(), &grant.org_id);
     let registered_at = now();
     let credential_expires_at = registered_at + grant.node_key_ttl;
-    sqlx::query("INSERT INTO nodes(id,org_id,name,wg_public_key,endpoint,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,advertised_routes_json,approved_routes_json,credential_expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'[]',$14)")
+    let capabilities = serde_json::to_string(&canonical_capabilities(input.capabilities)).unwrap();
+    sqlx::query("INSERT INTO nodes(id,org_id,name,wg_public_key,endpoint,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,advertised_routes_json,approved_routes_json,credential_expires_at,last_seen_at,os,os_version,agent_version,hostname,capabilities_json,ephemeral) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'[]',$14,$14,$15,$16,$17,$18,$19,$20)")
         .bind(id.to_string())
         .bind(&grant.org_id)
         .bind(input.name.trim())
@@ -1721,6 +1870,12 @@ async fn register_node(
         .bind(&dns_name)
         .bind(serde_json::to_string(&advertised_routes).unwrap())
         .bind(credential_expires_at)
+        .bind(normalise_inventory_text(input.os))
+        .bind(normalise_inventory_text(input.os_version))
+        .bind(normalise_inventory_text(input.agent_version))
+        .bind(normalise_inventory_text(input.hostname))
+        .bind(capabilities)
+        .bind(i64::from(input.ephemeral))
         .execute(&mut *tx)
         .await
         .map_err(conflict("node name, DNS name, public key, or address already exists in org"))?;
@@ -2052,7 +2207,7 @@ async fn list_peers(
     headers: HeaderMap,
 ) -> Result<Json<PeersResponse>, ApiError> {
     let token = bearer(&headers)?;
-    let source_row = sqlx::query("SELECT n.org_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=$1 AND n.token_hash=$2 AND n.revoked_at IS NULL")
+    let source_row = sqlx::query("SELECT n.org_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=$1 AND n.token_hash=$2 AND n.revoked_at IS NULL AND n.deleted_at IS NULL")
         .bind(node_id.to_string())
         .bind(token)
         .fetch_optional(&s.store.pool)
@@ -2068,6 +2223,12 @@ async fn list_peers(
     if credential_expires_at <= now() {
         return Err(ApiError::CredentialExpired);
     }
+    sqlx::query("UPDATE nodes SET last_seen_at=$1 WHERE id=$2")
+        .bind(now())
+        .bind(node_id.to_string())
+        .execute(&s.store.pool)
+        .await?;
+    expire_ephemeral_nodes(&s.store, &org).await?;
     let source = Subject {
         role: source_role.parse().map_err(|_| ApiError::CorruptData)?,
         tags: serde_json::from_str(&source_tags).unwrap_or_default(),
@@ -2078,7 +2239,7 @@ async fn list_peers(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let rows = sqlx::query("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>$3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL AND credential_expires_at>$4 ORDER BY name")
+    let rows = sqlx::query("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>$3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL AND deleted_at IS NULL AND credential_expires_at>$4 ORDER BY name")
         .bind(org)
         .bind(node_id.to_string())
         .bind(now() - RELAY_ENDPOINT_FRESH_SECS)
@@ -2402,7 +2563,7 @@ async fn revoke_node(
 }
 
 #[derive(Serialize, Deserialize)]
-struct NodeRow {
+pub(crate) struct NodeRow {
     id: Uuid,
     name: String,
     display_name: Option<String>,
@@ -2420,26 +2581,85 @@ struct NodeRow {
     expired: bool,
     expires_soon: bool,
     revoked: bool,
+    #[serde(default)]
+    deleted: bool,
+    #[serde(default)]
+    online: bool,
+    #[serde(default)]
+    last_seen_at: Option<i64>,
+    #[serde(default)]
+    os: Option<String>,
+    #[serde(default)]
+    os_version: Option<String>,
+    #[serde(default)]
+    agent_version: Option<String>,
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    ephemeral: bool,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct NodeListQuery {
+    q: Option<String>,
+    state: Option<String>,
+    include_deleted: Option<bool>,
+    limit: Option<u16>,
+    before: Option<String>,
 }
 
 async fn list_nodes(
     State(s): State<AppState>,
     UrlPath(org_id): UrlPath<Uuid>,
+    Query(query): Query<NodeListQuery>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<NodeRow>>, ApiError> {
     console_session(&s, &headers, org_id).await?;
+    expire_ephemeral_nodes(&s.store, &org_id.to_string()).await?;
+    Ok(Json(load_nodes(&s.store, org_id, &query).await?))
+}
+
+pub(crate) async fn load_nodes(
+    store: &Store,
+    org_id: Uuid,
+    query: &NodeListQuery,
+) -> Result<Vec<NodeRow>, ApiError> {
+    let include_deleted = query.include_deleted.unwrap_or(false);
+    let limit = i64::from(query.limit.unwrap_or(200).clamp(1, 200));
+    let current_time = now();
     let rows = sqlx::query(
-        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CAST(created_at AS BIGINT),credential_expires_at,CASE WHEN credential_expires_at<=$2 THEN 1 ELSE 0 END,CASE WHEN credential_expires_at<=$3 THEN 1 ELSE 0 END,CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END,advertised_routes_json,approved_routes_json,display_name FROM nodes WHERE org_id=$1 ORDER BY LOWER(COALESCE(NULLIF(TRIM(display_name),''),name)),name",
+        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CAST(created_at AS BIGINT),credential_expires_at,CASE WHEN credential_expires_at<=$2 THEN 1 ELSE 0 END,CASE WHEN credential_expires_at<=$3 THEN 1 ELSE 0 END,CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END,advertised_routes_json,approved_routes_json,display_name,last_seen_at,os,os_version,agent_version,hostname,capabilities_json,ephemeral,CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END FROM nodes WHERE org_id=$1 ORDER BY LOWER(COALESCE(NULLIF(TRIM(display_name),''),name)),name",
     )
     .bind(org_id.to_string())
-    .bind(now())
-    .bind(now() + 14 * 24 * 60 * 60)
-    .fetch_all(&s.store.pool)
+    .bind(current_time)
+    .bind(current_time + 14 * 24 * 60 * 60)
+    .fetch_all(&store.pool)
     .await?;
-    let rows = rows
+    let wanted = query
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let state = query
+        .state
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+    let before = query
+        .before
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut nodes = rows
         .into_iter()
         .map(|row| {
             let id: String = row.try_get(0)?;
+            let last_seen_at: Option<i64> = row.try_get(17)?;
+            let deleted = row.try_get::<i64, _>(24)? != 0;
             Ok::<_, ApiError>(NodeRow {
                 id: Uuid::parse_str(&id).map_err(|_| ApiError::CorruptData)?,
                 name: row.try_get(1)?,
@@ -2461,10 +2681,65 @@ async fn list_nodes(
                 expired: row.try_get::<i64, _>(11)? != 0,
                 expires_soon: row.try_get::<i64, _>(12)? != 0,
                 revoked: row.try_get::<i64, _>(13)? != 0,
+                deleted,
+                online: last_seen_at.is_some_and(|seen| current_time - seen <= NODE_ONLINE_SECS)
+                    && !deleted,
+                last_seen_at,
+                os: row.try_get(18)?,
+                os_version: row.try_get(19)?,
+                agent_version: row.try_get(20)?,
+                hostname: row.try_get(21)?,
+                capabilities: serde_json::from_str(&row.try_get::<String, _>(22)?)
+                    .unwrap_or_default(),
+                ephemeral: row.try_get::<i64, _>(23)? != 0,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(rows))
+    nodes.retain(|node| {
+        if !include_deleted && node.deleted {
+            return false;
+        }
+        if let Some(state) = state.as_deref() {
+            let matches = match state {
+                "active" => !node.revoked && !node.deleted && !node.expired,
+                "online" => node.online,
+                "offline" => !node.online && !node.deleted && !node.revoked,
+                "revoked" => node.revoked && !node.deleted,
+                "deleted" | "tombstone" => node.deleted,
+                "expired" => node.expired && !node.deleted,
+                "ephemeral" => node.ephemeral,
+                _ => true,
+            };
+            if !matches {
+                return false;
+            }
+        }
+        if let Some(wanted) = wanted.as_deref() {
+            let haystack = [
+                node.name.as_str(),
+                node.display_name.as_deref().unwrap_or(""),
+                node.dns_name.as_str(),
+                node.hostname.as_deref().unwrap_or(""),
+                node.os.as_deref().unwrap_or(""),
+                node.agent_version.as_deref().unwrap_or(""),
+                &node.id.to_string(),
+            ]
+            .join(" ")
+            .to_ascii_lowercase();
+            if !haystack.contains(wanted) {
+                return false;
+            }
+        }
+        true
+    });
+    if let Some(before) = before {
+        nodes = match nodes.iter().position(|node| node.id.to_string() == before) {
+            Some(position) => nodes.split_off(position + 1),
+            None => Vec::new(),
+        };
+    }
+    nodes.truncate(limit as usize);
+    Ok(nodes)
 }
 
 #[derive(Deserialize)]
@@ -2504,7 +2779,7 @@ async fn update_node_friendly_name(
     let friendly_name = normalise_friendly_name(&input.friendly_name)?;
     let mut tx = s.store.pool.begin().await?;
     let current = sqlx::query(
-        "SELECT name,display_name FROM nodes WHERE id=$1 AND org_id=$2 AND revoked_at IS NULL",
+        "SELECT name,display_name FROM nodes WHERE id=$1 AND org_id=$2 AND revoked_at IS NULL AND deleted_at IS NULL",
     )
     .bind(node_id.to_string())
     .bind(org_id.to_string())
@@ -2557,7 +2832,7 @@ async fn admin_revoke_node(
     }
     let mut tx = s.store.pool.begin().await?;
     let changed = sqlx::query(
-        "UPDATE nodes SET revoked_at=$1 WHERE id=$2 AND org_id=$3 AND revoked_at IS NULL",
+        "UPDATE nodes SET revoked_at=$1 WHERE id=$2 AND org_id=$3 AND revoked_at IS NULL AND deleted_at IS NULL",
     )
     .bind(now())
     .bind(node_id.to_string())
@@ -2581,6 +2856,99 @@ async fn admin_revoke_node(
     tx.commit().await?;
     info!(%node_id, %org_id, "node revoked by console");
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_tombstone_node(
+    State(s): State<AppState>,
+    UrlPath((org_id, node_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let session = console_session(&s, &headers, org_id).await?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    tombstone_node(&s.store, org_id, node_id, &session).await
+}
+
+pub(crate) async fn tombstone_node(
+    store: &Store,
+    org_id: Uuid,
+    node_id: Uuid,
+    session: &Session,
+) -> Result<StatusCode, ApiError> {
+    let mut tx = store.pool.begin().await?;
+    let existing = sqlx::query(
+        "SELECT name,wg_public_key FROM nodes WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(org_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|row| Ok::<_, sqlx::Error>((row.try_get::<String, _>(0)?, row.try_get::<String, _>(1)?)))
+    .transpose()?;
+    let (technical_name, public_key) = existing.ok_or(ApiError::NotFound)?;
+    let tombstone_name = format!("{technical_name}.deleted.{}", &node_id.to_string()[..8]);
+    let tombstone_key = format!("{public_key}.deleted");
+    let changed = sqlx::query(
+        "UPDATE nodes SET deleted_at=$1,revoked_at=COALESCE(revoked_at,$1),name=$2,wg_public_key=$3,token_hash=$4,dns_name=$5 WHERE id=$6 AND org_id=$7 AND deleted_at IS NULL",
+    )
+    .bind(now())
+    .bind(&tombstone_name)
+    .bind(&tombstone_key)
+    .bind(format!("deleted:{}", hash(&node_id.to_string())))
+    .bind(format!("{}.deleted", magic_dns_name(&technical_name, &org_id.to_string())))
+    .bind(node_id.to_string())
+    .bind(org_id.to_string())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    append_audit(
+        &mut tx,
+        org_id,
+        session,
+        "node.tombstoned",
+        "node",
+        Some(&node_id.to_string()),
+        &serde_json::json!({
+            "technical_name": technical_name,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    info!(%node_id, %org_id, "node tombstoned");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn expire_ephemeral_nodes(store: &Store, org_id: &str) -> Result<(), ApiError> {
+    let cutoff = now() - EPHEMERAL_OFFLINE_SECS;
+    let rows = sqlx::query(
+        "SELECT id FROM nodes WHERE org_id=$1 AND ephemeral=1 AND deleted_at IS NULL AND (last_seen_at IS NULL OR last_seen_at<$2)",
+    )
+    .bind(org_id)
+    .bind(cutoff)
+    .fetch_all(&store.pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let session = Session {
+        user_id: "coordinator".into(),
+        role: Role::Owner,
+        name: "BlakTail coordinator".into(),
+        email: String::new(),
+    };
+    for row in rows {
+        let id: String = row.try_get(0)?;
+        let Ok(node_id) = Uuid::parse_str(&id) else {
+            continue;
+        };
+        let org = Uuid::parse_str(org_id).map_err(|_| ApiError::CorruptData)?;
+        let _ = tombstone_node(store, org, node_id, &session).await;
+    }
+    Ok(())
 }
 
 async fn get_acl(
@@ -2612,6 +2980,23 @@ async fn put_acl(
         .map_err(|e| ApiError::BadRequest(format!("invalid ACL: {e}")))?;
     acl.validate()?;
     let mut tx = s.store.pool.begin().await?;
+    let current: Option<String> = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+    let current = current.ok_or(ApiError::NotFound)?;
+    if let Some(expected) = headers
+        .get("if-match")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let etag = hash(&current);
+        let quoted = format!("\"{etag}\"");
+        if expected != etag && expected != quoted {
+            return Err(ApiError::PreconditionFailed);
+        }
+    }
     let changed = sqlx::query("UPDATE orgs SET acl_json=$1 WHERE id=$2")
         .bind(value.to_string())
         .bind(org_id.to_string())
@@ -2699,13 +3084,14 @@ async fn put_security_policy(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
-struct AuditQuery {
+#[derive(Default, Deserialize)]
+pub(crate) struct AuditQuery {
     limit: Option<u16>,
+    before: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
-struct AuditEvent {
+#[derive(Deserialize, Serialize, Clone)]
+pub(crate) struct AuditEvent {
     id: String,
     actor_user_id: String,
     actor_name: String,
@@ -2725,16 +3111,56 @@ async fn list_audit_events(
     Query(query): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEvent>>, ApiError> {
     console_session(&s, &headers, org_id).await?;
+    purge_expired_audit(&s.store, org_id).await?;
+    Ok(Json(load_audit_events(&s.store, org_id, &query).await?))
+}
+
+pub(crate) async fn load_audit_events(
+    store: &Store,
+    org_id: Uuid,
+    query: &AuditQuery,
+) -> Result<Vec<AuditEvent>, ApiError> {
     let limit = i64::from(query.limit.unwrap_or(100).clamp(1, 200));
-    let rows = sqlx::query(
-        "SELECT id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at FROM audit_events WHERE org_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2",
-    )
-    .bind(org_id.to_string())
-    .bind(limit)
-    .fetch_all(&s.store.pool)
-    .await?;
-    let events = rows
-        .into_iter()
+    let before = query
+        .before
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (before_created_at, before_id) = match before {
+        Some(cursor) => {
+            let (created_at, id) = cursor
+                .split_once(':')
+                .ok_or_else(|| ApiError::BadRequest("before must be created_at:id".into()))?;
+            let created_at = created_at
+                .parse::<i64>()
+                .map_err(|_| ApiError::BadRequest("before created_at is invalid".into()))?;
+            if id.is_empty() {
+                return Err(ApiError::BadRequest("before id is required".into()));
+            }
+            (Some(created_at), Some(id.to_owned()))
+        }
+        None => (None, None),
+    };
+    let rows = if let (Some(created_at), Some(id)) = (before_created_at, before_id) {
+        sqlx::query(
+            "SELECT id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at FROM audit_events WHERE org_id=$1 AND (created_at<$2 OR (created_at=$2 AND id<$3)) ORDER BY created_at DESC,id DESC LIMIT $4",
+        )
+        .bind(org_id.to_string())
+        .bind(created_at)
+        .bind(id)
+        .bind(limit)
+        .fetch_all(&store.pool)
+        .await?
+    } else {
+        sqlx::query(
+            "SELECT id,actor_user_id,actor_name,actor_email,actor_role,action,target_type,target_id,details_json,created_at FROM audit_events WHERE org_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2",
+        )
+        .bind(org_id.to_string())
+        .bind(limit)
+        .fetch_all(&store.pool)
+        .await?
+    };
+    rows.into_iter()
         .map(|row| {
             let details_json: String = row.try_get(8)?;
             Ok::<_, sqlx::Error>(AuditEvent {
@@ -2750,11 +3176,26 @@ async fn list_audit_events(
                 created_at: row.try_get(9)?,
             })
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(events))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::Database)
 }
 
-async fn append_audit(
+pub(crate) async fn purge_expired_audit(store: &Store, org_id: Uuid) -> Result<(), ApiError> {
+    let retention: i64 = sqlx::query_scalar("SELECT audit_retention_seconds FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&store.pool)
+        .await?
+        .unwrap_or(DEFAULT_AUDIT_RETENTION_SECS);
+    let cutoff = now() - retention.max(86_400);
+    sqlx::query("DELETE FROM audit_events WHERE org_id=$1 AND created_at<$2")
+        .bind(org_id.to_string())
+        .bind(cutoff)
+        .execute(&store.pool)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn append_audit(
     connection: &mut AnyConnection,
     org_id: Uuid,
     session: &Session,
@@ -2802,14 +3243,15 @@ struct AssertionClaims {
     action: Option<String>,
 }
 
-struct Session {
-    user_id: String,
-    role: Role,
-    name: String,
-    email: String,
+#[derive(Clone)]
+pub(crate) struct Session {
+    pub(crate) user_id: String,
+    pub(crate) role: Role,
+    pub(crate) name: String,
+    pub(crate) email: String,
 }
 
-async fn console_session(
+pub(crate) async fn console_session(
     state: &AppState,
     headers: &HeaderMap,
     org_id: Uuid,
@@ -3001,7 +3443,7 @@ fn selector(roles: &[Role], tags: &[DeviceTag], s: &Subject) -> bool {
 fn bearer(headers: &HeaderMap) -> Result<String, ApiError> {
     Ok(hash(bearer_value(headers)?))
 }
-fn bearer_value(headers: &HeaderMap) -> Result<&str, ApiError> {
+pub(crate) fn bearer_value(headers: &HeaderMap) -> Result<&str, ApiError> {
     headers
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -3009,13 +3451,13 @@ fn bearer_value(headers: &HeaderMap) -> Result<&str, ApiError> {
         .filter(|v| !v.is_empty())
         .ok_or(ApiError::Unauthorized)
 }
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     Utc::now().timestamp()
 }
-fn hash(value: &str) -> String {
+pub(crate) fn hash(value: &str) -> String {
     format!("{:x}", Sha256::digest(value.as_bytes()))
 }
-fn secret(prefix: &str) -> String {
+pub(crate) fn secret(prefix: &str) -> String {
     let mut b = [0u8; 32];
     OsRng.fill_bytes(&mut b);
     format!("{prefix}_{}", URL_SAFE_NO_PAD.encode(b))
@@ -3242,7 +3684,7 @@ mod tests {
 
         let cleanup = connect_postgres(&database_url).await.unwrap();
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
+            "DROP TABLE IF EXISTS api_idempotency,api_clients,pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
         )
         .execute(&cleanup)
         .await
@@ -3334,7 +3776,7 @@ mod tests {
         second.pool.close().await;
         let cleanup = connect_postgres(&database_url).await.unwrap();
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
+            "DROP TABLE IF EXISTS api_idempotency,api_clients,pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
         )
         .execute(&cleanup)
         .await
@@ -5133,6 +5575,28 @@ mod tests {
                     StatusCode::FORBIDDEN,
                 ],
             ),
+            (
+                "node tombstone",
+                Method::POST,
+                format!("/v1/orgs/{}/nodes/{missing_node}/tombstone", o.id),
+                serde_json::Value::Null,
+                [
+                    StatusCode::NOT_FOUND,
+                    StatusCode::NOT_FOUND,
+                    StatusCode::FORBIDDEN,
+                ],
+            ),
+            (
+                "api client create",
+                Method::POST,
+                format!("/v1/orgs/{}/api-clients", o.id),
+                serde_json::json!({"name":"ci","scopes":["status:read"]}),
+                [
+                    StatusCode::CREATED,
+                    StatusCode::FORBIDDEN,
+                    StatusCode::FORBIDDEN,
+                ],
+            ),
         ] {
             for (index, token) in roles.into_iter().enumerate() {
                 assert_eq!(
@@ -5424,7 +5888,7 @@ mod tests {
             Uuid::new_v4()
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
-        sqlx::raw_sql("PRAGMA user_version=5")
+        sqlx::raw_sql("PRAGMA user_version=6")
             .execute(&pool)
             .await
             .unwrap();
@@ -5446,5 +5910,372 @@ mod tests {
         assert_eq!(table_count, 0);
         pool.close().await;
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn audit_pagination_retention_and_device_inventory_contracts() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "inventory-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let first =
+            register_test_node(&r, org.id, &owner, "field-laptop", "inventory-key-1", &[]).await;
+        let join: JoinKeyResponse = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", org.id),
+                serde_json::json!({"expires_in_seconds":60}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let register_with_posture = call(
+            &r,
+            Method::POST,
+            "/v1/nodes/register",
+            serde_json::json!({
+                "join_key": join.key,
+                "name": "ranger-tablet",
+                "wg_public_key": "inventory-key-2",
+                "os": "linux",
+                "os_version": "6.8",
+                "agent_version": "0.1.0",
+                "hostname": "ranger-tablet",
+                "capabilities": ["ssh", "wireguard"],
+                "ephemeral": false
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(register_with_posture.status(), StatusCode::CREATED);
+        let second: RegisterResponse = body(register_with_posture).await;
+        assert_eq!(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers?ipv6=true", second.id),
+                serde_json::Value::Null,
+                Some(&second.node_token),
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+
+        let listed: Vec<NodeRow> = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes?q=ranger&state=online", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, second.id);
+        assert_eq!(listed[0].os.as_deref(), Some("linux"));
+        assert_eq!(listed[0].agent_version.as_deref(), Some("0.1.0"));
+        assert!(listed[0].online);
+        assert!(listed[0].capabilities.contains(&"ssh".into()));
+
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/nodes/{}/tombstone", org.id, first.id),
+                serde_json::Value::Null,
+                Some(&member),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/nodes/{}/tombstone", org.id, first.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let hidden: Vec<NodeRow> = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert!(hidden.iter().all(|node| node.id != first.id));
+        let tombstones: Vec<NodeRow> = body(
+            call(
+                &r,
+                Method::GET,
+                &format!(
+                    "/v1/orgs/{}/nodes?include_deleted=true&state=deleted",
+                    org.id
+                ),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(tombstones.len(), 1);
+        assert!(tombstones[0].deleted);
+
+        let first_page: Vec<AuditEvent> = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/audit?limit=1", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first_page.len(), 1);
+        let cursor = format!("{}:{}", first_page[0].created_at, first_page[0].id);
+        let second_page: Vec<AuditEvent> = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/audit?limit=200&before={cursor}", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert!(second_page.iter().all(|event| event.id != first_page[0].id));
+        sqlx::query("UPDATE audit_events SET created_at=$1 WHERE org_id=$2")
+            .bind(now() - DEFAULT_AUDIT_RETENTION_SECS - 10)
+            .bind(org.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let retained: Vec<AuditEvent> = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/audit", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert!(retained.is_empty());
+    }
+
+    #[tokio::test]
+    async fn admin_api_tokens_are_scoped_hashed_and_tenant_bound() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "admin-api-org").await;
+        let other = create_test_org(&r, "admin-api-other").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let other_owner = signed_session(other.id, "owner-2", Role::Owner, now() + 60);
+        let created: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"github-actions","scopes":["devices:read","status:read"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert!(created.token.starts_with("bta_"));
+        let stored_hash: String =
+            sqlx::query_scalar("SELECT token_hash FROM api_clients WHERE id=$1")
+                .bind(created.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_ne!(stored_hash, created.token);
+        assert_eq!(stored_hash, hash(&created.token));
+
+        let status = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/status")
+            .header(AUTHORIZATION, format!("Bearer {}", created.token))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .body(Body::from("null"))
+            .unwrap();
+        let response = r.clone().oneshot(status).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let forbidden_write = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/keys")
+            .header(AUTHORIZATION, format!("Bearer {}", created.token))
+            .header("content-type", "application/json")
+            .header("x-blaktail-organisation", org.id.to_string())
+            .body(Body::from(r#"{"expires_in_seconds":60}"#))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(forbidden_write).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let cross_tenant = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/status")
+            .header(AUTHORIZATION, format!("Bearer {}", created.token))
+            .header("x-blaktail-organisation", other.id.to_string())
+            .body(Body::from("null"))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(cross_tenant).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let node = register_test_node(&r, org.id, &owner, "api-node", "admin-api-key", &[]).await;
+        let node_as_api = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/status")
+            .header(AUTHORIZATION, format!("Bearer {}", node.node_token))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .body(Body::from("null"))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(node_as_api).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        assert_eq!(
+            call(
+                &r,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/api-clients/{}", org.id, created.id),
+                serde_json::Value::Null,
+                Some(&other_owner),
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/api-clients/{}", org.id, created.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let revoked = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/status")
+            .header(AUTHORIZATION, format!("Bearer {}", created.token))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .body(Body::from("null"))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(revoked).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        for path in [
+            "/api/v1/status",
+            "/api/v1/devices",
+            "/api/v1/keys",
+            "/api/v1/policy",
+            "/api/v1/audit",
+        ] {
+            let response = r
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(if path == "/api/v1/keys" {
+                            Method::POST
+                        } else {
+                            Method::GET
+                        })
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must not be anonymous"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_api_key_mint_is_idempotent_and_uses_error_envelope() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "admin-idem-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let created: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"deploy","scopes":["keys:write","status:read"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let mint = |ttl: i64| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/keys")
+                .header(AUTHORIZATION, format!("Bearer {}", created.token))
+                .header("x-blaktail-organisation", org.id.to_string())
+                .header("content-type", "application/json")
+                .header("idempotency-key", "release-key-1")
+                .body(Body::from(format!(r#"{{"expires_in_seconds":{ttl}}}"#)))
+                .unwrap()
+        };
+        let first = r.clone().oneshot(mint(60)).await.unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body: serde_json::Value = body(first).await;
+        let second = r.clone().oneshot(mint(60)).await.unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second_body: serde_json::Value = body(second).await;
+        assert_eq!(first_body["data"]["id"], second_body["data"]["id"]);
+        let conflict = r.clone().oneshot(mint(120)).await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let denied = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/v1/status")
+                    .body(Body::from("null"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let envelope: serde_json::Value = body(denied).await;
+        assert_eq!(envelope["code"], "unauthorized");
+        assert!(envelope["request_id"].as_str().is_some());
     }
 }

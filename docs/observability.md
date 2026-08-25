@@ -58,13 +58,21 @@ Audited actions are:
 - `device_authorization.approved`
 - `node.routes_updated`
 - `node.revoked` (console administration)
+- `node.tombstoned`
 - `node.friendly_name_updated`
+- `api_client.created`
+- `api_client.revoked`
 - `acl.updated`
 - `security.updated`
 
+A native (non-Compose) scrape of both listeners is recorded in
+[e2e/observability-proof.md](e2e/observability-proof.md) and re-run in CI by
+`scripts/conformance/prove-observability.sh`.
+
 Organisation members can inspect the latest 100 events in Console → Audit log.
-The coordinator API supports `GET /v1/orgs/{org_id}/audit?limit=200`; it enforces
-the signed organisation boundary. Secret join keys, node tokens, raw device
+The coordinator API supports `GET /v1/orgs/{org_id}/audit?limit=200&before=created_at:id`
+cursor pagination and enforces the signed organisation boundary. Events older than
+the organisation's `audit_retention_seconds` (default 90 days) are purged on read. Secret join keys, node tokens, raw device
 codes, and ACL bodies are omitted. ACL events store only rule count and SHA-256.
 Database administrators can still alter the underlying store directly, so ship database
 audit records and process logs to separately controlled backup/log storage when tamper evidence

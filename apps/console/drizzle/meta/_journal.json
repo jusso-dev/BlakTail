@@ -36,6 +36,13 @@
       "when": 1787540000000,
       "tag": "0004_linked_identities",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1787616000000,
+      "tag": "0005_oidc_and_membership_lifecycle",
+      "breakpoints": true
     }
   ]
 }

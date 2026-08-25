@@ -148,6 +148,10 @@ export const membership = pgTable(
       .notNull()
       .references(() => user.id, { onDelete: "cascade" }),
     role: text("role").notNull().$type<"owner" | "admin" | "member">(),
+    status: text("status")
+      .notNull()
+      .$type<"invited" | "active" | "suspended" | "removed">()
+      .default("active"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (table) => [
@@ -159,6 +163,107 @@ export const membership = pgTable(
       "membership_role_check",
       sql.raw("\"role\" in ('owner', 'admin', 'member')"),
     ),
+    check(
+      "membership_status_check",
+      sql.raw("\"status\" in ('invited', 'active', 'suspended', 'removed')"),
+    ),
+  ],
+);
+
+export const identityProvider = pgTable(
+  "identity_provider",
+  {
+    id: text("id").primaryKey(),
+    organisationId: text("organisation_id")
+      .notNull()
+      .references(() => organisation.id, { onDelete: "cascade" }),
+    issuer: text("issuer").notNull(),
+    clientId: text("client_id").notNull(),
+    clientSecret: text("client_secret").notNull(),
+    enabled: boolean("enabled").notNull().default(false),
+    allowDomainsJson: jsonb("allow_domains_json")
+      .$type<string[]>()
+      .notNull()
+      .default([]),
+    allowSubjectsJson: jsonb("allow_subjects_json")
+      .$type<string[]>()
+      .notNull()
+      .default([]),
+    jitMembership: boolean("jit_membership").notNull().default(false),
+    defaultRole: text("default_role")
+      .notNull()
+      .$type<"admin" | "member">()
+      .default("member"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("identity_provider_org_issuer_unique").on(
+      table.organisationId,
+      table.issuer,
+    ),
+    check(
+      "identity_provider_role_check",
+      sql.raw("\"default_role\" in ('admin', 'member')"),
+    ),
+  ],
+);
+
+export const oidcLoginState = pgTable(
+  "oidc_login_state",
+  {
+    id: text("id").primaryKey(),
+    organisationId: text("organisation_id")
+      .notNull()
+      .references(() => organisation.id, { onDelete: "cascade" }),
+    providerId: text("provider_id")
+      .notNull()
+      .references(() => identityProvider.id, { onDelete: "cascade" }),
+    codeVerifier: text("code_verifier").notNull(),
+    nonce: text("nonce").notNull(),
+    redirectTo: text("redirect_to").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [index("oidc_login_state_expiry_idx").on(table.expiresAt)],
+);
+
+/** Durable issuer+subject binding. Email is never the account key. */
+export const externalIdentity = pgTable(
+  "external_identity",
+  {
+    id: text("id").primaryKey(),
+    organisationId: text("organisation_id")
+      .notNull()
+      .references(() => organisation.id, { onDelete: "cascade" }),
+    providerId: text("provider_id")
+      .notNull()
+      .references(() => identityProvider.id, { onDelete: "cascade" }),
+    issuer: text("issuer").notNull(),
+    subject: text("subject").notNull(),
+    userId: text("user_id")
+      .notNull()
+      .references(() => user.id, { onDelete: "cascade" }),
+    emailSnapshot: text("email_snapshot"),
+    lastAuthenticatedAt: timestamp("last_authenticated_at", {
+      withTimezone: true,
+    }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("external_identity_issuer_subject_unique").on(
+      table.issuer,
+      table.subject,
+    ),
+    index("external_identity_user_idx").on(table.userId),
   ],
 );
 

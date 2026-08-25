@@ -1,8 +1,35 @@
 import "server-only";
 
+import { randomUUID } from "node:crypto";
 import type { AuditEvent } from "./coord";
 import { rawSqlClient } from "./db/client";
 import type { ConsoleContext } from "./session";
+
+export async function writeConsoleAudit(event: {
+  organisationId: string | null;
+  actorUserId: string;
+  actorEmail: string;
+  actorRole: string;
+  source: string;
+  action: string;
+  result: string;
+  targetType: string;
+  targetId?: string;
+  details?: unknown;
+}): Promise<void> {
+  const sql = rawSqlClient();
+  await sql`
+    INSERT INTO console_audit_event (
+      id, organisation_id, actor_user_id, actor_email, actor_role,
+      source, action, result, target_type, target_id, details
+    ) VALUES (
+      ${randomUUID()}, ${event.organisationId}, ${event.actorUserId},
+      ${event.actorEmail}, ${event.actorRole}, ${event.source}, ${event.action},
+      ${event.result}, ${event.targetType}, ${event.targetId ?? null},
+      CAST(${JSON.stringify(event.details ?? {})} AS jsonb)
+    )
+  `;
+}
 
 type ConsoleAuditRow = {
   id: string;

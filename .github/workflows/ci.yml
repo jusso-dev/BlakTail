@@ -51,11 +51,13 @@ jobs:
         run: >-
           sh -n scripts/package-agent.sh scripts/install-agent.sh
           scripts/agent-checksums.sh scripts/two-vm-test.sh scripts/config-contract-test.sh
+          scripts/conformance/prove-observability.sh scripts/publish-package-repos.sh
+          scripts/admin-api-smoke.sh
 
       - name: Build and inspect Linux packages
         run: |
           sudo apt-get update
-          sudo apt-get install --yes rpm
+          sudo apt-get install --yes rpm dpkg-dev
           cargo build --locked -p blaktaild -p blaktail-config
           dist="${RUNNER_TEMP}/blaktail-agent-packages"
           scripts/package-agent.sh deb target/debug/blaktaild "${dist}"
@@ -68,6 +70,10 @@ jobs:
           rpm --query --package --info "${dist}/blaktaild-x86_64-unknown-linux-gnu.rpm"
           rpm --query --package --list "${dist}/blaktaild-x86_64-unknown-linux-gnu.rpm" | grep '^/usr/local/bin/blaktaild$'
           rpm --query --package --list "${dist}/blaktaild-x86_64-unknown-linux-gnu.rpm" | grep '^/usr/local/bin/blaktail-config$'
+          scripts/publish-package-repos.sh "${dist}" "${RUNNER_TEMP}/blaktail-repos"
+
+      - name: Live coordinator and relay metrics scrape
+        run: scripts/conformance/prove-observability.sh
 
   console:
     name: lint, typecheck, build

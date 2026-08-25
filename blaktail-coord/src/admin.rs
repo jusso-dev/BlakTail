@@ -1,0 +1,829 @@
+use crate::{
+    append_audit, bearer_value, conflict, console_session, hash, load_audit_events, load_nodes,
+    now, secret, tombstone_node, ApiError, AppState, AuditQuery, NodeListQuery, Role, Session,
+    Store,
+};
+use axum::{
+    extract::{Path as UrlPath, Query, State},
+    http::{HeaderMap, StatusCode},
+    routing::{get, post, put},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
+use uuid::Uuid;
+
+const API_PREFIX: &str = "bta";
+const DEFAULT_TOKEN_TTL_SECS: i64 = 90 * 24 * 60 * 60;
+const MAX_TOKEN_TTL_SECS: i64 = 365 * 24 * 60 * 60;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Scope {
+    #[serde(rename = "devices:read")]
+    DevicesRead,
+    #[serde(rename = "devices:write")]
+    DevicesWrite,
+    #[serde(rename = "keys:write")]
+    KeysWrite,
+    #[serde(rename = "routes:write")]
+    RoutesWrite,
+    #[serde(rename = "policy:write")]
+    PolicyWrite,
+    #[serde(rename = "audit:read")]
+    AuditRead,
+    #[serde(rename = "status:read")]
+    StatusRead,
+}
+
+impl Scope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DevicesRead => "devices:read",
+            Self::DevicesWrite => "devices:write",
+            Self::KeysWrite => "keys:write",
+            Self::RoutesWrite => "routes:write",
+            Self::PolicyWrite => "policy:write",
+            Self::AuditRead => "audit:read",
+            Self::StatusRead => "status:read",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ApiCaller {
+    session: Session,
+    client_id: Option<String>,
+    scopes: Vec<Scope>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateApiClient {
+    name: String,
+    #[serde(default)]
+    scopes: Vec<Scope>,
+    #[serde(default)]
+    expires_in_seconds: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ApiClientCreated {
+    pub id: Uuid,
+    pub name: String,
+    pub token: String,
+    pub token_prefix: String,
+    pub scopes: Vec<Scope>,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ApiClientRecord {
+    id: Uuid,
+    name: String,
+    token_prefix: String,
+    scopes: Vec<Scope>,
+    created_at: i64,
+    last_used_at: Option<i64>,
+    expires_at: Option<i64>,
+    revoked: bool,
+}
+
+#[derive(Serialize)]
+struct Envelope<T: Serialize> {
+    data: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+pub(crate) fn api_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/v1/status", get(api_status))
+        .route("/api/v1/devices", get(api_list_devices))
+        .route(
+            "/api/v1/devices/:node_id",
+            get(api_get_device).delete(api_delete_device),
+        )
+        .route(
+            "/api/v1/devices/:node_id/friendly-name",
+            put(api_rename_device),
+        )
+        .route(
+            "/api/v1/devices/:node_id/tombstone",
+            post(api_tombstone_device),
+        )
+        .route("/api/v1/keys", post(api_mint_key))
+        .route("/api/v1/devices/:node_id/routes", put(api_approve_routes))
+        .route("/api/v1/policy", get(api_get_policy).put(api_put_policy))
+        .route("/api/v1/audit", get(api_list_audit))
+}
+
+fn require_scope(caller: &ApiCaller, scope: Scope) -> Result<(), ApiError> {
+    if caller.client_id.is_none() {
+        if scope_is_write(scope) && caller.session.role == Role::Member {
+            return Err(ApiError::Forbidden);
+        }
+        return Ok(());
+    }
+    if caller.scopes.contains(&scope)
+        || (scope == Scope::DevicesRead && caller.scopes.contains(&Scope::DevicesWrite))
+    {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden)
+}
+
+fn scope_is_write(scope: Scope) -> bool {
+    matches!(
+        scope,
+        Scope::DevicesWrite | Scope::KeysWrite | Scope::RoutesWrite | Scope::PolicyWrite
+    )
+}
+
+async fn authenticate(
+    state: &AppState,
+    headers: &HeaderMap,
+    org_id: Uuid,
+) -> Result<ApiCaller, ApiError> {
+    let token = bearer_value(headers)?;
+    if token.starts_with(&format!("{API_PREFIX}_")) {
+        return api_token_session(state, token, org_id).await;
+    }
+    let session = console_session(state, headers, org_id).await?;
+    Ok(ApiCaller {
+        session,
+        client_id: None,
+        scopes: Vec::new(),
+    })
+}
+
+async fn authenticate_org_header(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(Uuid, ApiCaller), ApiError> {
+    let org_id = headers
+        .get("x-blaktail-organisation")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value.trim()).ok())
+        .ok_or(ApiError::Unauthorized)?;
+    let caller = authenticate(state, headers, org_id).await?;
+    Ok((org_id, caller))
+}
+
+async fn api_token_session(
+    state: &AppState,
+    token: &str,
+    org_id: Uuid,
+) -> Result<ApiCaller, ApiError> {
+    let current_time = now();
+    let row = sqlx::query(
+        "SELECT id,name,scopes_json,expires_at FROM api_clients WHERE token_hash=$1 AND org_id=$2 AND revoked_at IS NULL",
+    )
+    .bind(hash(token))
+    .bind(org_id.to_string())
+    .fetch_optional(&state.store.pool)
+    .await?
+    .ok_or(ApiError::Unauthorized)?;
+    let client_id: String = row.try_get(0)?;
+    let name: String = row.try_get(1)?;
+    let scopes: Vec<Scope> =
+        serde_json::from_str(&row.try_get::<String, _>(2)?).map_err(|_| ApiError::CorruptData)?;
+    let expires_at: Option<i64> = row.try_get(3)?;
+    if expires_at.is_some_and(|expires| expires <= current_time) {
+        return Err(ApiError::Unauthorized);
+    }
+    sqlx::query("UPDATE api_clients SET last_used_at=$1 WHERE id=$2")
+        .bind(current_time)
+        .bind(&client_id)
+        .execute(&state.store.pool)
+        .await?;
+    Ok(ApiCaller {
+        session: Session {
+            user_id: format!("api:{client_id}"),
+            role: Role::Admin,
+            name,
+            email: String::new(),
+        },
+        client_id: Some(client_id),
+        scopes,
+    })
+}
+
+fn normalise_client_name(name: &str) -> Result<String, ApiError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "name must be 1-64 characters without control characters".into(),
+        ));
+    }
+    Ok(name.to_owned())
+}
+
+pub(crate) async fn create_api_client(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<CreateApiClient>,
+) -> Result<(StatusCode, Json<ApiClientCreated>), ApiError> {
+    let session = console_session(&s, &headers, org_id).await?;
+    if session.role != Role::Owner {
+        return Err(ApiError::Forbidden);
+    }
+    insert_api_client(&s.store, org_id, &session, input).await
+}
+
+async fn insert_api_client(
+    store: &Store,
+    org_id: Uuid,
+    session: &Session,
+    input: CreateApiClient,
+) -> Result<(StatusCode, Json<ApiClientCreated>), ApiError> {
+    let name = normalise_client_name(&input.name)?;
+    let scopes = if input.scopes.is_empty() {
+        vec![Scope::StatusRead]
+    } else {
+        let mut scopes = input.scopes;
+        scopes.sort_by_key(|scope| scope.as_str());
+        scopes.dedup();
+        scopes
+    };
+    let expires_at = match input.expires_in_seconds {
+        Some(seconds) if (60..=MAX_TOKEN_TTL_SECS).contains(&seconds) => Some(now() + seconds),
+        Some(_) => {
+            return Err(ApiError::BadRequest(format!(
+                "expires_in_seconds must be between 60 and {MAX_TOKEN_TTL_SECS}"
+            )))
+        }
+        None => Some(now() + DEFAULT_TOKEN_TTL_SECS),
+    };
+    let token = secret(API_PREFIX);
+    let token_prefix = token.chars().take(11).collect::<String>();
+    let id = Uuid::new_v4();
+    let mut tx = store.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO api_clients(id,org_id,name,token_hash,token_prefix,scopes_json,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(id.to_string())
+    .bind(org_id.to_string())
+    .bind(&name)
+    .bind(hash(&token))
+    .bind(&token_prefix)
+    .bind(serde_json::to_string(&scopes).unwrap())
+    .bind(now())
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(conflict("automation client name already exists"))?;
+    append_audit(
+        &mut tx,
+        org_id,
+        session,
+        "api_client.created",
+        "api_client",
+        Some(&id.to_string()),
+        &serde_json::json!({
+            "name": name,
+            "scopes": scopes,
+            "token_prefix": token_prefix,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiClientCreated {
+            id,
+            name,
+            token,
+            token_prefix,
+            scopes,
+            expires_at,
+        }),
+    ))
+}
+
+pub(crate) async fn list_api_clients(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ApiClientRecord>>, ApiError> {
+    let session = console_session(&s, &headers, org_id).await?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(load_api_clients(&s.store, org_id).await?))
+}
+
+async fn load_api_clients(store: &Store, org_id: Uuid) -> Result<Vec<ApiClientRecord>, ApiError> {
+    let rows = sqlx::query(
+        "SELECT id,name,token_prefix,scopes_json,created_at,last_used_at,expires_at,CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END FROM api_clients WHERE org_id=$1 ORDER BY name",
+    )
+    .bind(org_id.to_string())
+    .fetch_all(&store.pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok::<_, ApiError>(ApiClientRecord {
+                id: Uuid::parse_str(&row.try_get::<String, _>(0)?)
+                    .map_err(|_| ApiError::CorruptData)?,
+                name: row.try_get(1)?,
+                token_prefix: row.try_get(2)?,
+                scopes: serde_json::from_str(&row.try_get::<String, _>(3)?)
+                    .map_err(|_| ApiError::CorruptData)?,
+                created_at: row.try_get(4)?,
+                last_used_at: row.try_get(5)?,
+                expires_at: row.try_get(6)?,
+                revoked: row.try_get::<i64, _>(7)? != 0,
+            })
+        })
+        .collect()
+}
+
+pub(crate) async fn revoke_api_client(
+    State(s): State<AppState>,
+    UrlPath((org_id, client_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let session = console_session(&s, &headers, org_id).await?;
+    if session.role != Role::Owner {
+        return Err(ApiError::Forbidden);
+    }
+    let mut tx = s.store.pool.begin().await?;
+    let changed = sqlx::query(
+        "UPDATE api_clients SET revoked_at=$1,token_hash=$2 WHERE id=$3 AND org_id=$4 AND revoked_at IS NULL",
+    )
+    .bind(now())
+    .bind(format!("revoked:{}", hash(&client_id.to_string())))
+    .bind(client_id.to_string())
+    .bind(org_id.to_string())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    append_audit(
+        &mut tx,
+        org_id,
+        &session,
+        "api_client.revoked",
+        "api_client",
+        Some(&client_id.to_string()),
+        &serde_json::json!({}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_status(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::StatusRead)?;
+    s.store
+        .readiness()
+        .await
+        .map_err(|_| ApiError::Unavailable)?;
+    Ok(Json(serde_json::json!({
+        "status": "ready",
+        "api": "v1",
+        "organisation_id": org_id,
+        "schema_version": crate::CURRENT_SCHEMA_VERSION,
+    })))
+}
+
+async fn api_list_devices(
+    State(s): State<AppState>,
+    Query(query): Query<NodeListQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<Vec<crate::NodeRow>>>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesRead)?;
+    let nodes = load_nodes(&s.store, org_id, &query).await?;
+    let next_cursor = nodes.last().map(|node| node.id.to_string());
+    Ok(Json(Envelope {
+        data: nodes,
+        next_cursor,
+    }))
+}
+
+async fn api_get_device(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<crate::NodeRow>>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesRead)?;
+    let query = NodeListQuery {
+        include_deleted: Some(true),
+        ..NodeListQuery::default()
+    };
+    let node = load_nodes(&s.store, org_id, &query)
+        .await?
+        .into_iter()
+        .find(|node| node.id == node_id)
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(Envelope {
+        data: node,
+        next_cursor: None,
+    }))
+}
+
+async fn api_delete_device(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesWrite)?;
+    let mut tx = s.store.pool.begin().await?;
+    let changed = sqlx::query(
+        "UPDATE nodes SET revoked_at=$1 WHERE id=$2 AND org_id=$3 AND revoked_at IS NULL AND deleted_at IS NULL",
+    )
+    .bind(now())
+    .bind(node_id.to_string())
+    .bind(org_id.to_string())
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    append_audit(
+        &mut tx,
+        org_id,
+        &caller.session,
+        "node.revoked",
+        "node",
+        Some(&node_id.to_string()),
+        &serde_json::json!({"via":"admin_api"}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FriendlyNameBody {
+    friendly_name: String,
+}
+
+async fn api_rename_device(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<FriendlyNameBody>,
+) -> Result<StatusCode, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesWrite)?;
+    rename_device(&s, org_id, node_id, &caller.session, &body.friendly_name).await
+}
+
+async fn rename_device(
+    state: &AppState,
+    org_id: Uuid,
+    node_id: Uuid,
+    session: &Session,
+    friendly_name: &str,
+) -> Result<StatusCode, ApiError> {
+    if session.role == Role::Member && !session.user_id.starts_with("api:") {
+        return Err(ApiError::Forbidden);
+    }
+    let value = friendly_name.trim();
+    let friendly_name = if value.is_empty() {
+        None
+    } else {
+        if value.chars().count() > 64 || value.chars().any(char::is_control) {
+            return Err(ApiError::BadRequest(
+                "friendly_name must be at most 64 characters".into(),
+            ));
+        }
+        Some(value.to_owned())
+    };
+    let mut tx = state.store.pool.begin().await?;
+    let current = sqlx::query(
+        "SELECT name,display_name FROM nodes WHERE id=$1 AND org_id=$2 AND revoked_at IS NULL AND deleted_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(org_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|row| {
+        Ok::<_, sqlx::Error>((
+            row.try_get::<String, _>(0)?,
+            row.try_get::<Option<String>, _>(1)?,
+        ))
+    })
+    .transpose()?;
+    let (technical_name, previous) = current.ok_or(ApiError::NotFound)?;
+    if previous == friendly_name {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    sqlx::query("UPDATE nodes SET display_name=$1 WHERE id=$2 AND org_id=$3")
+        .bind(&friendly_name)
+        .bind(node_id.to_string())
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    append_audit(
+        &mut tx,
+        org_id,
+        session,
+        "node.friendly_name_updated",
+        "node",
+        Some(&node_id.to_string()),
+        &serde_json::json!({
+            "friendly_name": friendly_name,
+            "previous_friendly_name": previous,
+            "technical_name": technical_name,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_tombstone_device(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesWrite)?;
+    tombstone_node(&s.store, org_id, node_id, &caller.session).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MintKeyBody {
+    #[serde(default = "default_key_ttl")]
+    expires_in_seconds: i64,
+    #[serde(default = "default_true")]
+    single_use: bool,
+}
+
+fn default_key_ttl() -> i64 {
+    3600
+}
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize)]
+struct MintedKey {
+    id: Uuid,
+    key: String,
+    expires_at: i64,
+    single_use: bool,
+}
+
+fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(value) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if !(8..=128).contains(&value.len()) || value.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "Idempotency-Key must be 8-128 printable characters".into(),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+async fn api_mint_key(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<MintKeyBody>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::KeysWrite)?;
+    if !(1..=2_592_000).contains(&input.expires_in_seconds) {
+        return Err(ApiError::BadRequest(
+            "expires_in_seconds must be between 1 and 2592000".into(),
+        ));
+    }
+    let actor = caller.client_id.clone().unwrap_or_else(|| "console".into());
+    let request_hash = crate::hash(&format!(
+        "{}:{}",
+        input.expires_in_seconds, input.single_use
+    ));
+    if let Some(key) = idempotency_key(&headers)? {
+        if let Some(row) = sqlx::query(
+            "SELECT request_hash,status,body_json FROM api_idempotency WHERE org_id=$1 AND client_id=$2 AND key_hash=$3",
+        )
+        .bind(org_id.to_string())
+        .bind(&actor)
+        .bind(crate::hash(&key))
+        .fetch_optional(&s.store.pool)
+        .await?
+        {
+            let stored: String = row.try_get(0)?;
+            if stored != request_hash {
+                return Err(ApiError::Conflict(
+                    "Idempotency-Key was reused with a different request".into(),
+                ));
+            }
+            let status = u16::try_from(row.try_get::<i64, _>(1)?).unwrap_or(201);
+            let body: String = row.try_get(2)?;
+            return Ok((
+                StatusCode::from_u16(status).unwrap_or(StatusCode::CREATED),
+                Json(serde_json::from_str(&body).unwrap_or_default()),
+            ));
+        }
+    }
+    let key = secret("btk");
+    let id = Uuid::new_v4();
+    let expires_at = now() + input.expires_in_seconds;
+    let mut tx = s.store.pool.begin().await?;
+    let changed = sqlx::query("INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT $1,id,$2,$3,$4,$5,$6,$7,'[]' FROM orgs WHERE id=$8")
+        .bind(id.to_string())
+        .bind(hash(&key))
+        .bind(expires_at)
+        .bind(i64::from(input.single_use))
+        .bind(now())
+        .bind(&caller.session.user_id)
+        .bind(caller.session.role.as_str())
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    append_audit(
+        &mut tx,
+        org_id,
+        &caller.session,
+        "join_key.minted",
+        "join_key",
+        Some(&id.to_string()),
+        &serde_json::json!({"single_use": input.single_use, "via":"admin_api"}),
+    )
+    .await?;
+    let body = serde_json::to_value(Envelope {
+        data: MintedKey {
+            id,
+            key,
+            expires_at,
+            single_use: input.single_use,
+        },
+        next_cursor: None,
+    })
+    .unwrap_or_default();
+    if let Some(idempotency) = idempotency_key(&headers)? {
+        sqlx::query(
+            "INSERT INTO api_idempotency(org_id,client_id,key_hash,method,path,request_hash,status,body_json,created_at) VALUES($1,$2,$3,'POST','/api/v1/keys',$4,201,$5,$6)",
+        )
+        .bind(org_id.to_string())
+        .bind(&actor)
+        .bind(crate::hash(&idempotency))
+        .bind(&request_hash)
+        .bind(body.to_string())
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok((StatusCode::CREATED, Json(body)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RouteBody {
+    approved_routes: Vec<String>,
+}
+
+async fn api_approve_routes(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<RouteBody>,
+) -> Result<StatusCode, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::RoutesWrite)?;
+    let mut tx = s.store.pool.begin().await?;
+    let advertised: Option<String> = sqlx::query_scalar(
+        "SELECT advertised_routes_json FROM nodes WHERE id=$1 AND org_id=$2 AND deleted_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(org_id.to_string())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let advertised: Vec<String> =
+        serde_json::from_str(&advertised.ok_or(ApiError::NotFound)?).unwrap_or_default();
+    for route in &body.approved_routes {
+        if !advertised.iter().any(|advertised| advertised == route) {
+            return Err(ApiError::BadRequest(format!(
+                "route {route} was not advertised"
+            )));
+        }
+    }
+    sqlx::query("UPDATE nodes SET approved_routes_json=$1 WHERE id=$2 AND org_id=$3")
+        .bind(serde_json::to_string(&body.approved_routes).unwrap())
+        .bind(node_id.to_string())
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    append_audit(
+        &mut tx,
+        org_id,
+        &caller.session,
+        "node.routes_updated",
+        "node",
+        Some(&node_id.to_string()),
+        &serde_json::json!({"approved_routes": body.approved_routes, "via":"admin_api"}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_get_policy(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<serde_json::Value>>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesRead)?;
+    let acl: String = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&s.store.pool)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let etag = hash(&acl);
+    Ok(Json(Envelope {
+        data: serde_json::json!({
+            "acl": serde_json::from_str::<serde_json::Value>(&acl).unwrap_or_default(),
+            "etag": etag,
+        }),
+        next_cursor: None,
+    }))
+}
+
+async fn api_put_policy(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Result<StatusCode, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::PolicyWrite)?;
+    let acl = value
+        .get("acl")
+        .cloned()
+        .ok_or_else(|| ApiError::BadRequest("acl is required".into()))?;
+    let mut tx = s.store.pool.begin().await?;
+    let current: Option<String> = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&mut *tx)
+        .await?;
+    let current = current.ok_or(ApiError::NotFound)?;
+    if let Some(expected) = value.get("etag").and_then(|value| value.as_str()) {
+        if expected != hash(&current) {
+            return Err(ApiError::PreconditionFailed);
+        }
+    }
+    let changed = sqlx::query("UPDATE orgs SET acl_json=$1 WHERE id=$2")
+        .bind(acl.to_string())
+        .bind(org_id.to_string())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    append_audit(
+        &mut tx,
+        org_id,
+        &caller.session,
+        "acl.updated",
+        "acl",
+        Some(&org_id.to_string()),
+        &serde_json::json!({"via":"admin_api","sha256": hash(&acl.to_string())}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_list_audit(
+    State(s): State<AppState>,
+    Query(query): Query<AuditQuery>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<Vec<crate::AuditEvent>>>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::AuditRead)?;
+    crate::purge_expired_audit(&s.store, org_id).await?;
+    let events = load_audit_events(&s.store, org_id, &query).await?;
+    let next_cursor = events
+        .last()
+        .map(|event| format!("{}:{}", event.created_at, event.id));
+    Ok(Json(Envelope {
+        data: events,
+        next_cursor,
+    }))
+}

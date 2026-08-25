@@ -139,6 +139,12 @@ struct RegisterRequest<'a> {
     endpoint: Option<&'a str>,
     allowed_ips: Vec<String>,
     advertised_routes: &'a [String],
+    os: &'a str,
+    os_version: &'a str,
+    agent_version: &'a str,
+    hostname: &'a str,
+    capabilities: Vec<String>,
+    ephemeral: bool,
 }
 pub struct Registration<'a> {
     pub join_key: &'a str,
@@ -148,6 +154,7 @@ pub struct Registration<'a> {
     pub interface: &'a str,
     pub advertised_routes: &'a [String],
     pub exit_node: Option<String>,
+    pub ephemeral: bool,
 }
 #[derive(Serialize)]
 struct DeviceAuthorizationRequest<'a> {
@@ -231,6 +238,10 @@ pub struct Coordinator {
 }
 impl Coordinator {
     pub fn new(base: &str) -> Result<Self, Error> {
+        Self::with_ca(base, None)
+    }
+
+    pub fn with_ca(base: &str, ca_pem: Option<&[u8]>) -> Result<Self, Error> {
         let base = base.trim_end_matches('/').to_owned();
         if !(base.starts_with("https://")
             || base.starts_with("http://127.0.0.1")
@@ -240,9 +251,16 @@ impl Coordinator {
                 "coordinator must use HTTPS (HTTP is allowed only for localhost)".into(),
             ));
         }
+        let mut builder = reqwest::Client::builder();
+        if let Some(pem) = ca_pem {
+            builder = builder.add_root_certificate(
+                reqwest::Certificate::from_pem(pem)
+                    .map_err(|error| Error::Message(format!("invalid coordinator CA: {error}")))?,
+            );
+        }
         Ok(Self {
             base,
-            client: reqwest::Client::new(),
+            client: builder.build()?,
         })
     }
     pub async fn begin_device_authorization(
@@ -315,6 +333,12 @@ impl Coordinator {
                 endpoint: registration.endpoint,
                 allowed_ips: vec![],
                 advertised_routes: registration.advertised_routes,
+                os: std::env::consts::OS,
+                os_version: std::env::consts::ARCH,
+                agent_version: env!("CARGO_PKG_VERSION"),
+                hostname: registration.name,
+                capabilities: vec!["wireguard".into(), "magicdns".into()],
+                ephemeral: registration.ephemeral,
             })
             .send()
             .await?;

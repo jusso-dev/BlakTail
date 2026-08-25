@@ -27,6 +27,30 @@ export type CoordNode = {
   expired: boolean;
   expires_soon: boolean;
   revoked: boolean;
+  deleted?: boolean;
+  online?: boolean;
+  last_seen_at?: number | null;
+  os?: string | null;
+  os_version?: string | null;
+  agent_version?: string | null;
+  hostname?: string | null;
+  capabilities?: string[];
+  ephemeral?: boolean;
+};
+
+export type ApiClient = {
+  id: string;
+  name: string;
+  token_prefix: string;
+  scopes: string[];
+  created_at: number;
+  last_used_at: number | null;
+  expires_at: number | null;
+  revoked: boolean;
+};
+
+export type ApiClientCreated = ApiClient & {
+  token: string;
 };
 
 export type NetworkNode = CoordNode & {
@@ -210,6 +234,78 @@ export async function revokeNode(
     method: "DELETE",
     ctx,
   });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+}
+
+export async function tombstoneNode(
+  ctx: ConsoleContext,
+  nodeId: string,
+): Promise<void> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot delete devices.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/nodes/${nodeId}/tombstone`,
+    {
+      method: "POST",
+      ctx,
+    },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+}
+
+export async function listApiClients(
+  ctx: ConsoleContext,
+): Promise<ApiClient[]> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot list automation credentials.");
+  }
+  const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/api-clients`, {
+    method: "GET",
+    ctx,
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<ApiClient[]>;
+}
+
+export async function createApiClient(
+  ctx: ConsoleContext,
+  input: { name: string; scopes: string[] },
+): Promise<ApiClientCreated> {
+  if (ctx.role !== "owner") {
+    throw new Error("Only owners can create automation credentials.");
+  }
+  const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/api-clients`, {
+    method: "POST",
+    ctx,
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<ApiClientCreated>;
+}
+
+export async function revokeApiClient(
+  ctx: ConsoleContext,
+  clientId: string,
+): Promise<void> {
+  if (ctx.role !== "owner") {
+    throw new Error("Only owners can revoke automation credentials.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/api-clients/${clientId}`,
+    {
+      method: "DELETE",
+      ctx,
+    },
+  );
   if (!res.ok) {
     throw new Error(await readError(res));
   }

@@ -3,7 +3,9 @@ CREATE TABLE IF NOT EXISTS orgs (
  id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
  acl_json TEXT NOT NULL CHECK (json_valid(acl_json)), created_at TEXT NOT NULL,
  node_key_ttl_seconds INTEGER NOT NULL DEFAULT 7776000
-   CHECK (node_key_ttl_seconds BETWEEN 86400 AND 31536000)
+   CHECK (node_key_ttl_seconds BETWEEN 86400 AND 31536000),
+ audit_retention_seconds INTEGER NOT NULL DEFAULT 7776000
+   CHECK (audit_retention_seconds BETWEEN 86400 AND 31536000)
 );
 CREATE TABLE IF NOT EXISTS join_keys (
  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
@@ -42,6 +44,14 @@ CREATE TABLE IF NOT EXISTS nodes (
  credential_expires_at INTEGER NOT NULL DEFAULT 0,
  relay_endpoint TEXT,
  relay_endpoint_updated_at INTEGER,
+ last_seen_at INTEGER,
+ os TEXT,
+ os_version TEXT,
+ agent_version TEXT,
+ hostname TEXT,
+ capabilities_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(capabilities_json)),
+ ephemeral INTEGER NOT NULL DEFAULT 0 CHECK (ephemeral IN (0,1)),
+ deleted_at INTEGER,
  UNIQUE(org_id,name), UNIQUE(org_id,wg_public_key)
 );
 CREATE INDEX IF NOT EXISTS nodes_active_org_idx ON nodes(org_id, revoked_at);
@@ -78,3 +88,29 @@ CREATE TABLE IF NOT EXISTS pending_bootstrap_orgs (
 );
 CREATE INDEX IF NOT EXISTS pending_bootstrap_orgs_expiry_idx
  ON pending_bootstrap_orgs(expires_at);
+CREATE TABLE IF NOT EXISTS api_clients (
+ id TEXT PRIMARY KEY,
+ org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+ name TEXT NOT NULL,
+ token_hash TEXT NOT NULL UNIQUE,
+ token_prefix TEXT NOT NULL,
+ scopes_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(scopes_json)),
+ created_at INTEGER NOT NULL,
+ last_used_at INTEGER,
+ expires_at INTEGER,
+ revoked_at INTEGER,
+ UNIQUE(org_id,name)
+);
+CREATE INDEX IF NOT EXISTS api_clients_org_idx ON api_clients(org_id, revoked_at);
+CREATE TABLE IF NOT EXISTS api_idempotency (
+ org_id TEXT NOT NULL,
+ client_id TEXT NOT NULL,
+ key_hash TEXT NOT NULL,
+ method TEXT NOT NULL,
+ path TEXT NOT NULL,
+ request_hash TEXT NOT NULL,
+ status INTEGER NOT NULL,
+ body_json TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ PRIMARY KEY (org_id, client_id, key_hash)
+);

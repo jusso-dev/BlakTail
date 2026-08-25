@@ -20,6 +20,7 @@ const migrations = [
   "0002_account_issuer.sql",
   "0003_secure_bootstrap.sql",
   "0004_linked_identities.sql",
+  "0005_oidc_and_membership_lifecycle.sql",
 ];
 
 async function resetThrough(sql, selectedMigrations) {

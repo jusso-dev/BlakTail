@@ -10,12 +10,16 @@ local process for access, correction, export, and deletion requests.
 
 - The console Postgres database holds account name and email, the Better Auth
   credential record, sessions (which may include IP address and user agent),
-  organisation membership and role, hashed invitation/bootstrap credentials,
-  invitation status/expiry, and actor-attributed console audit events. Raw
-  bootstrap and invitation credentials are shown once and are not stored.
+  organisation membership and role/status, hashed invitation/bootstrap credentials,
+  invitation status/expiry, actor-attributed console audit events, optional OIDC
+  issuer/subject bindings, an email snapshot from the last successful SSO, and
+  an encrypted IdP client secret. Raw bootstrap, invitation, API, and OIDC
+  client secrets are shown once and are not stored in recoverable form.
 - The coordinator's SQLite or PostgreSQL store holds organisation and node identifiers, device names,
   WireGuard public keys, tailnet addresses, advertised endpoints/routes, ACLs,
-  hashed join/node credentials, credential expiry, and actor-attributed audit events.
+  hashed join/node/automation credentials, credential expiry, last-seen time,
+  bounded agent OS/architecture/version/capability metadata, and actor-attributed
+  audit events. Hardware serials, location, and process inventory are not collected.
 - A relay keeps node identifiers and public socket addresses in memory. Registrations
   expire after 120 seconds idle. It forwards opaque WireGuard ciphertext and cannot
   decrypt the inner traffic.
@@ -44,8 +48,10 @@ security incident.
 ## Retention and deletion
 
 Expired browser authorisations are removed by the coordinator, and relay state is
-short-lived in memory. Current coordinator node, join-key, and audit rows otherwise
-have no automatic retention job; revoked and expired records can remain in the coordinator store.
+short-lived in memory. Coordinator audit rows older than the organisation's
+configured retention (default 90 days) are purged when the audit API is read.
+Revoked node rows remain until an owner tombstones them; tombstones keep the
+node id for audit and release the live name and WireGuard key.
 Console account, session, invitation, bootstrap-state, rate-limit, and audit
 retention follows Better Auth plus the operator's database procedures. Used,
 expired, and revoked invitation rows are not currently purged automatically. Logs

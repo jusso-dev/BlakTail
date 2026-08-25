@@ -40,6 +40,12 @@ The installer rejects an unsigned package. Linux artifacts are verified against 
 release's `SHA256SUMS`; this detects corruption but is not a substitute for protecting
 the GitHub release account.
 
+`scripts/publish-package-repos.sh DIST REPO_OUT` builds APT `Release` metadata and
+copies RPM packages from the same bytes. Set `BLAKTAIL_REPO_GPG_KEY` to produce
+`InRelease` / `Release.gpg`. Keep `stable` and opt-in `beta` as separate outputs;
+never publish a mutable `latest` package identity. Repository signing keys stay
+outside CI plaintext.
+
 `.github/workflows/agent-release.yml` is the only publication path. It builds each
 target on its native GitHub runner, signs and notarises both macOS packages, builds
 Linux on the Amazon Linux 2023 glibc baseline, creates GitHub OIDC provenance

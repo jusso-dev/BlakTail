@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   approveNodeRoutesAction,
   revokeDeviceAction,
+  tombstoneDeviceAction,
   updateDeviceFriendlyNameAction,
 } from "@/app/actions";
 import type { NetworkNode } from "@/lib/coord";
@@ -21,6 +22,22 @@ export function DeviceActions({
     error: boolean;
   } | null>(null);
   const [pending, startTransition] = useTransition();
+  const [query, setQuery] = useState("");
+  const visible = nodes.filter((node) => {
+    const wanted = query.trim().toLowerCase();
+    if (!wanted) return true;
+    return [
+      node.name,
+      node.display_name ?? "",
+      node.dns_name,
+      node.hostname ?? "",
+      node.os ?? "",
+      node.id,
+    ]
+      .join(" ")
+      .toLowerCase()
+      .includes(wanted);
+  });
 
   if (nodes.length === 0) {
     return (
@@ -32,6 +49,14 @@ export function DeviceActions({
 
   return (
     <div className="stack">
+      <label>
+        Search inventory
+        <input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Name, DNS, OS, or node id"
+        />
+      </label>
       <div className="table-wrap">
         <table className="table">
         <thead>
@@ -42,13 +67,15 @@ export function DeviceActions({
             <th>Addresses</th>
             <th>Advertised routes</th>
             <th>Tags</th>
+            <th>Posture</th>
+            <th>Last seen</th>
             <th>Credential expiry</th>
             <th>State</th>
             <th />
           </tr>
         </thead>
         <tbody>
-          {nodes.map((node) => (
+          {visible.map((node) => (
             <tr key={`${node.organisation_id}:${node.id}`}>
               <td>
                 <strong>{node.network_account_name}</strong>
@@ -190,6 +217,21 @@ export function DeviceActions({
                     ))
                   : "—"}
               </td>
+              <td>
+                <div>{node.os || "—"}{node.os_version ? `/${node.os_version}` : ""}</div>
+                <div className="muted mono">{node.agent_version || ""}</div>
+                {node.hostname ? (
+                  <div className="muted">{node.hostname}</div>
+                ) : null}
+              </td>
+              <td className="mono">
+                {node.last_seen_at
+                  ? new Date(node.last_seen_at * 1000).toISOString().replace("T", " ").slice(0, 19)
+                  : "Never"}
+                <div className="muted">
+                  {node.online ? "Online if seen within 90s" : "Offline"}
+                </div>
+              </td>
               <td className="mono">
                 <time
                   dateTime={new Date(
@@ -202,41 +244,78 @@ export function DeviceActions({
                 </time>
               </td>
               <td>
-                {node.revoked ? (
+                {node.deleted ? (
+                  <span className="badge warn">Deleted</span>
+                ) : node.revoked ? (
                   <span className="badge warn">Revoked</span>
                 ) : node.expired ? (
                   <span className="badge warn">Expired</span>
                 ) : node.expires_soon ? (
                   <span className="badge warn">Expires soon</span>
+                ) : node.online ? (
+                  <span className="badge">Online</span>
                 ) : (
                   <span className="badge">Active</span>
                 )}
               </td>
               <td>
-                {canMutateTailnet(node.effective_role) && !node.revoked ? (
-                  <button
-                    type="button"
-                    className="secondary"
-                    disabled={pending}
-                    onClick={() => {
-                      const formData = new FormData();
-                      formData.set("nodeId", node.id);
-                      formData.set("organisationId", node.organisation_id);
-                      setMessage(null);
-                      startTransition(async () => {
-                        const result = await revokeDeviceAction(formData);
-                        setMessage({
-                          text: result.ok
-                            ? `${node.display_name || node.name} revoked.`
-                            : result.error,
-                          error: !result.ok,
+                {canMutateTailnet(node.effective_role) && !node.revoked && !node.deleted ? (
+                  <div className="stack">
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={pending}
+                      onClick={() => {
+                        const formData = new FormData();
+                        formData.set("nodeId", node.id);
+                        formData.set("organisationId", node.organisation_id);
+                        setMessage(null);
+                        startTransition(async () => {
+                          const result = await revokeDeviceAction(formData);
+                          setMessage({
+                            text: result.ok
+                              ? `${node.display_name || node.name} revoked.`
+                              : result.error,
+                            error: !result.ok,
+                          });
+                          if (result.ok) router.refresh();
                         });
-                        if (result.ok) router.refresh();
-                      });
-                    }}
-                  >
-                    Revoke
-                  </button>
+                      }}
+                    >
+                      Revoke
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={pending}
+                      onClick={() => {
+                        const label = node.display_name || node.name;
+                        if (
+                          !window.confirm(
+                            `Delete ${label} from inventory? This keeps a tombstone for audit and is separate from revoke.`,
+                          )
+                        ) {
+                          return;
+                        }
+                        const formData = new FormData();
+                        formData.set("nodeId", node.id);
+                        formData.set("organisationId", node.organisation_id);
+                        setMessage(null);
+                        startTransition(async () => {
+                          const result = await tombstoneDeviceAction(formData);
+                          setMessage({
+                            text: result.ok
+                              ? `${label} deleted from inventory.`
+                              : result.error,
+                            error: !result.ok,
+                          });
+                          if (result.ok) router.refresh();
+                        });
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </div>
                 ) : null}
               </td>
             </tr>

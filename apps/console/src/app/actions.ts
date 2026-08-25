@@ -9,7 +9,10 @@ import {
   getAcl,
   mintJoinKey,
   putAcl,
+  createApiClient,
+  revokeApiClient,
   revokeNode,
+  tombstoneNode,
   updateNodeFriendlyName,
   type DeviceTag,
 } from "@/lib/coord";
@@ -26,6 +29,7 @@ import {
   revokeInvitation,
   type InvitationRole,
 } from "@/lib/invitations";
+import { OidcError, changeMembership, upsertIdentityProvider } from "@/lib/oidc";
 
 export type ActionResult<T = void> =
   | { ok: true; data: T }
@@ -119,6 +123,90 @@ export async function revokeDeviceAction(
     return {
       ok: false,
       error: error instanceof Error ? error.message : "Could not revoke device.",
+    };
+  }
+}
+
+export async function tombstoneDeviceAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireOrganisationContext(
+      owningOrganisation(formData),
+    );
+    if (!canMutateTailnet(ctx.role)) {
+      return { ok: false, error: "Only owners and admins can delete devices." };
+    }
+    const nodeId = String(formData.get("nodeId") ?? "");
+    if (!nodeId) {
+      return { ok: false, error: "Choose a device to delete." };
+    }
+    await tombstoneNode(ctx, nodeId);
+    revalidatePath("/devices");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Could not delete device.",
+    };
+  }
+}
+
+export async function createApiClientAction(
+  formData: FormData,
+): Promise<ActionResult<{ token: string; prefix: string }>> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (ctx.role !== "owner") {
+      return { ok: false, error: "Only owners can create automation credentials." };
+    }
+    const name = String(formData.get("name") ?? "").trim();
+    const scopes = formData
+      .getAll("scopes")
+      .map((value) => String(value))
+      .filter(Boolean);
+    if (!name) {
+      return { ok: false, error: "Name the automation client." };
+    }
+    const created = await createApiClient(ctx, {
+      name,
+      scopes: scopes.length > 0 ? scopes : ["status:read", "devices:read"],
+    });
+    revalidatePath("/settings");
+    return { ok: true, data: { token: created.token, prefix: created.token_prefix } };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not create automation credential.",
+    };
+  }
+}
+
+export async function revokeApiClientAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (ctx.role !== "owner") {
+      return { ok: false, error: "Only owners can revoke automation credentials." };
+    }
+    const clientId = String(formData.get("clientId") ?? "");
+    if (!clientId) {
+      return { ok: false, error: "Choose a credential to revoke." };
+    }
+    await revokeApiClient(ctx, clientId);
+    revalidatePath("/settings");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not revoke automation credential.",
     };
   }
 }
@@ -291,6 +379,83 @@ const consolePaths = new Set([
   "/status",
   "/settings",
 ]);
+
+export async function upsertOidcProviderAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (ctx.role !== "owner") {
+      return { ok: false, error: "Only owners can configure the identity provider." };
+    }
+    const allowDomains = String(formData.get("allowDomains") ?? "")
+      .split(",")
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean);
+    await upsertIdentityProvider({
+      organisationId: ctx.organisationId,
+      issuer: String(formData.get("issuer") ?? ""),
+      clientId: String(formData.get("clientId") ?? ""),
+      clientSecret: String(formData.get("clientSecret") ?? ""),
+      enabled: formData.get("enabled") === "true",
+      allowDomains,
+      jitMembership: formData.get("jitMembership") === "true",
+      actorUserId: ctx.userId,
+      actorEmail: ctx.email,
+    });
+    revalidatePath("/settings");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof OidcError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : "Could not save the identity provider.",
+    };
+  }
+}
+
+export async function changeMembershipAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireConsoleContext();
+    const membershipId = String(formData.get("membershipId") ?? "");
+    const status = String(formData.get("status") ?? "") as
+      | "active"
+      | "suspended"
+      | "removed"
+      | "";
+    const role = String(formData.get("role") ?? "") as "admin" | "member" | "";
+    if (!membershipId) {
+      return { ok: false, error: "Choose a membership." };
+    }
+    await changeMembership({
+      organisationId: ctx.organisationId,
+      membershipId,
+      status: status || undefined,
+      role: role || undefined,
+      actorUserId: ctx.userId,
+      actorEmail: ctx.email,
+      actorRole: ctx.role,
+    });
+    revalidatePath("/settings");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof OidcError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : "Could not update membership.",
+    };
+  }
+}
 
 export async function selectOrganisationAction(formData: FormData) {
   const person = await requirePersonSessionContext();

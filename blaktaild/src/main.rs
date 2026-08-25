@@ -30,6 +30,9 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long, global = true, hide = true)]
     state_dir: Option<PathBuf>,
+    /// PEM trust bundle for a private coordinator CA.
+    #[arg(long, global = true, env = "BLAKTAIL_COORD_CA")]
+    coord_ca: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -63,6 +66,9 @@ enum Command {
         /// Exit after the first successful peer sync; launchd or systemd keeps syncing via `run`.
         #[arg(long)]
         exit_after_join: bool,
+        /// Delete this node automatically after it has been offline for 24 hours.
+        #[arg(long)]
+        ephemeral: bool,
     },
     /// Resume the persisted enrollment and keep WireGuard peers synchronized.
     Run {
@@ -232,6 +238,24 @@ async fn main() {
     if let Err(error) = run(cli, loaded.config.agent).await {
         eprintln!("blaktaild: {error}");
         std::process::exit(1);
+    }
+}
+
+fn coordinator_client(
+    coord: &str,
+    ca_path: Option<&std::path::Path>,
+) -> Result<Coordinator, blaktaild::Error> {
+    match ca_path {
+        Some(path) => {
+            let pem = fs::read(path).map_err(|error| {
+                blaktaild::Error::Message(format!(
+                    "could not read coordinator CA {}: {error}",
+                    path.display()
+                ))
+            })?;
+            Coordinator::with_ca(coord, Some(&pem))
+        }
+        None => Coordinator::new(coord),
     }
 }
 
@@ -851,6 +875,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
             exit_node,
             poll_seconds,
             exit_after_join,
+            ephemeral,
         } => {
             let coord = coord
                 .or_else(|| operator_config.coordinator_url.clone())
@@ -901,7 +926,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                 ));
             }
             let (key_path, public_key) = ensure_private_key(state_dir)?;
-            let coordinator = Coordinator::new(&coord)?;
+            let coordinator = coordinator_client(&coord, cli.coord_ca.as_deref())?;
             let name = name.unwrap_or_else(detect_hostname);
             let resumed = state_dir.join("state.json").exists();
             let mut previous_routes = Vec::new();
@@ -942,6 +967,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                             interface: &interface,
                             advertised_routes: &requested_routes,
                             exit_node: requested_exit_node.clone(),
+                            ephemeral,
                         })
                         .await;
                     join_key.zeroize();
@@ -1018,7 +1044,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
             let mut state = read_state(state_dir)?;
             validate_interface(&state.interface)?;
             let (key_path, _) = ensure_private_key(state_dir)?;
-            let coordinator = Coordinator::new(&state.coord)?;
+            let coordinator = coordinator_client(&state.coord, cli.coord_ca.as_deref())?;
             let mut network = make_network();
             network.setup(&state.interface, &key_path, &state.interface_addresses())?;
             state.router_previous_ipv4_forward = network.configure_router(
@@ -1045,7 +1071,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
         }
         Command::Reauth { join_key } => {
             let mut state = read_state(state_dir)?;
-            let coordinator = Coordinator::new(&state.coord)?;
+            let coordinator = coordinator_client(&state.coord, cli.coord_ca.as_deref())?;
             let mut join_key = resolve_join_key(join_key)?;
             let result = coordinator.reauth(&mut state, &join_key).await;
             join_key.zeroize();
@@ -1123,7 +1149,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                     state.dns_mode.as_deref(),
                 )?;
             }
-            let coordinator = Coordinator::new(&state.coord)?;
+            let coordinator = coordinator_client(&state.coord, cli.coord_ca.as_deref())?;
             let mut network = make_network();
             network.configure_router(
                 &state.interface,

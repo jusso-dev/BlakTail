@@ -1,0 +1,157 @@
+openapi: 3.1.0
+info:
+  title: BlakTail Admin API
+  version: "1"
+  description: |
+    Organisation-scoped automation API. Distinct from node protocol routes
+    and console HMAC assertions. Compatibility is additive inside `/api/v1`.
+servers:
+  - url: https://coord.example
+security:
+  - bearerAuth: []
+  - organisationHeader: []
+paths:
+  /api/v1/status:
+    get:
+      summary: Service readiness
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      responses:
+        "200":
+          description: Ready
+        "401":
+          description: Authentication failed
+        "403":
+          description: Missing status:read
+  /api/v1/devices:
+    get:
+      summary: List devices
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - in: query
+          name: q
+          schema: { type: string }
+        - in: query
+          name: state
+          schema: { type: string, enum: [active, online, offline, revoked, deleted, expired, ephemeral] }
+        - in: query
+          name: include_deleted
+          schema: { type: boolean }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200 }
+        - in: query
+          name: before
+          schema: { type: string }
+      responses:
+        "200":
+          description: Envelope of devices
+  /api/v1/devices/{node_id}:
+    get:
+      summary: Get one device
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "200": { description: Device }
+        "404": { description: Not found }
+    delete:
+      summary: Revoke a device
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "204": { description: Revoked }
+        "403": { description: Missing devices:write }
+  /api/v1/devices/{node_id}/friendly-name:
+    put:
+      summary: Set or clear a friendly name
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - $ref: "#/components/parameters/NodeId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [friendly_name]
+              properties:
+                friendly_name: { type: string, maxLength: 64 }
+      responses:
+        "204": { description: Updated }
+  /api/v1/devices/{node_id}/tombstone:
+    post:
+      summary: Delete a device from default inventory
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "204": { description: Tombstoned }
+  /api/v1/devices/{node_id}/routes:
+    put:
+      summary: Approve advertised routes
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - $ref: "#/components/parameters/NodeId"
+      responses:
+        "204": { description: Updated }
+  /api/v1/keys:
+    post:
+      summary: Mint an enrolment key
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string, minLength: 8, maxLength: 128 }
+      responses:
+        "201": { description: Key shown once }
+        "409": { description: Idempotency key reused with a different body }
+  /api/v1/policy:
+    get:
+      summary: Read ACL plus etag
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      responses:
+        "200": { description: Policy }
+    put:
+      summary: Replace ACL with optimistic concurrency
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      responses:
+        "204": { description: Updated }
+        "412": { description: etag mismatch }
+  /api/v1/audit:
+    get:
+      summary: List audit events
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - in: query
+          name: limit
+          schema: { type: integer }
+        - in: query
+          name: before
+          schema: { type: string, description: "created_at:id cursor" }
+      responses:
+        "200": { description: Envelope of events }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: bta_ automation token. Node tokens and join keys are rejected.
+    organisationHeader:
+      type: apiKey
+      in: header
+      name: X-BlakTail-Organisation
+  parameters:
+    Organisation:
+      in: header
+      name: X-BlakTail-Organisation
+      required: true
+      schema: { type: string, format: uuid }
+    NodeId:
+      in: path
+      name: node_id
+      required: true
+      schema: { type: string, format: uuid }

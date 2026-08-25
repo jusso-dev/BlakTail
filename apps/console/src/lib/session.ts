@@ -110,6 +110,7 @@ export async function resolveSessionContext(
       mrr.membership_signature
     FROM person_login_identity pli
     JOIN membership m ON m.user_id = pli.user_id
+      AND coalesce(m.status, 'active') = 'active'
     JOIN network_account na ON na.membership_id = m.id
       AND na.login_identity_user_id = pli.user_id
       AND na.organisation_id = m.organisation_id
