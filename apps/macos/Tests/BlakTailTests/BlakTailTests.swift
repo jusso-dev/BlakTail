@@ -225,7 +225,7 @@ final class DesktopEndpointTests: XCTestCase {
             XCTAssertEqual(request.httpMethod, "PATCH")
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer session-token")
             XCTAssertEqual(request.value(forHTTPHeaderField: "X-BlakTail-Organisation"), "org-ranger")
-            let body = try XCTUnwrap(request.httpBody)
+            let body = try requestBodyData(request)
             let payload = try XCTUnwrap(
                 JSONSerialization.jsonObject(with: body) as? [String: String]
             )
@@ -290,6 +290,28 @@ private final class RecordingURLProtocol: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private func requestBodyData(_ request: URLRequest) throws -> Data {
+    if let body = request.httpBody {
+        return body
+    }
+    let stream = try XCTUnwrap(request.httpBodyStream)
+    stream.open()
+    defer { stream.close() }
+
+    var body = Data()
+    var buffer = [UInt8](repeating: 0, count: 4_096)
+    while true {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count < 0 {
+            throw stream.streamError ?? URLError(.cannotDecodeContentData)
+        }
+        if count == 0 {
+            return body
+        }
+        body.append(contentsOf: buffer.prefix(count))
+    }
 }
 
 private struct PausedStatusRunner: ProcessRunner {
