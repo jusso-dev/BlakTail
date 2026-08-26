@@ -43,6 +43,7 @@ const migrations = [
   "0002_account_issuer.sql",
   "0003_secure_bootstrap.sql",
   "0004_linked_identities.sql",
+  "0005_oidc_and_membership_lifecycle.sql",
 ];
 
 async function listen(server) {
@@ -367,8 +368,9 @@ try {
   const initialMe = await fetch(`${baseUrl}/api/me`, {
     headers: { cookie: ownerCookie },
   });
-  assert.equal(initialMe.status, 200);
-  assert.equal((await initialMe.json()).organisations.length, 1);
+  const initialMeBody = await initialMe.json();
+  assert.equal(initialMe.status, 200, JSON.stringify(initialMeBody));
+  assert.equal(initialMeBody.organisations.length, 1);
 
   const linkCsrf = await jsonRequest(baseUrl, "/api/identity-links", {
     cookie: ownerCookie,
@@ -1253,7 +1255,7 @@ try {
     ["member", "owner"],
   );
 
-  await sql`UPDATE session SET expires_at = now() - interval '1 minute' WHERE user_id = ${memberUser.id}`;
+  await sql`UPDATE session SET expires_at = timestamptz '1970-01-01 00:00:00+00' WHERE user_id = ${memberUser.id}`;
   const expiredSession = await fetch(`${baseUrl}/api/invitations`, {
     headers: { cookie: memberCookie },
     redirect: "manual",
