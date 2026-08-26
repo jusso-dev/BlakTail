@@ -191,7 +191,7 @@ final class BlakTailPhoneTests: XCTestCase {
         XCTAssertEqual(model.enrollment?.wireGuardPublicKey, keys.publicKey)
         XCTAssertEqual(model.enrollment?.wireGuardPrivateKey, keys.privateKey)
         XCTAssertEqual(tunnel.startCount, 1)
-        let stored = try XCTUnwrap(try enrollmentSecrets.load())
+        let stored = try XCTUnwrap(enrollmentSecrets.load())
         XCTAssertFalse(stored.contains(joinKey))
         XCTAssertFalse(stored.contains("join_key"))
         XCTAssertTrue(stored.contains("btn_phone_token"))
@@ -265,7 +265,7 @@ private final class PhoneRecordingURLProtocol: URLProtocol {
             let (response, data) = try handler(request)
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
-            client?.urlProtocol(self, didFinishLoading: self)
+            client?.urlProtocolDidFinishLoading(self)
         } catch {
             client?.urlProtocol(self, didFailWithError: error)
         }
