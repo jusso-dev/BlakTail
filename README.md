@@ -59,55 +59,60 @@ secret.
 
 ## Project status
 
-BlakTail is pre-release. There are no published agent tags or install artifacts yet;
-build from source until the release checklist in
-[docs/releases.md](docs/releases.md) has been completed on clean hosts.
+BlakTail is pre-release. There is no hosted product and no published agent tag
+or installer. Operators build from source until the release checklist in
+[docs/releases.md](docs/releases.md) is complete on clean hosts.
 
-Browser onboarding, friendly device names, direct candidates, an Australian relay
-fallback, and nonce-confirmed UDP hole punching are implemented. The literal
-forced-relay proof across two independent NAT paths is still pending in
-[#24](https://github.com/jusso-dev/BlakTail/issues/24), so NAT traversal is not yet a
-production-verified claim. Dual-stack traffic passed on two private AWS agents, but
-the IPv6-only drill with each BlakTail IPv4 address removed remains open in
-[#32](https://github.com/jusso-dev/BlakTail/issues/32).
+Today it is an organisation-run private path: a night-sky operator console, a
+Rust coordinator and Australian relay, WireGuard agents for Linux and macOS, and
+a native macOS endpoint manager. A person can sign in once, enrol machines,
+give them friendly names, apply tags and routes, and reach authorised devices
+over IPv4 and IPv6. One session can show every machine across explicitly linked
+network accounts.
 
-“Onshore” is a deployment responsibility as well as a product rule. Included AWS
-infrastructure is pinned to Sydney and the relay rejects non-Australian cloud region
-identifiers; self-hosters must independently keep the console database, coordinator
+“Onshore” is a deployment duty as well as a product rule. Included AWS
+infrastructure is pinned to Sydney and the relay rejects non-Australian cloud
+region identifiers. Self-hosters must keep the console database, coordinator
 state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
+
+## What it is today
+
+- Open, self-hosted private networking for Indigenous Australian organisations
+- Encrypted WireGuard paths between laptops, field devices, servers, and sites
+- Organisation-held identity, policy, keys, and operational data
+- One live login across many network accounts, without logout/login switching
+- An operator console, Linux/macOS agents, and a macOS desktop manager
+- Optional organisation SSO (OIDC) with a password owner as the break-glass path
+- An Australian relay as the encrypted fallback when a direct UDP path fails
 
 ## What works today
 
-- Browser-based device enrolment without copying a join key
-- One person, many explicitly linked network accounts, and one concurrent
-  all-machines inventory with a visible network name on every row
-- Stable technical device identity and editable, audited friendly names
-- Join-key enrolment for automation, tags, route approval, ACLs, and revocation
-- Bun 1.4-hosted Next.js 16.3 console: Bun SQL, Drizzle ORM, Better Auth, and
-  the Rust control plane for auth and ACLs
-- WireGuard agents for Linux and macOS; Windows is not implemented
-- A native macOS endpoint manager with all-network search, local connect controls,
-  friendly-name and route administration, guarded revoke, Keychain auth, and a
-  menu-bar quick view; Windows and Linux desktop apps are not implemented
-- Coordination server and AU relay the org runs
-- SQLx coordinator storage: SQLite for a single host or PostgreSQL for concurrent replicas
-- MagicDNS-style names and tag ACLs (office, ranger, store)
-- Owner-approved Linux subnet routers and opt-in IPv4 exit nodes
-- Dual-stack tailnets with an organisation ULA `/64` and one `/128` per node
-- Prometheus coordinator/relay metrics and an actor-attributed admin audit log
-  with cursor pagination and 90-day default retention
-- Device inventory with last-seen/online, OS/agent posture, search, revoke, and
-  tombstone; versioned `/api/v1` automation credentials for owners
+- First-owner bootstrap, disabled public sign-up, and one-use invitations
+- Browser enrolment and join-key enrolment for automation
+- Linked login identities and one **All networks** inventory
+- Stable technical and MagicDNS identity, with editable audited friendly names
+- Tags, ACL rules, advertised-route approval, revoke, and tombstone
+- Linux subnet routers and opt-in IPv4 exit nodes
+- Dual-stack overlay addresses (CGNAT IPv4 plus an organisation ULA `/64`)
+- Device posture: last-seen/online, OS, agent version, search
+- Owner-minted `/api/v1` automation credentials
+- Prometheus metrics and an actor-attributed audit log
+- Single-host SQLite or concurrent PostgreSQL coordinator storage
+- A disposable Sydney AWS proof harness, not a production SaaS
 
-## Current boundaries
+## What it is not
 
-- No SaaS control plane outside Australia
-- No closed-source agent
-- No published release artifacts yet; source builds are the supported pre-release path
-- No Windows agent or Linux desktop tray yet
-- Not a file sync tool (that is BlakSync)
-- Not a clone of Tailscale's trademark or UI assets
-- No Go or Zig
+- Not a released product; source builds are the only supported install path
+- Not a hosted SaaS or a closed-source agent
+- Not a Windows agent, and not a Windows or Linux desktop app
+- Not a file-sync product (that is BlakSync)
+- Not an anonymity network; the coordinator and relay can still see metadata
+- Not a production-verified NAT claim: agents have hole punching and relay
+  fallback, but a forced-relay proof across two independent NAT paths is still
+  open in [#24](https://github.com/jusso-dev/BlakTail/issues/24)
+- Not an IPv6-only product yet: dual-stack passed on private AWS agents, but
+  the drill that removes each BlakTail IPv4 address is still open in
+  [#32](https://github.com/jusso-dev/BlakTail/issues/32)
 
 ## Console
 
@@ -202,11 +207,11 @@ pre-existing distinct login identities remain open acceptance work.
 ## Stack (locked for first cut)
 
 - Rust workspace: `blaktaild` (node agent), `blaktail-coord`, `blaktail-relay`
-- WireGuard: userspace on macOS first, kernel WG on Linux, userspace on Windows
+- WireGuard: userspace on macOS, kernel WG on Linux
 - Console: Bun 1.4 runtime/package manager and native SQL client, Next.js 16.3,
   Drizzle, Better Auth, Postgres onshore. Auth sessions are issued in the console
   and verified by Rust
-- Desktop: Mac app first (SwiftUI wrapping the LaunchDaemon agent). Windows and Linux follow
+- Desktop: macOS SwiftUI app wrapping the LaunchDaemon agent
 - CI on GitHub-hosted runners: `ubuntu-latest` for Rust, console, and security jobs; `macos-latest` for the Swift desktop app
 - Apache-2.0
 
