@@ -45,3 +45,73 @@ const migrations = [
   "0004_linked_identities.sql",
   "0005_oidc_and_membership_lifecycle.sql",
 ];
+
+async function listen(server) {
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  return address.port;
+}
+
+async function close(server) {
+  if (!server.listening) return;
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+}
+
+async function resetDatabase(sql) {
+  await sql.unsafe("DROP SCHEMA public CASCADE; CREATE SCHEMA public");
+  for (const migration of migrations) {
+    const source = await readFile(
+      new URL(`../drizzle/${migration}`, import.meta.url),
+      "utf8",
+    );
+    for (const statement of source.split("--> statement-breakpoint")) {
+      if (statement.trim()) await sql.unsafe(statement);
+    }
+  }
+}
+
+function cookies(response) {
+  const values = response.headers.getSetCookie?.() ?? [];
+  const source = values.length ? values : [response.headers.get("set-cookie") ?? ""];
+  return source
+    .filter(Boolean)
+    .map((value) => value.split(";", 1)[0])
+    .join("; ");
+}
+
+function cookieValue(cookieHeader, names) {
+  for (const part of cookieHeader.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    const name = part.slice(0, separator).trim();
+    if (names.includes(name)) return part.slice(separator + 1).trim();
+  }
+  return null;
+}
+
+async function jsonRequest(baseUrl, path, options = {}) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: options.method ?? "POST",
+    headers: {
+      origin: options.origin ?? baseUrl,
+      "content-type": "application/json",
+      ...(options.cookie ? { cookie: options.cookie } : {}),
+      ...(options.bearer ? { authorization: `Bearer ${options.bearer}` } : {}),
+      ...(options.organisationId
+        ? { "x-blaktail-organisation": options.organisationId }
+        : {}),
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    redirect: "manual",
+  });
+  let body = null;
+  try {
+    body = await response.json();
+  } catch {
+    // Empty 204 responses are expected.
+  }
+  return { response, body };
+}
