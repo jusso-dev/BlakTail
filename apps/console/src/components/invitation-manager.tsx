@@ -92,7 +92,7 @@ export function InvitationManager({
                   <td>
                     <button
                       type="button"
-                      className="secondary"
+                      className="danger"
                       disabled={pending}
                       onClick={() => {
                         const form = new FormData();
@@ -117,7 +117,7 @@ export function InvitationManager({
           </table>
         </div>
       ) : (
-        <p className="muted">No pending invitations.</p>
+        <p className="muted">No pending invitations. Invite someone when you need another operator on this network.</p>
       )}
     </div>
   );

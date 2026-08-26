@@ -1,5 +1,6 @@
 import { AclEditor } from "@/components/acl-editor";
 import { ConsoleShell } from "@/components/console-shell";
+import { PageHeader } from "@/components/page-header";
 import { getAcl } from "@/lib/coord";
 import { requireConsoleContext } from "@/lib/session";
 
@@ -17,13 +18,10 @@ export default async function AclsPage() {
   return (
     <ConsoleShell ctx={ctx} current="/acls">
       <div className="stack">
-        <div>
-          <h1>ACL rules</h1>
-          <p className="lead">
-            Tag and role rules live on the coordinator. Default deny across
-            tags. Explicit deny wins.
-          </p>
-        </div>
+        <PageHeader
+          title="ACL rules"
+          description="Tag and role rules live on the coordinator. Default deny across tags. Explicit deny wins."
+        />
         <div className="panel stack">
           {error ? <p className="error">{error}</p> : null}
           <AclEditor initialAcl={initialAcl} role={ctx.role} />

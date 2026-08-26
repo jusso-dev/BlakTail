@@ -52,7 +52,10 @@ export function IdentitySettings({
           </p>
         </div>
         {networkAccounts.length === 0 ? (
-          <p className="muted">No active network accounts.</p>
+          <p className="muted">
+            No active network accounts. Accept an invitation or ask an owner to
+            add this identity to a workspace.
+          </p>
         ) : (
           <div className="table-wrap">
             <table className="table">

@@ -50,7 +50,19 @@ export function MembershipManager({
                   <div className="muted mono">{row.email}</div>
                 </td>
                 <td>{row.role}</td>
-                <td>{row.status}</td>
+                <td>
+                  <span
+                    className={
+                      row.status === "active"
+                        ? "badge online"
+                        : row.status === "invited"
+                          ? "badge pending"
+                          : "badge revoked"
+                    }
+                  >
+                    {row.status}
+                  </span>
+                </td>
                 <td>
                   {row.role === "owner" ? null : (
                     <div className="stack">
@@ -80,7 +92,7 @@ export function MembershipManager({
                       {row.status === "removed" ? null : (
                         <button
                           type="button"
-                          className="secondary"
+                          className="danger"
                           disabled={pending}
                           onClick={() => {
                             const form = new FormData();

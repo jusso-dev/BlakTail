@@ -45,6 +45,18 @@ so operators have one consistent technical identity.
 5. Connect by private address or name. Direct UDP is preferred; the Australian
    relay is the encrypted fallback.
 
+## Console
+
+The operator console uses the night-sky brand from the artwork above. These
+shots are from a throwaway inventory with invented organisation and device
+names. Sign-in was captured before credentials were entered. The device view
+contains no enrollment code, WireGuard fingerprint, cookie, key, or cloud
+secret.
+
+![BlakTail sign-in](docs/images/console/sign-in.png)
+
+![All networks inventory with invented device names](docs/images/console/devices.png)
+
 ## Project status
 
 BlakTail is pre-release. There are no published agent tags or install artifacts yet;
@@ -180,9 +192,10 @@ resources; native service checks found zero active scoped residue and local
 passwords, enrolment material, cookies, state, browser profiles, and registry login
 were removed.
 
-These screenshots are from that exact disposable run. The sign-in image was taken
-before credentials were entered; the device image contains no enrollment code,
-WireGuard fingerprint, cookie, key, or cloud secret.
+These screenshots are from that exact disposable run and show the console theme
+in use at the time. The sign-in image was taken before credentials were entered;
+the device image contains no enrollment code, WireGuard fingerprint, cookie,
+key, or cloud secret. The current console look is in [Console](#console).
 
 ![BlakTail sign-in served by AWS run 20260824ma1](docs/images/aws-e2e/sign-in-20260824ma1.png)
 

@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import { Wordmark } from "@/components/wordmark";
 
 export const metadata: Metadata = {
   title: "Privacy and data handling · BlakTail",
@@ -11,9 +11,7 @@ export default function PrivacyPage() {
     <main className="policy-page">
       <article className="panel stack">
         <div>
-          <Link className="brand" href="/">
-            BlakTail
-          </Link>
+          <Wordmark href="/" />
           <h1>Privacy and data handling</h1>
           <p className="lead">Software statement · 23 August 2026</p>
         </div>

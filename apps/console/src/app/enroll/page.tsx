@@ -2,6 +2,8 @@ import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { ConsoleShell } from "@/components/console-shell";
 import { EnrollmentApproval } from "@/components/enrollment-approval";
+import { PageHeader } from "@/components/page-header";
+import { Wordmark } from "@/components/wordmark";
 import { auth } from "@/lib/auth";
 import { getDeviceAuthorization } from "@/lib/coord";
 import { requireConsoleContext } from "@/lib/session";
@@ -25,6 +27,7 @@ export default async function EnrollPage({
     return (
       <main className="sign-in">
         <div className="sign-in-card panel">
+          <Wordmark href="/sign-in" />
           <h1>Invalid device link</h1>
           <p className="error">
             This enrollment link has no valid eight-character device code. Run
@@ -73,12 +76,17 @@ export default async function EnrollPage({
   return (
     <ConsoleShell ctx={ctx} current="/devices">
       <div className="stack">
-        <div>
-          <h1>Approve device</h1>
-          <p className="lead">
-            Confirm that this is the device waiting in your terminal.
-          </p>
-        </div>
+        <PageHeader
+          eyebrow="Enrolment"
+          title="Approve device"
+          description="Confirm that this is the device waiting in your terminal."
+        />
+        <ol className="ceremony" aria-label="Enrolment path">
+          <li>Device</li>
+          <li>Fingerprint</li>
+          <li aria-current="step">Approve</li>
+          <li>Joined</li>
+        </ol>
         <section className="panel stack" aria-labelledby="device-heading">
           <h2 id="device-heading">{request.name}</h2>
           <dl className="details">

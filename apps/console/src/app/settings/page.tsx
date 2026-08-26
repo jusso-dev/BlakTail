@@ -4,6 +4,7 @@ import { ApiClientManager } from "@/components/api-client-manager";
 import { InvitationManager } from "@/components/invitation-manager";
 import { MembershipManager } from "@/components/membership-manager";
 import { OidcProviderManager } from "@/components/oidc-provider-manager";
+import { PageHeader } from "@/components/page-header";
 import { listApiClients } from "@/lib/coord";
 import { listPendingInvitations } from "@/lib/invitations";
 import { listIdentitySettings } from "@/lib/identity-links";
@@ -32,13 +33,10 @@ export default async function SettingsPage() {
   return (
     <ConsoleShell ctx={ctx} current="/settings">
       <div className="stack">
-        <div>
-          <h1>Settings</h1>
-          <p className="lead">
-            One person, every explicitly linked network account, and independent
-            ways to sign in.
-          </p>
-        </div>
+        <PageHeader
+          title="Settings"
+          description="One person, every explicitly linked network account, and independent ways to sign in."
+        />
         <div className="panel stack">
           <p>
             <strong>Signed in as:</strong> {ctx.name} ({ctx.email})
@@ -47,7 +45,8 @@ export default async function SettingsPage() {
             <strong>Role:</strong> {roleLabel(ctx.role)}
           </p>
           <p>
-            <strong>Organisation:</strong> {ctx.organisationName}
+            <strong>Organisation:</strong>{" "}
+            <span className="badge network">{ctx.organisationName}</span>
           </p>
           <p>
             <strong>Accessible workspaces:</strong> {ctx.organisations.length}
@@ -55,6 +54,11 @@ export default async function SettingsPage() {
           <p>
             <strong>Coordinator org id:</strong>{" "}
             <span className="mono">{ctx.coordOrgId}</span>
+          </p>
+          <p className="region-mark">
+            <span className="region-dot" aria-hidden="true" />
+            <strong>Onshore</strong>
+            <span>Sydney, Australia · AU · ap-southeast-2</span>
           </p>
           <p className="tagline">{TAGLINE}</p>
           <p className="muted">

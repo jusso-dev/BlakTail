@@ -10,6 +10,7 @@ import {
 } from "@/app/actions";
 import type { NetworkNode } from "@/lib/coord";
 import { canMutateTailnet } from "@/lib/roles";
+import { EmptyState } from "./empty-state";
 
 export function DeviceActions({
   nodes,
@@ -23,6 +24,10 @@ export function DeviceActions({
   } | null>(null);
   const [pending, startTransition] = useTransition();
   const [query, setQuery] = useState("");
+  const [confirm, setConfirm] = useState<{
+    kind: "revoke" | "delete";
+    node: NetworkNode;
+  } | null>(null);
   const visible = nodes.filter((node) => {
     const wanted = query.trim().toLowerCase();
     if (!wanted) return true;
@@ -41,16 +46,17 @@ export function DeviceActions({
 
   if (nodes.length === 0) {
     return (
-      <p className="muted">
-        No devices yet. Mint a join key and enrol a node with the agent.
-      </p>
+      <EmptyState
+        title="No devices yet"
+        body="Bring your first device onto this network with a join key or browser enrolment."
+      />
     );
   }
 
   return (
     <div className="stack">
-      <label>
-        Search inventory
+      <label className="search-field">
+        Search devices across all networks
         <input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
@@ -78,7 +84,7 @@ export function DeviceActions({
           {visible.map((node) => (
             <tr key={`${node.organisation_id}:${node.id}`}>
               <td>
-                <strong>{node.network_account_name}</strong>
+                <span className="badge network">{node.network_account_name}</span>
                 <span className="device-technical-name">
                   {node.organisation_name}
                 </span>
@@ -245,17 +251,17 @@ export function DeviceActions({
               </td>
               <td>
                 {node.deleted ? (
-                  <span className="badge warn">Deleted</span>
+                  <span className="badge revoked">Deleted</span>
                 ) : node.revoked ? (
-                  <span className="badge warn">Revoked</span>
+                  <span className="badge revoked">Revoked</span>
                 ) : node.expired ? (
                   <span className="badge warn">Expired</span>
                 ) : node.expires_soon ? (
-                  <span className="badge warn">Expires soon</span>
+                  <span className="badge pending">Expires soon</span>
                 ) : node.online ? (
-                  <span className="badge">Online</span>
+                  <span className="badge online">Online</span>
                 ) : (
-                  <span className="badge">Active</span>
+                  <span className="badge offline">Offline</span>
                 )}
               </td>
               <td>
@@ -263,55 +269,17 @@ export function DeviceActions({
                   <div className="stack">
                     <button
                       type="button"
-                      className="secondary"
+                      className="danger"
                       disabled={pending}
-                      onClick={() => {
-                        const formData = new FormData();
-                        formData.set("nodeId", node.id);
-                        formData.set("organisationId", node.organisation_id);
-                        setMessage(null);
-                        startTransition(async () => {
-                          const result = await revokeDeviceAction(formData);
-                          setMessage({
-                            text: result.ok
-                              ? `${node.display_name || node.name} revoked.`
-                              : result.error,
-                            error: !result.ok,
-                          });
-                          if (result.ok) router.refresh();
-                        });
-                      }}
+                      onClick={() => setConfirm({ kind: "revoke", node })}
                     >
                       Revoke
                     </button>
                     <button
                       type="button"
-                      className="secondary"
+                      className="danger"
                       disabled={pending}
-                      onClick={() => {
-                        const label = node.display_name || node.name;
-                        if (
-                          !window.confirm(
-                            `Delete ${label} from inventory? This keeps a tombstone for audit and is separate from revoke.`,
-                          )
-                        ) {
-                          return;
-                        }
-                        const formData = new FormData();
-                        formData.set("nodeId", node.id);
-                        formData.set("organisationId", node.organisation_id);
-                        setMessage(null);
-                        startTransition(async () => {
-                          const result = await tombstoneDeviceAction(formData);
-                          setMessage({
-                            text: result.ok
-                              ? `${label} deleted from inventory.`
-                              : result.error,
-                            error: !result.ok,
-                          });
-                          if (result.ok) router.refresh();
-                        });
-                      }}
+                      onClick={() => setConfirm({ kind: "delete", node })}
                     >
                       Delete
                     </button>
@@ -331,6 +299,66 @@ export function DeviceActions({
         >
           {message.text}
         </p>
+      ) : null}
+      {confirm ? (
+        <div className="confirm-backdrop">
+          <div
+            className="confirm-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="device-confirm-title"
+          >
+            <h2 id="device-confirm-title">
+              {confirm.kind === "revoke" ? "Revoke device" : "Delete from inventory"}
+            </h2>
+            <p>
+              {confirm.kind === "revoke"
+                ? `Revoke ${confirm.node.display_name || confirm.node.name} on ${confirm.node.organisation_name}? The device will lose network access.`
+                : `Delete ${confirm.node.display_name || confirm.node.name} from ${confirm.node.organisation_name} inventory? This keeps a tombstone for audit and is separate from revoke.`}
+            </p>
+            <div className="actions">
+              <button
+                type="button"
+                className="danger"
+                disabled={pending}
+                onClick={() => {
+                  const node = confirm.node;
+                  const kind = confirm.kind;
+                  const formData = new FormData();
+                  formData.set("nodeId", node.id);
+                  formData.set("organisationId", node.organisation_id);
+                  setMessage(null);
+                  setConfirm(null);
+                  startTransition(async () => {
+                    const result =
+                      kind === "revoke"
+                        ? await revokeDeviceAction(formData)
+                        : await tombstoneDeviceAction(formData);
+                    const label = node.display_name || node.name;
+                    setMessage({
+                      text: result.ok
+                        ? kind === "revoke"
+                          ? `${label} revoked.`
+                          : `${label} deleted from inventory.`
+                        : result.error,
+                      error: !result.ok,
+                    });
+                    if (result.ok) router.refresh();
+                  });
+                }}
+              >
+                {confirm.kind === "revoke" ? "Revoke device" : "Delete device"}
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => setConfirm(null)}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
       ) : null}
     </div>
   );

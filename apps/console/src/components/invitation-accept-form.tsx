@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import { useState, useTransition } from "react";
 import { authClient } from "@/lib/auth-client";
 import { TAGLINE } from "@/lib/tagline";
+import { PathMotif } from "./path-motif";
+import { Wordmark } from "./wordmark";
 
 export function InvitationAcceptForm({
   token,
@@ -18,11 +20,12 @@ export function InvitationAcceptForm({
   const [pending, startTransition] = useTransition();
 
   return (
-    <div className="sign-in">
+    <div className="auth-screen">
+      <div className="auth-form-col">
       <div className="sign-in-card panel">
         <div className="stack">
           <div>
-            <div className="brand">BlakTail</div>
+            <Wordmark href="/sign-in" />
             <h1>Accept invitation</h1>
             <p className="tagline">{TAGLINE}</p>
           </div>
@@ -121,6 +124,15 @@ export function InvitationAcceptForm({
           ) : null}
         </div>
       </div>
+      </div>
+      <aside className="auth-brand-col" aria-hidden="true">
+        <PathMotif />
+        <div className="auth-brand-copy">
+          <p className="auth-kicker">Invitation</p>
+          <p>A private path between your organisation&apos;s devices.</p>
+          <p className="muted">Your network. Your rules. Your country.</p>
+        </div>
+      </aside>
     </div>
   );
 }

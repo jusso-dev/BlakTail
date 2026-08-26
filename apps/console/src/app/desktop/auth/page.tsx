@@ -2,6 +2,8 @@
 
 import { useRouter, useSearchParams } from "next/navigation";
 import { FormEvent, Suspense, useEffect, useState, useTransition } from "react";
+import { PathMotif } from "@/components/path-motif";
+import { Wordmark } from "@/components/wordmark";
 import { authClient } from "@/lib/auth-client";
 import { TAGLINE } from "@/lib/tagline";
 
@@ -51,64 +53,88 @@ function DesktopAuthInner() {
   }
 
   if (checking) {
-    return <p>Checking your session…</p>;
+    return (
+      <main className="sign-in">
+        <div className="sign-in-card panel">
+          <div className="skeleton" aria-busy="true">
+            <div className="skeleton-line" />
+            <div className="skeleton-line" />
+            <p className="muted">Checking your session…</p>
+          </div>
+        </div>
+      </main>
+    );
   }
 
   return (
-    <main
-      style={{
-        maxWidth: 420,
-        margin: "4rem auto",
-        fontFamily: "system-ui, sans-serif",
-        lineHeight: 1.5,
-        padding: "0 1rem",
-      }}
-    >
-      <div style={{ fontWeight: 700, letterSpacing: "0.04em" }}>BlakTail</div>
-      <h1 style={{ marginTop: "0.5rem" }}>Desktop sign-in</h1>
-      <p style={{ color: "#444" }}>{TAGLINE}</p>
-      <form onSubmit={onSubmit} style={{ display: "grid", gap: "0.75rem" }}>
-        <label>
-          Email
-          <input
-            name="email"
-            type="email"
-            autoComplete="username"
-            required
-            style={{ display: "block", width: "100%", marginTop: 4 }}
-          />
-        </label>
-        <label>
-          Password
-          <input
-            name="password"
-            type="password"
-            autoComplete="current-password"
-            required
-            minLength={10}
-            style={{ display: "block", width: "100%", marginTop: 4 }}
-          />
-        </label>
-        {error ? (
-          <p style={{ color: "#a40000" }} role="alert">
-            {error}
-          </p>
-        ) : null}
-        <button type="submit" disabled={pending}>
-          {pending ? "Signing in…" : "Sign in and return to the app"}
-        </button>
-      </form>
-      <p style={{ color: "#666", fontSize: "0.9rem" }}>
-        Sessions stay in your onshore Postgres. The Mac app stores the session
-        token in Keychain and never logs the join key.
-      </p>
-    </main>
+    <div className="auth-screen">
+      <div className="auth-form-col">
+        <div className="sign-in-card panel">
+          <div className="stack">
+            <div>
+              <Wordmark href="/desktop/auth" />
+              <h1>Desktop sign-in</h1>
+              <p className="tagline">{TAGLINE}</p>
+            </div>
+            <form onSubmit={onSubmit}>
+              <label>
+                Email
+                <input
+                  name="email"
+                  type="email"
+                  autoComplete="username"
+                  required
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  name="password"
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  minLength={10}
+                />
+              </label>
+              {error ? (
+                <p className="error" role="alert">
+                  {error}
+                </p>
+              ) : null}
+              <button type="submit" disabled={pending}>
+                {pending ? "Signing in…" : "Sign in and return to the app"}
+              </button>
+            </form>
+            <p className="muted">
+              Sessions stay in your onshore Postgres. The Mac app stores the session
+              token in Keychain and never logs the join key.
+            </p>
+          </div>
+        </div>
+      </div>
+      <aside className="auth-brand-col" aria-hidden="true">
+        <PathMotif />
+        <div className="auth-brand-copy">
+          <p className="auth-kicker">Desktop</p>
+          <p>A private path between your organisation&apos;s devices.</p>
+          <p className="muted">Your network. Your rules. Your country.</p>
+        </div>
+      </aside>
+    </div>
   );
 }
 
 export default function DesktopAuthPage() {
   return (
-    <Suspense fallback={<p>Loading…</p>}>
+    <Suspense
+      fallback={
+        <main className="sign-in">
+          <div className="sign-in-card panel">
+            <p className="muted">Loading…</p>
+          </div>
+        </main>
+      }
+    >
       <DesktopAuthInner />
     </Suspense>
   );

@@ -1,10 +1,19 @@
 import { ConsoleShell } from "@/components/console-shell";
+import { EmptyState } from "@/components/empty-state";
+import { PageHeader } from "@/components/page-header";
 import { listAuditEvents } from "@/lib/coord";
 import { listConsoleAuditEvents } from "@/lib/console-audit";
 import { requireConsoleContext } from "@/lib/session";
 
 function actor(event: Awaited<ReturnType<typeof listAuditEvents>>[number]) {
   return event.actor_email || event.actor_name || event.actor_user_id;
+}
+
+function nodeTone(action: string): "success" | "warning" | "danger" | undefined {
+  if (/revok|delete|deny|disable|tombstone/i.test(action)) return "danger";
+  if (/expir|conflict|fail/i.test(action)) return "warning";
+  if (/approv|create|link|save|mint/i.test(action)) return "success";
+  return undefined;
 }
 
 export default async function AuditPage() {
@@ -26,55 +35,44 @@ export default async function AuditPage() {
   return (
     <ConsoleShell ctx={ctx} current="/audit">
       <div className="stack">
-        <div>
-          <h1>Audit log</h1>
-          <p className="lead">
-            Security and administration changes for {ctx.organisationName}.
-            Times are shown in UTC.
-          </p>
-        </div>
-        <div className="panel table-wrap">
+        <PageHeader
+          title="Audit log"
+          description={`Security and administration changes for ${ctx.organisationName}. Times are shown in UTC.`}
+        />
+        <div className="panel">
           {error ? <p className="error">{error}</p> : null}
           {!error && events.length === 0 ? (
-            <p className="muted">No audited changes yet.</p>
+            <EmptyState
+              title="No audited changes yet"
+              body="Approvals, invitations, and policy edits will appear here as a trail through this organisation."
+            />
           ) : null}
           {events.length > 0 ? (
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>When (UTC)</th>
-                  <th>Actor</th>
-                  <th>Action</th>
-                  <th>Target</th>
-                  <th>Details</th>
-                </tr>
-              </thead>
-              <tbody>
-                {events.map((event) => (
-                  <tr key={event.id}>
-                    <td className="mono">
-                      {new Date(event.created_at * 1000).toISOString()}
-                    </td>
-                    <td>
-                      <div>{actor(event)}</div>
-                      <div className="muted">{event.actor_role}</div>
-                    </td>
-                    <td className="mono">{event.action}</td>
-                    <td>
-                      <div>{event.target_type}</div>
-                      {event.target_id ? (
-                        <div className="mono">{event.target_id}</div>
-                      ) : null}
-                    </td>
-                    <td>
-                      <code className="mono audit-details">
-                        {JSON.stringify(event.details, null, 2)}
-                      </code>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <ol className="audit-trail">
+              {events.map((event) => (
+                <li key={event.id} className="audit-event">
+                  <span
+                    className={["audit-node", nodeTone(event.action)]
+                      .filter(Boolean)
+                      .join(" ")}
+                    aria-hidden="true"
+                  />
+                  <strong>{event.action}</strong>
+                  <div>
+                    {actor(event)}
+                    {event.actor_role ? ` · ${event.actor_role}` : ""}
+                    {event.target_type ? ` · ${event.target_type}` : ""}
+                  </div>
+                  <div className="muted mono">
+                    {new Date(event.created_at * 1000).toISOString()}
+                    {event.target_id ? ` · ${event.target_id}` : ""}
+                  </div>
+                  <code className="mono audit-details">
+                    {JSON.stringify(event.details, null, 2)}
+                  </code>
+                </li>
+              ))}
+            </ol>
           ) : null}
         </div>
       </div>

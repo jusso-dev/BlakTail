@@ -94,12 +94,16 @@ export function ApiClientManager({ clients }: { clients: ApiClient[] }) {
                   <td>{client.name}</td>
                   <td className="mono">{client.token_prefix}</td>
                   <td className="mono">{client.scopes.join(", ")}</td>
-                  <td>{client.revoked ? "Revoked" : "Active"}</td>
+                  <td>
+                    <span className={client.revoked ? "badge revoked" : "badge online"}>
+                      {client.revoked ? "Revoked" : "Active"}
+                    </span>
+                  </td>
                   <td>
                     {client.revoked ? null : (
                       <button
                         type="button"
-                        className="secondary"
+                        className="danger"
                         disabled={pending}
                         onClick={() => {
                           const form = new FormData();
