@@ -179,7 +179,7 @@ private final class CoordinatorRecordingURLProtocol: URLProtocol {
             let (response, data) = try handler(request)
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: data)
-            client?.urlProtocol(self, didFinishLoading: self)
+            client?.urlProtocolDidFinishLoading(self)
         } catch {
             client?.urlProtocol(self, didFailWithError: error)
         }
