@@ -1,4 +1,9 @@
+#if canImport(AppKit)
 import AppKit
+#endif
+#if canImport(UIKit)
+import UIKit
+#endif
 import AuthenticationServices
 import Foundation
 
@@ -24,6 +29,8 @@ public enum BrowserSignInError: LocalizedError, Sendable, Equatable {
 public final class BrowserSignIn: NSObject, ASWebAuthenticationPresentationContextProviding {
     public static let callbackScheme = "blaktail"
 
+    private var activeSession: ASWebAuthenticationSession?
+
     public override init() {
         super.init()
     }
@@ -39,7 +46,8 @@ public final class BrowserSignIn: NSObject, ASWebAuthenticationPresentationConte
             let session = ASWebAuthenticationSession(
                 url: start,
                 callbackURLScheme: Self.callbackScheme
-            ) { callbackURL, error in
+            ) { [weak self] callbackURL, error in
+                self?.activeSession = nil
                 if let error {
                     if let authError = error as? ASWebAuthenticationSessionError,
                        authError.code == .canceledLogin {
@@ -61,7 +69,9 @@ public final class BrowserSignIn: NSObject, ASWebAuthenticationPresentationConte
             }
             session.prefersEphemeralWebBrowserSession = false
             session.presentationContextProvider = self
+            self.activeSession = session
             if !session.start() {
+                self.activeSession = nil
                 continuation.resume(throwing: BrowserSignInError.invalidCallback)
             }
         }
@@ -95,6 +105,15 @@ public final class BrowserSignIn: NSObject, ASWebAuthenticationPresentationConte
     }
 
     public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        #if canImport(AppKit) && !targetEnvironment(macCatalyst)
         NSApplication.shared.windows.first ?? ASPresentationAnchor()
+        #elseif canImport(UIKit)
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+        return windows.first(where: \.isKeyWindow) ?? windows.first ?? ASPresentationAnchor()
+        #else
+        ASPresentationAnchor()
+        #endif
     }
 }

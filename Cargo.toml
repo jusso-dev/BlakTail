@@ -5,6 +5,7 @@ members = [
     "blaktaild",
     "blaktail-coord",
     "blaktail-relay",
+    "blaktail-ios-wg",
 ]
 
 [workspace.package]

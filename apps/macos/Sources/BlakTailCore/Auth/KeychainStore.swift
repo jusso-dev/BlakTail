@@ -1,6 +1,40 @@
 import Foundation
 import Security
 
+public protocol SecretStoring: Sendable {
+    func save(_ secret: String) throws
+    func load() throws -> String?
+    func delete() throws
+}
+
+/// In-memory secret store for tests. Hosted CI must not depend on a login Keychain.
+public final class MemorySecretStore: SecretStoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    public init(_ value: String? = nil) {
+        self.value = value
+    }
+
+    public func save(_ secret: String) {
+        lock.lock()
+        value = secret
+        lock.unlock()
+    }
+
+    public func load() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    public func delete() {
+        lock.lock()
+        value = nil
+        lock.unlock()
+    }
+}
+
 public enum KeychainStoreError: LocalizedError, Sendable {
     case unexpectedStatus(OSStatus)
 
@@ -12,28 +46,41 @@ public enum KeychainStoreError: LocalizedError, Sendable {
     }
 }
 
-/// Stores Better Auth session tokens in the macOS Keychain. Never writes them to disk logs.
-public struct KeychainStore: Sendable {
+/// Stores session tokens and node enrolment in the Keychain. Never writes them to disk logs.
+public struct KeychainStore: SecretStoring, Sendable {
     public var service: String
     public var account: String
+    public var accessGroup: String?
 
     public static let session = KeychainStore(
         service: "au.org.blaktail.desktop",
         account: "better-auth.session_token"
     )
 
-    public init(service: String, account: String) {
+    public static let phoneSession = KeychainStore(
+        service: "au.org.blaktail.ios",
+        account: "better-auth.session_token"
+    )
+
+    /// Shared with the packet-tunnel extension. The access group is the Team ID
+    /// prefixed keychain group, never the bare `group.` app-group string.
+    public static var phoneEnrollment: KeychainStore {
+        KeychainStore(
+            service: "au.org.blaktail.ios",
+            account: "node.enrollment",
+            accessGroup: BlakTailIdentifiers.keychainAccessGroup()
+        )
+    }
+
+    public init(service: String, account: String, accessGroup: String? = nil) {
         self.service = service
         self.account = account
+        self.accessGroup = accessGroup
     }
 
     public func save(_ secret: String) throws {
         let data = Data(secret.utf8)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
+        let query = baseQuery()
         SecItemDelete(query as CFDictionary)
 
         var add = query
@@ -46,13 +93,9 @@ public struct KeychainStore: Sendable {
     }
 
     public func load() throws -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+        var query = baseQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound {
@@ -65,14 +108,21 @@ public struct KeychainStore: Sendable {
     }
 
     public func delete() throws {
-        let query: [String: Any] = [
+        let status = SecItemDelete(baseQuery() as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw KeychainStoreError.unexpectedStatus(status)
+        }
+    }
+
+    private func baseQuery() -> [String: Any] {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainStoreError.unexpectedStatus(status)
+        if let accessGroup, !accessGroup.isEmpty {
+            query[kSecAttrAccessGroup as String] = accessGroup
         }
+        return query
     }
 }

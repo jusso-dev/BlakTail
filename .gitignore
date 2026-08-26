@@ -2,6 +2,8 @@
 apps/macos/.build/
 apps/macos/*.xcodeproj/
 apps/macos/*.xcworkspace/
+apps/ios/.build/
+apps/ios/.swiftpm/
 **/DerivedData/
 *.xcuserstate
 
