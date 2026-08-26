@@ -1,0 +1,18 @@
+[package]
+name = "blaktail-ios-wg"
+description = "C ABI around boringtun for the iPhone packet-tunnel dataplane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "blaktail_ios_wg"
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+boringtun = "0.7.1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[dev-dependencies]
+rand = "0.8"

@@ -81,7 +81,7 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 - Encrypted WireGuard paths between laptops, field devices, servers, and sites
 - Organisation-held identity, policy, keys, and operational data
 - One live login across many network accounts, without logout/login switching
-- An operator console, Linux/macOS agents, and a macOS desktop manager
+- An operator console, Linux/macOS agents, a macOS desktop manager, and an iPhone client
 - Optional organisation SSO (OIDC) with a password owner as the break-glass path
 - An Australian relay as the encrypted fallback when a direct UDP path fails
 
@@ -99,12 +99,16 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 - Prometheus metrics and an actor-attributed audit log
 - Single-host SQLite or concurrent PostgreSQL coordinator storage
 - A disposable Sydney AWS proof harness, not a production SaaS
+- An iPhone client that joins a network as a WireGuard node and still administers All networks
 
 ## What it is not
 
 - Not a released product; source builds are the only supported install path
 - Not a hosted SaaS or a closed-source agent
 - Not a Windows agent, and not a Windows or Linux desktop app
+- Not a completed iPhone relay path: the phone joins as a WireGuard client over
+  direct UDP; Australian relay fallback and hole punch are still the Mac/Linux
+  agent cut
 - Not a file-sync product (that is BlakSync)
 - Not an anonymity network; the coordinator and relay can still see metadata
 - Not a production-verified NAT claim: agents have hole punching and relay
@@ -206,12 +210,13 @@ pre-existing distinct login identities remain open acceptance work.
 
 ## Stack (locked for first cut)
 
-- Rust workspace: `blaktaild` (node agent), `blaktail-coord`, `blaktail-relay`
-- WireGuard: userspace on macOS, kernel WG on Linux
+- Rust workspace: `blaktaild` (node agent), `blaktail-coord`, `blaktail-relay`, `blaktail-ios-wg`
+- WireGuard: userspace on macOS, kernel WG on Linux, boringtun in the iPhone packet tunnel
 - Console: Bun 1.4 runtime/package manager and native SQL client, Next.js 16.3,
   Drizzle, Better Auth, Postgres onshore. Auth sessions are issued in the console
   and verified by Rust
 - Desktop: macOS SwiftUI app wrapping the LaunchDaemon agent
+- iPhone: native SwiftUI client (`apps/ios`) with a Network Extension packet tunnel
 - CI on GitHub-hosted runners: `ubuntu-latest` for Rust, console, and security jobs; `macos-latest` for the Swift desktop app
 - Apache-2.0
 
@@ -256,4 +261,25 @@ See [`docs/macos-desktop.md`](docs/macos-desktop.md) for build steps, manual val
 bash scripts/validate-macos-desktop.sh
 # on a Mac runner or Mac workstation:
 cd apps/macos && swift test
+```
+
+## iPhone
+
+Native SwiftUI client in `apps/ios`. Minimum **iOS 17**. One Better Auth
+session shows every machine across every authorised workspace in a searchable
+list. Owners and admins can enrol **this iPhone** as a WireGuard node, then
+change friendly names, approve advertised routes, and revoke endpoints. Session
+tokens and the phone's node credential stay in Keychain. There is no
+`blaktaild` LaunchDaemon on iOS; the packet tunnel is a Network Extension.
+
+The interface follows [Apple's Human Interface Guidelines](https://developer.apple.com/design/human-interface-guidelines/):
+a tab bar, `NavigationStack`, grouped forms, system search, semantic colours,
+VoiceOver labels, and status that pairs a symbol with a word.
+
+See [`docs/ios.md`](docs/ios.md) for build steps and manual validation.
+
+```bash
+bash scripts/validate-ios-phone.sh
+# on a Mac runner or Mac workstation:
+cd apps/ios && swift test
 ```

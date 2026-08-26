@@ -293,6 +293,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaktail-ios-wg"
+version = "0.1.0"
+dependencies = [
+ "boringtun",
+ "rand 0.8.7",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "blaktail-relay"
 version = "0.1.0"
 dependencies = [

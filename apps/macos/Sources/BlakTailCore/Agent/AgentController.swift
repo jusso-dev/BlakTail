@@ -96,12 +96,14 @@ public struct AgentController: Sendable {
     public var launchDaemonPlist: String
     public var runner: any ProcessRunner
 
+    #if os(macOS)
     public static let `default` = AgentController(
         agentPath: "/usr/local/bin/blaktaild",
         launchDaemonLabel: "com.blaktail.agent",
         launchDaemonPlist: "/Library/LaunchDaemons/com.blaktail.agent.plist",
         runner: FoundationProcessRunner()
     )
+    #endif
 
     public init(
         agentPath: String,
@@ -238,6 +240,7 @@ public struct AgentController: Sendable {
     }
 }
 
+#if os(macOS)
 public struct FoundationProcessRunner: ProcessRunner {
     public init() {}
 
@@ -326,3 +329,4 @@ public struct FoundationProcessRunner: ProcessRunner {
             + "\""
     }
 }
+#endif

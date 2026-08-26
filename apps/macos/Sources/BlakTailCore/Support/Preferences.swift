@@ -1,3 +1,6 @@
+#if canImport(UIKit)
+import UIKit
+#endif
 import Foundation
 
 /// Non-secret preferences stored in UserDefaults. Session tokens stay in Keychain.
@@ -10,7 +13,7 @@ public struct Preferences: Equatable, Sendable {
     public static let defaults = Preferences(
         consoleBaseURL: "https://console.example.org.au",
         coordinatorURL: "https://coord.example.org.au",
-        deviceName: Host.current().localizedName ?? "mac",
+        deviceName: defaultDeviceName,
         selectedOrganisationID: "",
     )
 
@@ -31,6 +34,17 @@ public struct Preferences: Equatable, Sendable {
         self.coordinatorURL = coordinatorURL
         self.deviceName = deviceName
         self.selectedOrganisationID = selectedOrganisationID
+    }
+
+    public static var defaultDeviceName: String {
+        #if os(macOS)
+        Host.current().localizedName ?? "mac"
+        #elseif canImport(UIKit)
+        let name = UIDevice.current.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? "iPhone" : name
+        #else
+        "iPhone"
+        #endif
     }
 
     public static func load(defaults: UserDefaults = .standard) -> Preferences {
