@@ -192,15 +192,6 @@ resources; native service checks found zero active scoped residue and local
 passwords, enrolment material, cookies, state, browser profiles, and registry login
 were removed.
 
-These screenshots are from that exact disposable run and show the console theme
-in use at the time. The sign-in image was taken before credentials were entered;
-the device image contains no enrollment code, WireGuard fingerprint, cookie,
-key, or cloud secret. The current console look is in [Console](#console).
-
-![BlakTail sign-in served by AWS run 20260824ma1](docs/images/aws-e2e/sign-in-20260824ma1.png)
-
-![Two private agents with editable friendly names in AWS run 20260824ma1](docs/images/aws-e2e/devices-20260824ma1.png)
-
 See the [redacted run report](docs/e2e/aws-fargate-run.md),
 [#27](https://github.com/jusso-dev/BlakTail/issues/27), and
 [#34](https://github.com/jusso-dev/BlakTail/issues/34). This is source-commit smoke
