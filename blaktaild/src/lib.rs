@@ -15,6 +15,7 @@ use uuid::Uuid;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
+pub mod acl_filter;
 pub mod dns;
 pub mod relay_client;
 pub use dns::{
@@ -54,7 +55,76 @@ pub struct Peer {
     /// proves reachability before opaque WireGuard ciphertext uses this path.
     #[serde(default)]
     pub relay_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<PeerIngress>,
 }
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PeerIngress {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub icmp: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_tcp: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_udp: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deny_icmp: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_users: Vec<String>,
+}
+
+impl Peer {
+    pub fn ingress_summary(&self) -> String {
+        match &self.ingress {
+            None => "legacy".into(),
+            Some(ingress)
+                if ingress.all
+                    && ingress.deny_tcp.is_empty()
+                    && ingress.deny_udp.is_empty()
+                    && !ingress.deny_icmp =>
+            {
+                if ingress.ssh_users.is_empty() {
+                    "all".into()
+                } else {
+                    format!("all ssh:{}", ingress.ssh_users.join(","))
+                }
+            }
+            Some(ingress) => {
+                let mut parts = Vec::new();
+                if ingress.all {
+                    parts.push("all".into());
+                }
+                if !ingress.tcp.is_empty() {
+                    parts.push(format!("tcp:{}", ingress.tcp.join(",")));
+                }
+                if !ingress.udp.is_empty() {
+                    parts.push(format!("udp:{}", ingress.udp.join(",")));
+                }
+                if ingress.icmp {
+                    parts.push("icmp".into());
+                }
+                if !ingress.deny_tcp.is_empty() {
+                    parts.push(format!("deny-tcp:{}", ingress.deny_tcp.join(",")));
+                }
+                if !ingress.ssh_users.is_empty() {
+                    parts.push(format!("ssh:{}", ingress.ssh_users.join(",")));
+                }
+                if parts.is_empty() {
+                    "deny".into()
+                } else {
+                    parts.join(" ")
+                }
+            }
+        }
+    }
+}
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PeerChange {
     Remove(String),
@@ -667,6 +737,9 @@ pub trait Network {
             ))
         }
     }
+    fn apply_ingress(&mut self, _interface: &str, _peers: &[Peer]) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 fn parse_cidr(value: &str) -> Result<(std::net::IpAddr, u8), Error> {
@@ -1007,10 +1080,53 @@ impl LinuxNetwork {
             ],
         );
     }
+
+    fn clear_acl_filter(interface: &str) {
+        for bin in ["iptables", "ip6tables"] {
+            for _ in 0..4 {
+                Self::run_ignore(
+                    bin,
+                    &["-D", "INPUT", "-i", interface, "-j", acl_filter::ACL_CHAIN],
+                );
+            }
+            Self::run_ignore(bin, &["-F", acl_filter::ACL_CHAIN]);
+            Self::run_ignore(bin, &["-X", acl_filter::ACL_CHAIN]);
+        }
+    }
+
+    fn install_acl_chain(bin: &str, interface: &str, rules: &[Vec<String>]) -> Result<(), Error> {
+        Self::run_ignore(bin, &["-N", acl_filter::ACL_CHAIN]);
+        Self::run(bin, &["-F", acl_filter::ACL_CHAIN])?;
+        if Self::run(
+            bin,
+            &["-C", "INPUT", "-i", interface, "-j", acl_filter::ACL_CHAIN],
+        )
+        .is_err()
+        {
+            Self::run(
+                bin,
+                &[
+                    "-I",
+                    "INPUT",
+                    "1",
+                    "-i",
+                    interface,
+                    "-j",
+                    acl_filter::ACL_CHAIN,
+                ],
+            )?;
+        }
+        for rule in rules {
+            let args: Vec<&str> = rule.iter().map(String::as_str).collect();
+            Self::run(bin, &args)?;
+        }
+        Ok(())
+    }
 }
 impl Network for LinuxNetwork {
     fn setup(&mut self, interface: &str, key: &Path, addresses: &[String]) -> Result<(), Error> {
         Self::clear_exit_rules();
+        Self::clear_acl_filter(interface);
         self.peer_routes.clear();
         self.installed_routes.clear();
         self.exit_routing = false;
@@ -1068,8 +1184,25 @@ impl Network for LinuxNetwork {
         }
         self.reconcile_routes(interface)
     }
+    fn apply_ingress(&mut self, interface: &str, peers: &[Peer]) -> Result<(), Error> {
+        Self::clear_acl_filter(interface);
+        let plan = acl_filter::plan_overlay_filter(peers);
+        if !plan.enforce {
+            return Ok(());
+        }
+        if let Err(error) = Self::install_acl_chain("iptables", interface, &plan.ipv4) {
+            Self::clear_acl_filter(interface);
+            return Err(error);
+        }
+        if let Err(error) = Self::install_acl_chain("ip6tables", interface, &plan.ipv6) {
+            Self::clear_acl_filter(interface);
+            return Err(error);
+        }
+        Ok(())
+    }
     fn down(&mut self, interface: &str) -> Result<(), Error> {
         self.disable_exit_routing(interface);
+        Self::clear_acl_filter(interface);
         Self::run("ip", &["link", "delete", "dev", interface])
     }
     fn set_peer_endpoint(
@@ -1604,15 +1737,33 @@ pub fn apply_peer_map(
     }
     let changes = peer_diff(&state.peers, &desired);
     network.apply(&state.interface, &changes)?;
+    apply_peer_filter(network, dir, &state.interface, &desired)?;
     state.peers = desired;
     write_state(dir, state)?;
     Ok(changes.len())
 }
 
+fn apply_peer_filter(
+    network: &mut dyn Network,
+    dir: &Path,
+    interface: &str,
+    peers: &[Peer],
+) -> Result<(), Error> {
+    network.apply_ingress(interface, peers)?;
+    write_secret(
+        &dir.join("sshd_blaktail.conf"),
+        acl_filter::sshd_policy_config(peers).as_bytes(),
+    )
+}
+
 /// Reinstalls the persisted peer set after a platform backend recreates its
 /// WireGuard interface. This keeps the last known mesh usable during a
 /// coordinator outage and makes daemon restarts deterministic.
-pub fn restore_peers(network: &mut dyn Network, state: &NodeState) -> Result<usize, Error> {
+pub fn restore_peers(
+    network: &mut dyn Network,
+    state: &NodeState,
+    dir: &Path,
+) -> Result<usize, Error> {
     let changes: Vec<_> = state
         .peers
         .iter()
@@ -1620,6 +1771,7 @@ pub fn restore_peers(network: &mut dyn Network, state: &NodeState) -> Result<usi
         .map(PeerChange::Upsert)
         .collect();
     network.apply(&state.interface, &changes)?;
+    apply_peer_filter(network, dir, &state.interface, &state.peers)?;
     Ok(changes.len())
 }
 
@@ -1815,6 +1967,7 @@ mod tests {
             dns_name: format!("{key}.tail.blaktail"),
             tags: vec![],
             relay_endpoint: None,
+            ingress: None,
         }
     }
     #[test]
@@ -1907,7 +2060,12 @@ mod tests {
             control_revision: 0,
         };
         let mut network = RecordingNetwork::default();
-        assert_eq!(restore_peers(&mut network, &state).unwrap(), 1);
+        let dir =
+            std::env::temp_dir().join(format!("blaktail-restore-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(restore_peers(&mut network, &state, &dir).unwrap(), 1);
+        fs::remove_dir_all(&dir).unwrap();
         assert_eq!(network.applied, vec![PeerChange::Upsert(expected)]);
     }
     #[test]
@@ -2012,6 +2170,7 @@ mod tests {
                 dns_name: "kept.blaktail".into(),
                 tags: vec![],
                 relay_endpoint: None,
+                ingress: None,
             },
             Peer {
                 id: gone,
@@ -2022,6 +2181,7 @@ mod tests {
                 dns_name: "gone.blaktail".into(),
                 tags: vec![],
                 relay_endpoint: None,
+                ingress: None,
             },
         ];
         let body = PeersResponse {
@@ -2036,6 +2196,7 @@ mod tests {
                 dns_name: "added.blaktail".into(),
                 tags: vec![],
                 relay_endpoint: None,
+                ingress: None,
             }],
             removed: vec![gone],
             assigned_ips: vec![],

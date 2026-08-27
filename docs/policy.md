@@ -84,11 +84,16 @@ unknown field rejects the document.
 - `rules` select roles, tags, groups, optional `dst_hosts`, `dst_ports`
   (`22`, `80-443`, or `*`), and `protocols` (`tcp`, `udp`, `icmp`). ICMP
   cannot name ports. Peer-map evaluation still includes a peer when any
-  port on that path is allowed; packet-level enforcement stays later.
+  port on that path is allowed. Linux agents install an INPUT filter on
+  the overlay from each peer's compiled `ingress` grant (destination
+  enforcement). Legacy snapshots without `ingress` stay unfiltered.
 - `ssh` selects the same source and destination roles, tags, and groups,
   plus operating-system `users` (`ubuntu` or `*`) and `allow` / `deny` /
   `check`. `check` may set `check_period_secs` (1-604800). SSH evaluation
-  has no same-tag default. Agents do not yet enforce these rules.
+  has no same-tag default. Allowed users are written to
+  `sshd_blaktail.conf` as `Match Address` / `AllowUsers` blocks; TCP 22
+  is opened only when at least one user is granted. Homelab proof is
+  `deploy/homelab/prove-acl-services.sh`.
 - `tests` can name `dst_host`, `dst_port`, and `protocol`, or `ssh_user`
   for an SSH decision. A mismatch fails closed. Host-only rules never
   become the implicit same-tag default.
