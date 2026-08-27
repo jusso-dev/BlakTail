@@ -152,20 +152,21 @@ echo "== install vanilla wg tools"
 '
 vanilla_lan="$(container_ip vanilla-wg)"
 echo "== bring up vanilla wg0 at ${VANILLA_OVERLAY} (${vanilla_lan}:${LISTEN_PORT})"
+# Host AppArmor profile `wg` allows private-key reads from /etc/wireguard, not /tmp.
 vanilla_pub="$("${COMPOSE[@]}" exec -T vanilla-wg sh -ceu '
+  mkdir -p /etc/wireguard
   umask 077
-  wg genkey > /tmp/vanilla.key
-  wg pubkey < /tmp/vanilla.key
-')"
-vanilla_pub="$(printf '%s' "$vanilla_pub" | tr -d '\r\n ')"
-"${COMPOSE[@]}" exec -T vanilla-wg sh -ceu '
+  wg genkey > /etc/wireguard/vanilla.key
+  pubkey="$(wg pubkey < /etc/wireguard/vanilla.key)"
   ip link del dev wg0 2>/dev/null || true
   ip link add dev wg0 type wireguard
   ip address add '"${VANILLA_OVERLAY}"'/32 dev wg0
-  wg set wg0 private-key /tmp/vanilla.key listen-port '"${LISTEN_PORT}"'
+  wg set wg0 private-key /etc/wireguard/vanilla.key listen-port '"${LISTEN_PORT}"'
   ip link set up dev wg0
-  shred -u /tmp/vanilla.key || rm -f /tmp/vanilla.key
-'
+  shred -u /etc/wireguard/vanilla.key || rm -f /etc/wireguard/vanilla.key
+  printf "%s\n" "$pubkey"
+')"
+vanilla_pub="$(printf '%s' "$vanilla_pub" | tr -d '\r\n ')"
 if [[ -z "$vanilla_pub" ]]; then
   echo "FAIL vanilla public key missing" >&2
   exit 1
