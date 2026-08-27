@@ -52,11 +52,32 @@ enum Command {
     Serve,
     /// Apply coordinator database migrations without opening network listeners.
     Migrate,
+    /// Validate a versioned policy document offline without a database.
+    CheckPolicy {
+        /// Path to a JSON policy document.
+        policy: PathBuf,
+    },
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Some(Command::CheckPolicy { policy }) = &cli.command {
+        let document = std::fs::read_to_string(policy)?;
+        match blaktail_coord::check_policy_document(&document) {
+            Ok(report) => {
+                println!(
+                    "policy ok version={} groups={} rules={} tests={} tag_owners={}",
+                    report.version, report.groups, report.rules, report.tests, report.tag_owners
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("blaktail-coord: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     let loaded = load_effective(&cli)?;
     let filter = tracing_subscriber::EnvFilter::new(&loaded.config.diagnostics.log_filter);
     let (filter_layer, filter_handle) = tracing_subscriber::reload::Layer::new(filter);

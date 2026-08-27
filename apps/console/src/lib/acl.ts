@@ -22,8 +22,11 @@ export type AclRuleDraft = {
 };
 
 export type AclPolicyDraft = {
+  version: number;
   groups: { name: string; members: string[] }[];
+  tag_owners: { tag: string; owners: string[] }[];
   rules: AclRuleDraft[];
+  tests: unknown[];
 };
 
 function asStringArray(value: unknown): string[] {
@@ -86,7 +89,19 @@ export function parseAclPolicy(value: unknown): AclPolicyDraft {
         } satisfies AclRuleDraft;
       })
     : [];
-  return { groups, rules };
+  const tagOwnersValue = source.tag_owners;
+  const tag_owners =
+    tagOwnersValue && typeof tagOwnersValue === "object" && !Array.isArray(tagOwnersValue)
+      ? Object.entries(tagOwnersValue as Record<string, unknown>).map(
+          ([tag, owners]) => ({
+            tag,
+            owners: asStringArray(owners),
+          }),
+        )
+      : [];
+  const tests = Array.isArray(source.tests) ? source.tests : [];
+  const version = source.version === 1 || source.version === undefined ? 1 : Number(source.version);
+  return { version: Number.isFinite(version) ? version : 1, groups, tag_owners, rules, tests };
 }
 
 export function validGroupName(name: string): boolean {
@@ -140,8 +155,19 @@ export function serializeAclPolicy(policy: AclPolicyDraft): Record<string, unkno
       ])
       .filter(([name, members]) => name && (members as string[]).length > 0),
   );
+  const tag_owners = Object.fromEntries(
+    policy.tag_owners
+      .map((entry) => [
+        entry.tag.trim(),
+        [...new Set(entry.owners.map((owner) => owner.trim()).filter(Boolean))],
+      ])
+      .filter(([tag, owners]) => tag && (owners as string[]).length > 0),
+  );
   return {
+    version: policy.version || 1,
     groups,
+    ...(Object.keys(tag_owners).length > 0 ? { tag_owners } : {}),
+    ...(policy.tests.length > 0 ? { tests: policy.tests } : {}),
     rules: policy.rules.map((rule) => ({
       action: rule.action,
       ...compact("src_roles", rule.src_roles),

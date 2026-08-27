@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "groups": {
+    "rangers": ["alice@example.test", "alice-user"]
+  },
+  "tag_owners": {
+    "office": ["owner-1", "admin"]
+  },
+  "rules": [
+    {
+      "action": "allow",
+      "src_groups": ["rangers"],
+      "dst_tags": ["store"]
+    }
+  ],
+  "tests": [
+    {
+      "name": "ranger reaches store",
+      "src_user": "alice-user",
+      "dst_tags": ["store"],
+      "allow": true
+    },
+    {
+      "name": "office stays isolated",
+      "src_tags": ["office"],
+      "dst_tags": ["store"],
+      "allow": false
+    }
+  ]
+}

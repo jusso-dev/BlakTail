@@ -36,7 +36,27 @@ test("ACL drafts keep groups and compact empty selectors", () => {
     ["alice-user", "alice@example.test"].sort(),
   );
   assert.deepEqual(serializeAclPolicy(policy), {
+    version: 1,
     groups: { rangers: ["alice@example.test", "alice-user"] },
     rules: [{ action: "allow", src_groups: ["rangers"], dst_tags: ["store"] }],
+  });
+});
+
+test("ACL drafts keep policy tests and tag owners across a round trip", () => {
+  const policy = parseAclPolicy({
+    version: 1,
+    tag_owners: { office: ["owner-1"] },
+    tests: [{ name: "office isolated", src_tags: ["office"], dst_tags: ["store"], allow: false }],
+    rules: [],
+  });
+  assert.equal(policy.version, 1);
+  assert.deepEqual(policy.tag_owners, [{ tag: "office", owners: ["owner-1"] }]);
+  assert.equal(policy.tests.length, 1);
+  assert.deepEqual(serializeAclPolicy(policy), {
+    version: 1,
+    groups: {},
+    tag_owners: { office: ["owner-1"] },
+    tests: [{ name: "office isolated", src_tags: ["office"], dst_tags: ["store"], allow: false }],
+    rules: [],
   });
 });
