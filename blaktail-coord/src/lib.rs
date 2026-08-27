@@ -7681,6 +7681,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn device_inventory_paginates_ten_thousand_duplicate_labels() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "inventory-10k-org").await;
+        let other = create_test_org(&r, "inventory-10k-other").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let created_at = now();
+        let expires = created_at + 86_400;
+        let mut tx = store.pool.begin().await.unwrap();
+        for index in 0..10_000 {
+            let octet_hi = 1 + index / 254;
+            let octet_lo = 1 + index % 254;
+            let name = format!("node-{index:05}");
+            sqlx::query(
+                "INSERT INTO nodes(id,org_id,name,display_name,wg_public_key,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,advertised_routes_json,approved_routes_json,credential_expires_at,capabilities_json,ephemeral) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'[]',$11,'[]','[]',$12,'[]',0)",
+            )
+            .bind(Uuid::from_u128(index as u128 + 1).to_string())
+            .bind(org.id.to_string())
+            .bind(&name)
+            .bind("Ranger tablet")
+            .bind(format!("key-{index:05}"))
+            .bind(format!(r#"["100.64.{octet_hi}.{octet_lo}/32"]"#))
+            .bind(format!("hash-{index:05}"))
+            .bind(created_at)
+            .bind("owner-1")
+            .bind("owner")
+            .bind(magic_dns_name(&name, &org.id.to_string()))
+            .bind(expires)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO nodes(id,org_id,name,display_name,wg_public_key,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,advertised_routes_json,approved_routes_json,credential_expires_at,capabilities_json,ephemeral) VALUES($1,$2,'foreign','Ranger tablet','foreign-key','[\"100.64.200.1/32\"]','foreign-hash',$3,'owner-1','owner','[]',$4,'[]','[]',$5,'[]',0)",
+        )
+        .bind(Uuid::from_u128(99_999).to_string())
+        .bind(other.id.to_string())
+        .bind(created_at)
+        .bind(magic_dns_name("foreign", &other.id.to_string()))
+        .bind(expires)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let reader: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"inventory","scopes":["devices:read"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let mut seen = std::collections::HashSet::new();
+        let mut before = None;
+        loop {
+            let uri = match &before {
+                Some(id) => format!("/api/v1/devices?limit=200&before={id}"),
+                None => "/api/v1/devices?limit=200".into(),
+            };
+            let page: serde_json::Value = body(
+                r.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(Method::GET)
+                            .uri(uri)
+                            .header(AUTHORIZATION, format!("Bearer {}", reader.token))
+                            .header("x-blaktail-organisation", org.id.to_string())
+                            .body(Body::from("null"))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let nodes = page["data"].as_array().unwrap();
+            if nodes.is_empty() {
+                break;
+            }
+            for node in nodes {
+                assert_eq!(node["display_name"], "Ranger tablet");
+                assert_ne!(node["name"], "foreign");
+                assert!(seen.insert(node["id"].as_str().unwrap().to_owned()));
+            }
+            before = nodes
+                .last()
+                .and_then(|node| node["id"].as_str())
+                .map(ToOwned::to_owned);
+            if nodes.len() < 200 {
+                break;
+            }
+        }
+        assert_eq!(seen.len(), 10_000);
+        let search: serde_json::Value = body(
+            r.clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/v1/devices?q=node-00001")
+                        .header(AUTHORIZATION, format!("Bearer {}", reader.token))
+                        .header("x-blaktail-organisation", org.id.to_string())
+                        .body(Body::from("null"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(search["data"].as_array().unwrap().len(), 1);
+        assert_eq!(search["data"][0]["name"], "node-00001");
+    }
+
+    #[tokio::test]
     async fn org_dns_settings_publish_rollback_and_reject_leaks() {
         let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
