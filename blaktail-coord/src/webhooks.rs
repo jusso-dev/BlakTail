@@ -1,7 +1,7 @@
-use crate::{hash, now, secret, ApiError, AppState};
+use crate::{hash, now, secret, ApiError, AppState, Role, Session};
 use axum::{
     extract::{Path as UrlPath, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -80,7 +80,7 @@ pub(crate) struct WebhookDestination {
     pub secret_prefix: String,
     pub enabled: bool,
     pub created_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
 }
 
@@ -381,11 +381,33 @@ pub(crate) async fn list_destinations(
 ) -> Result<Json<crate::admin::Envelope<Vec<WebhookDestination>>>, ApiError> {
     let (org_id, caller) = crate::admin::authenticate_org_header(&s, &headers).await?;
     crate::admin::require_scope(&caller, crate::admin::Scope::WebhooksRead)?;
+    Ok(Json(crate::admin::Envelope {
+        data: load_destinations(&s, org_id).await?,
+        next_cursor: None,
+    }))
+}
+
+pub(crate) async fn list_destinations_console(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WebhookDestination>>, ApiError> {
+    let session = crate::console_session(&s, &headers, org_id).await?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(load_destinations(&s, org_id).await?))
+}
+
+async fn load_destinations(
+    state: &AppState,
+    org_id: Uuid,
+) -> Result<Vec<WebhookDestination>, ApiError> {
     let rows = sqlx::query(
         "SELECT id,name,url,secret_prefix,enabled,created_at FROM webhook_destinations WHERE org_id=$1 ORDER BY created_at,id",
     )
     .bind(org_id.to_string())
-    .fetch_all(&s.store.pool)
+    .fetch_all(&state.store.pool)
     .await?;
     let mut destinations = Vec::new();
     for row in rows {
@@ -400,19 +422,38 @@ pub(crate) async fn list_destinations(
             secret: None,
         });
     }
-    Ok(Json(crate::admin::Envelope {
-        data: destinations,
-        next_cursor: None,
-    }))
+    Ok(destinations)
 }
 
 pub(crate) async fn create_destination(
     State(s): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<CreateWebhook>,
-) -> Result<(axum::http::StatusCode, Json<WebhookDestination>), ApiError> {
+) -> Result<(StatusCode, Json<WebhookDestination>), ApiError> {
     let (org_id, caller) = crate::admin::authenticate_org_header(&s, &headers).await?;
     crate::admin::require_scope(&caller, crate::admin::Scope::WebhooksWrite)?;
+    insert_destination(&s, org_id, &caller.session, input).await
+}
+
+pub(crate) async fn create_destination_console(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<CreateWebhook>,
+) -> Result<(StatusCode, Json<WebhookDestination>), ApiError> {
+    let session = crate::console_session(&s, &headers, org_id).await?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    insert_destination(&s, org_id, &session, input).await
+}
+
+async fn insert_destination(
+    state: &AppState,
+    org_id: Uuid,
+    session: &Session,
+    input: CreateWebhook,
+) -> Result<(StatusCode, Json<WebhookDestination>), ApiError> {
     let name = input.name.trim();
     if name.is_empty() || name.len() > 64 {
         return Err(ApiError::BadRequest(
@@ -424,7 +465,7 @@ pub(crate) async fn create_destination(
         "SELECT COUNT(*) FROM webhook_destinations WHERE org_id=$1 AND enabled=1",
     )
     .bind(org_id.to_string())
-    .fetch_one(&s.store.pool)
+    .fetch_one(&state.store.pool)
     .await?;
     if count >= MAX_DESTINATIONS {
         return Err(ApiError::BadRequest(
@@ -433,10 +474,10 @@ pub(crate) async fn create_destination(
     }
     let id = Uuid::new_v4();
     let signing_secret = secret(WEBHOOK_SECRET_PREFIX);
-    let sealed = seal_signing_secret(&s.auth_hmac_secret, &signing_secret)?;
+    let sealed = seal_signing_secret(&state.auth_hmac_secret, &signing_secret)?;
     let prefix: String = signing_secret.chars().take(11).collect();
     let created_at = now();
-    let mut tx = s.store.pool.begin().await?;
+    let mut tx = state.store.pool.begin().await?;
     sqlx::query(
         "INSERT INTO webhook_destinations(id,org_id,name,url,signing_secret,secret_hash,secret_prefix,enabled,created_at)
          VALUES($1,$2,$3,$4,$5,$6,$7,1,$8)",
@@ -461,7 +502,7 @@ pub(crate) async fn create_destination(
     crate::append_audit(
         &mut tx,
         org_id,
-        &caller.session,
+        session,
         "webhook.created",
         "webhook",
         Some(&id.to_string()),
@@ -470,7 +511,7 @@ pub(crate) async fn create_destination(
     .await?;
     tx.commit().await?;
     Ok((
-        axum::http::StatusCode::CREATED,
+        StatusCode::CREATED,
         Json(WebhookDestination {
             id,
             name: name.to_owned(),
@@ -487,10 +528,31 @@ pub(crate) async fn delete_destination(
     State(s): State<AppState>,
     UrlPath(destination_id): UrlPath<Uuid>,
     headers: HeaderMap,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let (org_id, caller) = crate::admin::authenticate_org_header(&s, &headers).await?;
     crate::admin::require_scope(&caller, crate::admin::Scope::WebhooksWrite)?;
-    let mut tx = s.store.pool.begin().await?;
+    disable_destination(&s, org_id, &caller.session, destination_id).await
+}
+
+pub(crate) async fn delete_destination_console(
+    State(s): State<AppState>,
+    UrlPath((org_id, destination_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let session = crate::console_session(&s, &headers, org_id).await?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    disable_destination(&s, org_id, &session, destination_id).await
+}
+
+async fn disable_destination(
+    state: &AppState,
+    org_id: Uuid,
+    session: &Session,
+    destination_id: Uuid,
+) -> Result<StatusCode, ApiError> {
+    let mut tx = state.store.pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE webhook_destinations SET enabled=0 WHERE id=$1 AND org_id=$2 AND enabled=1",
     )
@@ -505,7 +567,7 @@ pub(crate) async fn delete_destination(
     crate::append_audit(
         &mut tx,
         org_id,
-        &caller.session,
+        session,
         "webhook.disabled",
         "webhook",
         Some(&destination_id.to_string()),
@@ -513,7 +575,7 @@ pub(crate) async fn delete_destination(
     )
     .await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub(crate) async fn list_deliveries(
@@ -523,11 +585,34 @@ pub(crate) async fn list_deliveries(
 ) -> Result<Json<crate::admin::Envelope<Vec<WebhookDelivery>>>, ApiError> {
     let (org_id, caller) = crate::admin::authenticate_org_header(&s, &headers).await?;
     crate::admin::require_scope(&caller, crate::admin::Scope::WebhooksRead)?;
+    Ok(Json(crate::admin::Envelope {
+        data: load_deliveries(&s, org_id, destination_id).await?,
+        next_cursor: None,
+    }))
+}
+
+pub(crate) async fn list_deliveries_console(
+    State(s): State<AppState>,
+    UrlPath((org_id, destination_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WebhookDelivery>>, ApiError> {
+    let session = crate::console_session(&s, &headers, org_id).await?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(load_deliveries(&s, org_id, destination_id).await?))
+}
+
+async fn load_deliveries(
+    state: &AppState,
+    org_id: Uuid,
+    destination_id: Uuid,
+) -> Result<Vec<WebhookDelivery>, ApiError> {
     let exists: Option<String> =
         sqlx::query_scalar("SELECT id FROM webhook_destinations WHERE id=$1 AND org_id=$2")
             .bind(destination_id.to_string())
             .bind(org_id.to_string())
-            .fetch_optional(&s.store.pool)
+            .fetch_optional(&state.store.pool)
             .await?;
     if exists.is_none() {
         return Err(ApiError::NotFound);
@@ -538,7 +623,7 @@ pub(crate) async fn list_deliveries(
     )
     .bind(org_id.to_string())
     .bind(destination_id.to_string())
-    .fetch_all(&s.store.pool)
+    .fetch_all(&state.store.pool)
     .await?;
     let mut deliveries = Vec::new();
     for row in rows {
@@ -556,20 +641,38 @@ pub(crate) async fn list_deliveries(
             dead_lettered_at: row.try_get(8)?,
         });
     }
-    Ok(Json(crate::admin::Envelope {
-        data: deliveries,
-        next_cursor: None,
-    }))
+    Ok(deliveries)
 }
 
 pub(crate) async fn replay_delivery(
     State(s): State<AppState>,
     UrlPath(delivery_id): UrlPath<Uuid>,
     headers: HeaderMap,
-) -> Result<axum::http::StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError> {
     let (org_id, caller) = crate::admin::authenticate_org_header(&s, &headers).await?;
     crate::admin::require_scope(&caller, crate::admin::Scope::WebhooksWrite)?;
-    let mut tx = s.store.pool.begin().await?;
+    reset_delivery(&s, org_id, &caller.session, delivery_id).await
+}
+
+pub(crate) async fn replay_delivery_console(
+    State(s): State<AppState>,
+    UrlPath((org_id, delivery_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let session = crate::console_session(&s, &headers, org_id).await?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    reset_delivery(&s, org_id, &session, delivery_id).await
+}
+
+async fn reset_delivery(
+    state: &AppState,
+    org_id: Uuid,
+    session: &Session,
+    delivery_id: Uuid,
+) -> Result<StatusCode, ApiError> {
+    let mut tx = state.store.pool.begin().await?;
     let changed = sqlx::query(
         "UPDATE webhook_outbox SET attempts=0,next_attempt_at=$1,dead_lettered_at=NULL,last_error=NULL
          WHERE id=$2 AND org_id=$3 AND delivered_at IS NULL",
@@ -586,7 +689,7 @@ pub(crate) async fn replay_delivery(
     crate::append_audit(
         &mut tx,
         org_id,
-        &caller.session,
+        session,
         "webhook.replayed",
         "webhook_delivery",
         Some(&delivery_id.to_string()),
@@ -594,7 +697,7 @@ pub(crate) async fn replay_delivery(
     )
     .await?;
     tx.commit().await?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

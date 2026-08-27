@@ -1029,6 +1029,22 @@ pub fn app_with_relays_console_and_metrics(
             "/v1/orgs/:org_id/api-clients/:client_id",
             delete(admin::revoke_api_client),
         )
+        .route(
+            "/v1/orgs/:org_id/webhooks",
+            get(webhooks::list_destinations_console).post(webhooks::create_destination_console),
+        )
+        .route(
+            "/v1/orgs/:org_id/webhooks/:destination_id",
+            delete(webhooks::delete_destination_console),
+        )
+        .route(
+            "/v1/orgs/:org_id/webhooks/:destination_id/deliveries",
+            get(webhooks::list_deliveries_console),
+        )
+        .route(
+            "/v1/orgs/:org_id/webhooks/deliveries/:delivery_id/replay",
+            post(webhooks::replay_delivery_console),
+        )
         .merge(admin::api_routes())
         .route("/oauth/token", post(admin::oauth_token))
         .route("/v1/nodes/register", post(register_node))
@@ -7951,6 +7967,72 @@ mod tests {
         .await;
         assert_eq!(listed["data"][0]["event_type"], "policy.published");
         assert!(listed["data"][0]["delivered_at"].as_i64().is_some());
+    }
+
+    #[tokio::test]
+    async fn console_can_create_and_list_webhooks_members_cannot() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "console-webhooks").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let created: crate::webhooks::WebhookDestination = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks", org.id),
+                serde_json::json!({"name":"inventory","url":"https://example.com/hook"}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert!(created.secret.as_deref().unwrap().starts_with("btw_"));
+        let stored: String =
+            sqlx::query_scalar("SELECT signing_secret FROM webhook_destinations WHERE id=$1")
+                .bind(created.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(stored.starts_with("bte1."));
+        assert!(!stored.contains(created.secret.as_deref().unwrap()));
+        let listed: Vec<crate::webhooks::WebhookDestination> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/webhooks", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].secret.is_none());
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks", org.id),
+                serde_json::json!({"name":"nope","url":"https://example.com/other"}),
+                Some(&member),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/webhooks/{}", org.id, created.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[tokio::test]
