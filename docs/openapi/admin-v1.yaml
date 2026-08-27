@@ -5,6 +5,8 @@ info:
   description: |
     Organisation-scoped automation API. Distinct from node protocol routes
     and console HMAC assertions. Compatibility is additive inside `/api/v1`.
+    Request bodies are limited to 64 KiB. Each `bta_` client is limited to
+    120 requests per 60-second window.
 servers:
   - url: https://coord.example
 security:
@@ -107,6 +109,8 @@ paths:
       responses:
         "201": { description: Key shown once }
         "409": { description: Idempotency key reused with a different body }
+        "413": { description: Request body larger than 64 KiB }
+        "429": { description: Client exceeded 120 requests per minute }
   /api/v1/policy:
     get:
       summary: Read ACL plus etag
@@ -121,6 +125,8 @@ paths:
       responses:
         "204": { description: Updated }
         "412": { description: etag mismatch }
+        "413": { description: Request body larger than 64 KiB }
+        "429": { description: Client exceeded 120 requests per minute }
   /api/v1/audit:
     get:
       summary: List audit events
