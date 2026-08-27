@@ -2279,6 +2279,18 @@ async fn register_node(
         .execute(&mut *tx)
         .await?;
     bump_control_revision(&mut tx, &grant.org_id).await?;
+    let org_id = Uuid::parse_str(&grant.org_id).map_err(|_| ApiError::CorruptData)?;
+    webhooks::enqueue(
+        &mut tx,
+        org_id,
+        "device.enrolled",
+        &serde_json::json!({
+            "device_id": id,
+            "name": input.name.trim(),
+            "dns_name": dns_name,
+        }),
+    )
+    .await?;
     tx.commit().await?;
     info!(node_id=%id, org_id=%grant.org_id, "node registered");
     let (relay_token, relay_expires_at) = relay_credentials(&s, id);
@@ -3436,6 +3448,16 @@ async fn update_node_friendly_name(
         }),
     )
     .await?;
+    webhooks::enqueue(
+        &mut tx,
+        org_id,
+        "device.renamed",
+        &serde_json::json!({
+            "device_id": node_id,
+            "friendly_name": friendly_name,
+        }),
+    )
+    .await?;
     tx.commit().await?;
     info!(%node_id, %org_id, "node friendly name updated");
     Ok(StatusCode::NO_CONTENT)
@@ -3472,6 +3494,13 @@ async fn admin_revoke_node(
         "node",
         Some(&node_id.to_string()),
         &serde_json::json!({}),
+    )
+    .await?;
+    webhooks::enqueue(
+        &mut tx,
+        org_id,
+        "device.revoked",
+        &serde_json::json!({ "device_id": node_id }),
     )
     .await?;
     tx.commit().await?;
@@ -3537,6 +3566,13 @@ pub(crate) async fn tombstone_node(
         &serde_json::json!({
             "technical_name": technical_name,
         }),
+    )
+    .await?;
+    webhooks::enqueue(
+        &mut tx,
+        org_id,
+        "device.deleted",
+        &serde_json::json!({ "device_id": node_id }),
     )
     .await?;
     tx.commit().await?;
@@ -8033,6 +8069,68 @@ mod tests {
             .status(),
             StatusCode::NO_CONTENT
         );
+    }
+
+    #[tokio::test]
+    async fn device_lifecycle_writes_webhook_outbox_events() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "device-webhooks").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let dest: crate::webhooks::WebhookDestination = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks", org.id),
+                serde_json::json!({"name":"inventory","url":"https://example.com/hook"}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let node = register_test_node(&router, org.id, &owner, "office-1", "office-key", &[]).await;
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/nodes/{}/friendly-name", org.id, node.id),
+                serde_json::json!({"friendly_name":"Front desk"}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/nodes/{}/tombstone", org.id, node.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let deliveries: Vec<crate::webhooks::WebhookDelivery> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/webhooks/{}/deliveries", org.id, dest.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let types: Vec<_> = deliveries
+            .iter()
+            .map(|delivery| delivery.event_type.as_str())
+            .collect();
+        assert!(types.contains(&"device.enrolled"));
+        assert!(types.contains(&"device.renamed"));
+        assert!(types.contains(&"device.deleted"));
     }
 
     #[tokio::test]

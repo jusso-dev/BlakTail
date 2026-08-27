@@ -63,5 +63,6 @@ signing secret is shown once and stored as `bte1.` ChaCha20-Poly1305
 sealed with a key derived from the coordinator HMAC secret. Legacy
 plaintext `btw_` rows still open. Loopback, private, link-local, and
 metadata targets are rejected. Owners and admins can also create and
-disable destinations from Settings. A full timeout/429/SSRF receiver
-matrix remains later.
+disable destinations from Settings. Device enrol, rename, revoke, and
+delete write the same outbox. Membership events and a full
+timeout/429/SSRF receiver matrix remain later.
