@@ -1108,16 +1108,26 @@ async fn api_get_policy(
 ) -> Result<Json<Envelope<serde_json::Value>>, ApiError> {
     let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
     require_scope(&caller, Scope::DevicesRead)?;
-    let acl: String = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
-        .bind(org_id.to_string())
-        .fetch_optional(&s.store.pool)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let etag = hash(&acl);
+    let document = crate::load_acl_document(&s.store, org_id).await?;
+    let etag = document
+        .get("etag")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let revision = document
+        .get("revision")
+        .cloned()
+        .unwrap_or(serde_json::json!(1));
+    let has_previous = document
+        .get("has_previous")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
     Ok(Json(Envelope {
         data: serde_json::json!({
-            "acl": serde_json::from_str::<serde_json::Value>(&acl).unwrap_or_default(),
+            "acl": document,
             "etag": etag,
+            "revision": revision,
+            "has_previous": has_previous,
         }),
         next_cursor: None,
     }))
@@ -1130,39 +1140,47 @@ async fn api_put_policy(
 ) -> Result<StatusCode, ApiError> {
     let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
     require_scope(&caller, Scope::PolicyWrite)?;
-    let acl = value
-        .get("acl")
-        .cloned()
-        .ok_or_else(|| ApiError::BadRequest("acl is required".into()))?;
     let mut tx = s.store.pool.begin().await?;
-    let current: Option<String> = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
-        .bind(org_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
-    let current = current.ok_or(ApiError::NotFound)?;
-    if let Some(expected) = value.get("etag").and_then(|value| value.as_str()) {
-        if expected != hash(&current) {
-            return Err(ApiError::PreconditionFailed);
-        }
+    let current = crate::load_acl_row_tx(&mut tx, org_id).await?;
+    let expected = value
+        .get("etag")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| ApiError::BadRequest("etag is required".into()))?;
+    if expected != hash(&current.json) {
+        return Err(ApiError::PreconditionFailed);
     }
-    let changed = sqlx::query("UPDATE orgs SET acl_json=$1 WHERE id=$2")
-        .bind(acl.to_string())
-        .bind(org_id.to_string())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if changed == 0 {
-        return Err(ApiError::NotFound);
-    }
+    let rollback = value.get("rollback").and_then(serde_json::Value::as_bool) == Some(true);
+    let next = if rollback {
+        current
+            .previous
+            .clone()
+            .ok_or_else(|| ApiError::BadRequest("no previous policy revision to restore".into()))?
+    } else {
+        let acl = value.get("acl").cloned().ok_or_else(|| {
+            ApiError::BadRequest("acl is required unless rollback is true".into())
+        })?;
+        crate::storeable_acl_json(acl)?
+    };
+    let acl: crate::Acl = serde_json::from_str(&next).map_err(|_| ApiError::CorruptData)?;
+    crate::publish_acl_tx(&mut tx, org_id, &current.json, &next, current.revision).await?;
     bump_control_revision(&mut tx, org_id.to_string()).await?;
     append_audit(
         &mut tx,
         org_id,
         &caller.session,
-        "acl.updated",
+        if rollback {
+            "acl.rolled_back"
+        } else {
+            "acl.updated"
+        },
         "acl",
         Some(&org_id.to_string()),
-        &serde_json::json!({"via":"admin_api","sha256": hash(&acl.to_string())}),
+        &serde_json::json!({
+            "via": "admin_api",
+            "defaults": acl.defaults.as_str(),
+            "sha256": hash(&next),
+            "revision": current.revision + 1,
+        }),
     )
     .await?;
     tx.commit().await?;

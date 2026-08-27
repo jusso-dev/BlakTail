@@ -10,7 +10,9 @@ CREATE TABLE IF NOT EXISTS orgs (
    CHECK (json_valid(dns_json)),
  dns_revision INTEGER NOT NULL DEFAULT 0,
  dns_previous_json TEXT,
- control_revision INTEGER NOT NULL DEFAULT 1
+ control_revision INTEGER NOT NULL DEFAULT 1,
+ acl_revision INTEGER NOT NULL DEFAULT 1,
+ acl_previous_json TEXT
 );
 CREATE TABLE IF NOT EXISTS join_keys (
  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,

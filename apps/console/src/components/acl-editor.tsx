@@ -1,8 +1,10 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useMemo, useState, useTransition } from "react";
 import { saveAclAction } from "@/app/actions";
 import {
+  ACL_DEFAULTS,
   ACL_PROTOCOLS,
   ACL_ROLES,
   ACL_SSH_ACTIONS,
@@ -74,6 +76,7 @@ export function AclEditor({
   role: OrgRole;
   people: AclPerson[];
 }) {
+  const router = useRouter();
   const canMutate = canMutateTailnet(role);
   const parsedInitial = useMemo(() => {
     try {
@@ -111,6 +114,45 @@ export function AclEditor({
 
   return (
     <div className="acl-layout">
+      <section className="acl-section">
+        <div>
+          <h2>Default</h2>
+          <p className="muted">
+            New organisations start with deny. Existing documents keep the
+            same-tag compatibility default until you change it.
+          </p>
+        </div>
+        <label>
+          Unmatched traffic
+          <select
+            data-testid="acl-defaults"
+            disabled={!canMutate}
+            value={policy.defaults}
+            onChange={(event) =>
+              setPolicy((current) => ({
+                ...current,
+                defaults: event.target.value === "deny" ? "deny" : "same_tag",
+                generated:
+                  event.target.value === "deny" ? [] : current.generated,
+              }))
+            }
+          >
+            {ACL_DEFAULTS.map((value) => (
+              <option key={value} value={value}>
+                {value === "deny"
+                  ? "Deny (least privilege)"
+                  : "Same tag and untagged (legacy)"}
+              </option>
+            ))}
+          </select>
+        </label>
+        {policy.generated.length > 0 ? (
+          <p className="muted" data-testid="acl-generated">
+            Visible generated rule: {policy.generated[0]?.note ?? "legacy same-tag allow."}
+          </p>
+        ) : null}
+      </section>
+
       <section className="acl-section">
         <div>
           <h2>Groups</h2>
@@ -749,17 +791,48 @@ export function AclEditor({
                 "aclJson",
                 JSON.stringify(serializeAclPolicy(policy), null, 2),
               );
+              formData.set("etag", policy.etag);
               setMessage(null);
               startTransition(async () => {
                 const result = await saveAclAction(formData);
                 setMessage(
                   result.ok ? "Access policy saved on the coordinator." : result.error,
                 );
+                if (result.ok) {
+                  router.refresh();
+                }
               });
             }}
           >
             {pending ? "Saving…" : "Save access policy"}
           </button>
+          {policy.has_previous ? (
+            <button
+              type="button"
+              className="secondary"
+              data-testid="acl-rollback"
+              disabled={pending}
+              onClick={() => {
+                const formData = new FormData();
+                formData.set("rollback", "true");
+                formData.set("etag", policy.etag);
+                setMessage(null);
+                startTransition(async () => {
+                  const result = await saveAclAction(formData);
+                  setMessage(
+                    result.ok
+                      ? "Access policy rolled back on the coordinator."
+                      : result.error,
+                  );
+                  if (result.ok) {
+                    router.refresh();
+                  }
+                });
+              }}
+            >
+              Roll back
+            </button>
+          ) : null}
         </div>
       ) : null}
 

@@ -1,8 +1,12 @@
 # Organisation policy
 
 BlakTail policy is a versioned JSON document stored per organisation. The
-coordinator compiles it once on publish. `deny` wins over `allow`. When no
-rule matches, same-tag peers and untagged peers can still reach each other.
+coordinator compiles it once on publish. `deny` wins over `allow`. New
+organisations start with `"defaults": "deny"`. Existing documents without
+`defaults` keep the legacy same-tag and untagged allow; GET shows that as a
+visible `generated` rule. `PUT` requires the current `etag` when the caller
+sends `If-Match`. Admin `PUT /api/v1/policy` always requires `etag`.
+`{"rollback":true}` restores the previous document.
 
 ```sh
 blaktail-coord check-policy policy.json
@@ -16,6 +20,7 @@ unknown field rejects the document.
 ```json
 {
   "version": 1,
+  "defaults": "deny",
   "groups": {
     "rangers": ["alice@example.test", "alice-user"]
   },
@@ -68,6 +73,8 @@ unknown field rejects the document.
 }
 ```
 
+- `defaults` is `same_tag` or `deny`. Missing `defaults` is `same_tag` so
+  existing meshes keep working. New organisations write `deny`.
 - `groups` are named sets of people, identified by user id or email.
 - `tag_owners` lists who may assign that tag on a join key or browser
   approval. An unlisted tag keeps the previous owner/admin behaviour. The

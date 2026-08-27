@@ -29,7 +29,9 @@ client rejects later access tokens. Webhook/event delivery remains later.
 
 ## Writes
 
-- Policy PUT requires the current `etag`.
+- Policy PUT requires the current `etag`. `{"rollback": true}` restores the
+  previous document. GET includes `defaults`, a visible `generated` legacy
+  same-tag rule when that default is active, `revision`, and `has_previous`.
 - `GET`/`PUT /api/v1/dns` publishes organisation DNS settings. Writes need
   `dns:write` and the current `etag`. `{"rollback": true}` restores the previous
   revision.

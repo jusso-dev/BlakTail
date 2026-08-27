@@ -593,13 +593,22 @@ export async function revokeWgOnlyPeer(
   }
 }
 
-export async function putAcl(ctx: ConsoleContext, acl: unknown): Promise<void> {
+export async function putAcl(
+  ctx: ConsoleContext,
+  acl: unknown,
+  etag?: string,
+): Promise<void> {
   if (ctx.role === "member") {
     throw new Error("Members cannot edit ACL rules.");
+  }
+  const headers = new Headers();
+  if (etag) {
+    headers.set("If-Match", etag);
   }
   const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/acl`, {
     method: "PUT",
     ctx,
+    headers,
     body: JSON.stringify(acl),
   });
   if (!res.ok) {

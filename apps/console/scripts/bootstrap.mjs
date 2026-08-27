@@ -319,7 +319,7 @@ async function prepareCoordinator(input, prepared) {
     body: JSON.stringify({
       id: prepared.coordOrgId,
       name: input.organisationName,
-      acl: { rules: [] },
+      acl: { version: 1, defaults: "deny", rules: [] },
     }),
   });
   if (response.status !== 200 && response.status !== 202) {
