@@ -198,10 +198,7 @@ fn insert_record(
     insert(name);
 }
 
-fn insert_extra_record(
-    records: &mut HashMap<String, Vec<IpAddr>>,
-    record: &crate::OrgDnsRecord,
-) {
+fn insert_extra_record(records: &mut HashMap<String, Vec<IpAddr>>, record: &crate::OrgDnsRecord) {
     let name = record.name.trim_end_matches('.').to_ascii_lowercase();
     if name.is_empty() || name.ends_with(".blaktail") {
         return;
