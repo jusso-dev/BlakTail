@@ -1,19 +1,21 @@
 import { ConsoleShell } from "@/components/console-shell";
 import { DeviceActions } from "@/components/device-actions";
 import { PageHeader } from "@/components/page-header";
-import { listAllNodes } from "@/lib/coord";
+import { WgOnlyManager } from "@/components/wg-only-manager";
+import { listAllNodes, listAllWgOnlyPeers } from "@/lib/coord";
 import { listMemberships } from "@/lib/oidc";
 import { requireConsoleContext } from "@/lib/session";
 
 export default async function DevicesPage() {
   const ctx = await requireConsoleContext();
-  const [inventory, memberships] = await Promise.all([
+  const [inventory, memberships, unmanaged] = await Promise.all([
     listAllNodes(ctx),
     Promise.all(
       ctx.organisations.map((organisation) =>
         listMemberships(organisation.organisationId).catch(() => []),
       ),
     ).then((rows) => rows.flat().filter((row) => row.status === "active")),
+    listAllWgOnlyPeers(ctx),
   ]);
   const blockedErrors = ctx.blockedOrganisations.map(
     (organisation) =>
@@ -49,6 +51,12 @@ export default async function DevicesPage() {
             }))}
           />
         </div>
+        <WgOnlyManager
+          peers={unmanaged.peers}
+          errors={unmanaged.errors}
+          role={ctx.role}
+          organisationId={ctx.organisationId}
+        />
       </div>
     </ConsoleShell>
   );

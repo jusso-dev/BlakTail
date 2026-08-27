@@ -43,6 +43,8 @@ peers without a later gateway design.
 
 ## Follow-up
 
-Implementation, owner/admin/member tests, a vanilla `wg` reachability proof,
-and rotation/revoke live in later #45 slices. This record only locks the first
-topology so those slices do not silently grow into a gateway product.
+The console now lists unmanaged peers separately from managed devices and
+creates them with stored kind `wireguard_only`. A vanilla `wg` reachability
+proof and overlap rotation still live in later #45 slices. This record only
+locks the first topology so those slices do not silently grow into a gateway
+product.

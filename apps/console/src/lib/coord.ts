@@ -473,6 +473,126 @@ export async function putDns(
   return res.json() as Promise<OrgDnsResponse>;
 }
 
+export type WireGuardOnlyPeer = {
+  id: string;
+  name: string;
+  kind: string;
+  wg_public_key: string;
+  endpoint: string;
+  allowed_ips: string[];
+  tags: DeviceTag[];
+  created_at: number;
+  expires_at: number | null;
+  revoked_at: number | null;
+  revision: number;
+};
+
+export type NetworkWgOnlyPeer = WireGuardOnlyPeer & {
+  organisation_id: string;
+  organisation_name: string;
+};
+
+export async function listWgOnlyPeers(
+  ctx: ConsoleContext,
+): Promise<WireGuardOnlyPeer[]> {
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/wireguard-only-peers`,
+    { method: "GET", ctx },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<WireGuardOnlyPeer[]>;
+}
+
+export async function listAllWgOnlyPeers(
+  person: PersonSessionContext,
+): Promise<{ peers: NetworkWgOnlyPeer[]; errors: string[] }> {
+  const inventories = await Promise.all(
+    person.organisations.map(async (organisation) => {
+      const ctx = organisationContext(person, organisation.organisationId);
+      try {
+        const peers = await listWgOnlyPeers(ctx);
+        return {
+          peers: peers.map((peer) => ({
+            ...peer,
+            organisation_id: ctx.organisationId,
+            organisation_name: ctx.organisationName,
+          })),
+          error: null,
+        };
+      } catch (error) {
+        return {
+          peers: [],
+          error: `${organisation.organisationName}: ${
+            error instanceof Error
+              ? error.message
+              : "Could not load unmanaged peers."
+          }`,
+        };
+      }
+    }),
+  );
+  return {
+    peers: inventories
+      .flatMap((inventory) => inventory.peers)
+      .sort(
+        (left, right) =>
+          left.organisation_name.localeCompare(right.organisation_name) ||
+          left.name.localeCompare(right.name),
+      ),
+    errors: inventories.flatMap((inventory) =>
+      inventory.error ? [inventory.error] : [],
+    ),
+  };
+}
+
+export async function createWgOnlyPeer(
+  ctx: ConsoleContext,
+  input: {
+    name: string;
+    wg_public_key: string;
+    endpoint: string;
+    allowed_ips: string[];
+    tags: DeviceTag[];
+  },
+): Promise<WireGuardOnlyPeer> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot add unmanaged WireGuard peers.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/wireguard-only-peers`,
+    {
+      method: "POST",
+      ctx,
+      body: JSON.stringify({
+        kind: "wireguard_only",
+        ...input,
+      }),
+    },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<WireGuardOnlyPeer>;
+}
+
+export async function revokeWgOnlyPeer(
+  ctx: ConsoleContext,
+  peerId: string,
+): Promise<void> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot revoke unmanaged WireGuard peers.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/wireguard-only-peers/${peerId}`,
+    { method: "DELETE", ctx },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+}
+
 export async function putAcl(ctx: ConsoleContext, acl: unknown): Promise<void> {
   if (ctx.role === "member") {
     throw new Error("Members cannot edit ACL rules.");
