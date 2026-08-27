@@ -57,7 +57,9 @@ and proves a read-only token cannot write. `POST /oauth/token` mints a
 short-lived `bto_` access token for the `client_credentials` grant. Webhook
 delivery is HTTPS-only: owners create destinations at `/api/v1/webhooks`,
 policy and DNS publishes write a transactional outbox, and the coordinator
-signs `t={unix},v1={hmac}` over `{timestamp}.{body}`. Loopback, private,
-link-local, and metadata targets are rejected. Console destination UI,
-encryption of the stored signing secret, and a full timeout/429/SSRF
-receiver matrix remain later.
+signs `t={unix},v1={hmac}` over `{timestamp}.{body}`. The destination
+signing secret is shown once and stored as `bte1.` ChaCha20-Poly1305
+sealed with a key derived from the coordinator HMAC secret. Legacy
+plaintext `btw_` rows still open. Loopback, private, link-local, and
+metadata targets are rejected. Console destination UI and a full
+timeout/429/SSRF receiver matrix remain later.

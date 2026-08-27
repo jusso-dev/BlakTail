@@ -4,9 +4,15 @@ use axum::{
     http::HeaderMap,
     Json,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
+use chacha20poly1305::{
+    aead::{Aead, KeyInit},
+    ChaCha20Poly1305, Nonce,
+};
 use hmac::{Hmac, Mac};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::{
     net::{IpAddr, SocketAddr},
@@ -18,10 +24,53 @@ use url::Url;
 use uuid::Uuid;
 
 const WEBHOOK_SECRET_PREFIX: &str = "btw";
+const SEALED_SECRET_PREFIX: &str = "bte1.";
 const MAX_DESTINATIONS: i64 = 8;
 const MAX_ATTEMPTS: i64 = 8;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+fn webhook_seal_key(master: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"blaktail-webhook-secret-v1");
+    hasher.update(master);
+    hasher.finalize().into()
+}
+
+fn seal_signing_secret(master: &[u8], plaintext: &str) -> Result<String, ApiError> {
+    let cipher = ChaCha20Poly1305::new_from_slice(&webhook_seal_key(master))
+        .map_err(|_| ApiError::BadRequest("webhook sealing key is invalid".into()))?;
+    let mut nonce_bytes = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, plaintext.as_bytes())
+        .map_err(|_| ApiError::CorruptData)?;
+    let mut packed = nonce_bytes.to_vec();
+    packed.extend(ciphertext);
+    Ok(format!("{SEALED_SECRET_PREFIX}{}", STANDARD.encode(packed)))
+}
+
+fn open_signing_secret(master: &[u8], stored: &str) -> Result<String, ApiError> {
+    if stored.starts_with("btw_") {
+        return Ok(stored.to_owned());
+    }
+    let packed = stored
+        .strip_prefix(SEALED_SECRET_PREFIX)
+        .ok_or(ApiError::CorruptData)?;
+    let raw = STANDARD.decode(packed).map_err(|_| ApiError::CorruptData)?;
+    if raw.len() <= 12 {
+        return Err(ApiError::CorruptData);
+    }
+    let (nonce_bytes, ciphertext) = raw.split_at(12);
+    let cipher = ChaCha20Poly1305::new_from_slice(&webhook_seal_key(master))
+        .map_err(|_| ApiError::CorruptData)?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext)
+        .map_err(|_| ApiError::CorruptData)?;
+    String::from_utf8(plaintext).map_err(|_| ApiError::CorruptData)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct WebhookDestination {
@@ -118,7 +167,14 @@ async fn deliver_due(state: &AppState) -> Result<(), ApiError> {
         let payload: String = row.try_get(5)?;
         let attempts: i64 = row.try_get(6)?;
         let url: String = row.try_get(7)?;
-        let signing_secret: String = row.try_get(8)?;
+        let stored_secret: String = row.try_get(8)?;
+        let signing_secret = match open_signing_secret(&state.auth_hmac_secret, &stored_secret) {
+            Ok(secret) => secret,
+            Err(error) => {
+                warn!(%error, delivery_id = %id, "webhook signing secret could not be opened");
+                continue;
+            }
+        };
         match deliver_one(DeliveryJob {
             delivery_id: &id,
             org_id: &org_id,
@@ -211,7 +267,7 @@ async fn deliver_one(job: DeliveryJob<'_>) -> Result<(), ApiError> {
 }
 
 fn sign_payload(secret: &str, timestamp: i64, payload: &str) -> String {
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac key");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).expect("hmac key");
     mac.update(format!("{timestamp}.{payload}").as_bytes());
     mac.finalize()
         .into_bytes()
@@ -377,6 +433,7 @@ pub(crate) async fn create_destination(
     }
     let id = Uuid::new_v4();
     let signing_secret = secret(WEBHOOK_SECRET_PREFIX);
+    let sealed = seal_signing_secret(&s.auth_hmac_secret, &signing_secret)?;
     let prefix: String = signing_secret.chars().take(11).collect();
     let created_at = now();
     let mut tx = s.store.pool.begin().await?;
@@ -388,7 +445,7 @@ pub(crate) async fn create_destination(
     .bind(org_id.to_string())
     .bind(name)
     .bind(url.as_str())
-    .bind(&signing_secret)
+    .bind(&sealed)
     .bind(hash(&signing_secret))
     .bind(&prefix)
     .bind(created_at)
@@ -562,5 +619,22 @@ mod tests {
         let other = sign_payload("btw_secret", 11, "{\"ok\":true}");
         assert_eq!(first, second);
         assert_ne!(first, other);
+    }
+
+    #[test]
+    fn webhook_signing_secret_seals_and_opens() {
+        let master = b"test-only-hmac-secret-at-least-32-bytes";
+        let sealed = seal_signing_secret(master, "btw_shown-once").unwrap();
+        assert!(sealed.starts_with("bte1."));
+        assert!(!sealed.contains("btw_shown-once"));
+        assert_eq!(
+            open_signing_secret(master, &sealed).unwrap(),
+            "btw_shown-once"
+        );
+        assert_eq!(
+            open_signing_secret(master, "btw_legacy-plaintext").unwrap(),
+            "btw_legacy-plaintext"
+        );
+        assert!(open_signing_secret(b"other-master-key-at-least-32-bytes!!", &sealed).is_err());
     }
 }
