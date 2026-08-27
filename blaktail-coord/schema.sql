@@ -118,3 +118,23 @@ CREATE TABLE IF NOT EXISTS api_idempotency (
  created_at INTEGER NOT NULL,
  PRIMARY KEY (org_id, client_id, key_hash)
 );
+CREATE TABLE IF NOT EXISTS wireguard_only_peers (
+ id TEXT PRIMARY KEY,
+ org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+ name TEXT NOT NULL,
+ kind TEXT NOT NULL DEFAULT 'wireguard_only' CHECK (kind = 'wireguard_only'),
+ wg_public_key TEXT NOT NULL,
+ endpoint TEXT NOT NULL,
+ allowed_ips_json TEXT NOT NULL CHECK (json_valid(allowed_ips_json)),
+ tags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags_json)),
+ created_at INTEGER NOT NULL,
+ expires_at INTEGER,
+ revoked_at INTEGER,
+ revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE UNIQUE INDEX IF NOT EXISTS wireguard_only_peers_org_name_idx
+ ON wireguard_only_peers(org_id, name) WHERE revoked_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS wireguard_only_peers_org_key_idx
+ ON wireguard_only_peers(org_id, wg_public_key) WHERE revoked_at IS NULL;
+CREATE INDEX IF NOT EXISTS wireguard_only_peers_org_idx
+ ON wireguard_only_peers(org_id, revoked_at);

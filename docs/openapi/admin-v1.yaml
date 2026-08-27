@@ -143,6 +143,61 @@ paths:
         "412": { description: etag mismatch }
         "413": { description: Body exceeded 64 KiB }
         "429": { description: Rate limit exceeded }
+  /api/v1/wireguard-only-peers:
+    get:
+      summary: List WireGuard-only peers
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      responses:
+        "200":
+          description: Envelope of peers. Private keys are never stored or returned.
+    post:
+      summary: Create a WireGuard-only peer from an external public key
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, kind, wg_public_key, endpoint, allowed_ips]
+              properties:
+                name: { type: string, maxLength: 64 }
+                kind: { type: string, enum: [wireguard_only] }
+                wg_public_key: { type: string }
+                endpoint: { type: string }
+                allowed_ips:
+                  type: array
+                  items: { type: string }
+                tags:
+                  type: array
+                  items: { type: string }
+                expires_at: { type: integer }
+      responses:
+        "201": { description: Created public-key export }
+        "403": { description: Missing devices:write }
+        "409": { description: Name or public key already exists }
+        "413": { description: Request body larger than 64 KiB }
+        "429": { description: Client exceeded 120 requests per minute }
+  /api/v1/wireguard-only-peers/{peer_id}:
+    get:
+      summary: Get one WireGuard-only peer
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - $ref: "#/components/parameters/PeerId"
+      responses:
+        "200": { description: Peer }
+        "404": { description: Not found }
+    delete:
+      summary: Revoke a WireGuard-only peer
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - $ref: "#/components/parameters/PeerId"
+      responses:
+        "204": { description: Revoked }
+        "403": { description: Missing devices:write }
+        "409": { description: Already revoked }
   /api/v1/audit:
     get:
       summary: List audit events
@@ -175,5 +230,10 @@ components:
     NodeId:
       in: path
       name: node_id
+      required: true
+      schema: { type: string, format: uuid }
+    PeerId:
+      in: path
+      name: peer_id
       required: true
       schema: { type: string, format: uuid }
