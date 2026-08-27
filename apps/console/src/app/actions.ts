@@ -12,13 +12,18 @@ import {
   putDns,
   type OrgDnsSettings,
   createApiClient,
+  createWebhook,
   createWgOnlyPeer,
+  disableWebhook,
+  listWebhookDeliveries,
+  replayWebhookDelivery,
   revokeApiClient,
   revokeWgOnlyPeer,
   revokeNode,
   tombstoneNode,
   updateNodeFriendlyName,
   type DeviceTag,
+  type WebhookDelivery,
 } from "@/lib/coord";
 import {
   canMutateTailnet,
@@ -211,6 +216,130 @@ export async function revokeApiClientAction(
         error instanceof Error
           ? error.message
           : "Could not revoke automation credential.",
+    };
+  }
+}
+
+export async function createWebhookAction(
+  formData: FormData,
+): Promise<ActionResult<{ secret: string; prefix: string }>> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (!canMutateTailnet(ctx.role)) {
+      return {
+        ok: false,
+        error: "Only owners and admins can create webhook destinations.",
+      };
+    }
+    const name = String(formData.get("name") ?? "").trim();
+    const url = String(formData.get("url") ?? "").trim();
+    if (!name) {
+      return { ok: false, error: "Name the webhook destination." };
+    }
+    if (!url) {
+      return { ok: false, error: "Enter an HTTPS destination URL." };
+    }
+    const created = await createWebhook(ctx, { name, url });
+    revalidatePath("/settings");
+    return {
+      ok: true,
+      data: {
+        secret: created.secret ?? "",
+        prefix: created.secret_prefix,
+      },
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not create webhook destination.",
+    };
+  }
+}
+
+export async function disableWebhookAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (!canMutateTailnet(ctx.role)) {
+      return {
+        ok: false,
+        error: "Only owners and admins can disable webhook destinations.",
+      };
+    }
+    const destinationId = String(formData.get("destinationId") ?? "");
+    if (!destinationId) {
+      return { ok: false, error: "Choose a webhook destination to disable." };
+    }
+    await disableWebhook(ctx, destinationId);
+    revalidatePath("/settings");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not disable webhook destination.",
+    };
+  }
+}
+
+export async function listWebhookDeliveriesAction(
+  destinationId: string,
+): Promise<ActionResult<{ deliveries: WebhookDelivery[] }>> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (!canMutateTailnet(ctx.role)) {
+      return {
+        ok: false,
+        error: "Only owners and admins can list webhook deliveries.",
+      };
+    }
+    if (!destinationId) {
+      return { ok: false, error: "Choose a webhook destination." };
+    }
+    const deliveries = await listWebhookDeliveries(ctx, destinationId);
+    return { ok: true, data: { deliveries } };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not list webhook deliveries.",
+    };
+  }
+}
+
+export async function replayWebhookDeliveryAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireConsoleContext();
+    if (!canMutateTailnet(ctx.role)) {
+      return {
+        ok: false,
+        error: "Only owners and admins can replay webhook deliveries.",
+      };
+    }
+    const deliveryId = String(formData.get("deliveryId") ?? "");
+    if (!deliveryId) {
+      return { ok: false, error: "Choose a delivery to replay." };
+    }
+    await replayWebhookDelivery(ctx, deliveryId);
+    revalidatePath("/settings");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not replay webhook delivery.",
     };
   }
 }

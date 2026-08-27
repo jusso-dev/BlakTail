@@ -6,23 +6,27 @@ import { MembershipManager } from "@/components/membership-manager";
 import { OidcProviderManager } from "@/components/oidc-provider-manager";
 import { PageHeader } from "@/components/page-header";
 import { DnsSettings } from "@/components/dns-settings";
-import { getDns, listApiClients } from "@/lib/coord";
+import { WebhookManager } from "@/components/webhook-manager";
+import { getDns, listApiClients, listWebhooks } from "@/lib/coord";
 import { listPendingInvitations } from "@/lib/invitations";
 import { listIdentitySettings } from "@/lib/identity-links";
 import { listIdentityProviders, listMemberships } from "@/lib/oidc";
-import { roleLabel } from "@/lib/roles";
+import { canMutateTailnet, roleLabel } from "@/lib/roles";
 import { requireConsoleContext } from "@/lib/session";
 import { TAGLINE } from "@/lib/tagline";
 
 export default async function SettingsPage() {
   const ctx = await requireConsoleContext();
-  const [invitations, identitySettings, apiClients, providers, memberships, dns] =
+  const [invitations, identitySettings, apiClients, webhooks, providers, memberships, dns] =
     await Promise.all([
       listPendingInvitations(ctx),
       listIdentitySettings(ctx),
       ctx.role === "member"
         ? Promise.resolve([])
         : listApiClients(ctx).catch(() => []),
+      canMutateTailnet(ctx.role)
+        ? listWebhooks(ctx).catch(() => [])
+        : Promise.resolve([]),
       ctx.role === "owner"
         ? listIdentityProviders(ctx.organisationId)
         : Promise.resolve([]),
@@ -91,6 +95,9 @@ export default async function SettingsPage() {
             </p>
           </div>
         )}
+        {canMutateTailnet(ctx.role) ? (
+          <WebhookManager destinations={webhooks} />
+        ) : null}
         {ctx.role === "owner" ? (
           <ApiClientManager clients={apiClients} />
         ) : null}

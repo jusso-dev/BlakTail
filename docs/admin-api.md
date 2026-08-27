@@ -25,7 +25,8 @@ in at most one hour, plus `organisation_id` so callers can set
 `X-BlakTail-Organisation`. The static `bta_` secret remains a bootstrap
 Bearer option. Requested `scope` must be empty or a subset of the registered
 scopes; the access token still carries the registered set. Revoking the
-client rejects later access tokens. Webhook/event delivery remains later.
+client rejects later access tokens. Webhook destinations are minted separately
+and their signing secrets are not OAuth credentials.
 
 ## Writes
 
@@ -61,5 +62,6 @@ signs `t={unix},v1={hmac}` over `{timestamp}.{body}`. The destination
 signing secret is shown once and stored as `bte1.` ChaCha20-Poly1305
 sealed with a key derived from the coordinator HMAC secret. Legacy
 plaintext `btw_` rows still open. Loopback, private, link-local, and
-metadata targets are rejected. Console destination UI and a full
-timeout/429/SSRF receiver matrix remain later.
+metadata targets are rejected. Owners and admins can also create and
+disable destinations from Settings. A full timeout/429/SSRF receiver
+matrix remains later.

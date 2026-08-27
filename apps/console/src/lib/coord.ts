@@ -53,6 +53,28 @@ export type ApiClientCreated = ApiClient & {
   token: string;
 };
 
+export type WebhookDestination = {
+  id: string;
+  name: string;
+  url: string;
+  secret_prefix: string;
+  enabled: boolean;
+  created_at: number;
+  secret?: string | null;
+};
+
+export type WebhookDelivery = {
+  id: string;
+  destination_id: string;
+  event_id: string;
+  event_type: string;
+  created_at: number;
+  attempts: number;
+  last_error: string | null;
+  delivered_at: number | null;
+  dead_lettered_at: number | null;
+};
+
 export type NetworkNode = CoordNode & {
   organisation_id: string;
   organisation_name: string;
@@ -290,6 +312,98 @@ export async function createApiClient(
     throw new Error(await readError(res));
   }
   return res.json() as Promise<ApiClientCreated>;
+}
+
+export async function listWebhooks(
+  ctx: ConsoleContext,
+): Promise<WebhookDestination[]> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot list webhook destinations.");
+  }
+  const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/webhooks`, {
+    method: "GET",
+    ctx,
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<WebhookDestination[]>;
+}
+
+export async function createWebhook(
+  ctx: ConsoleContext,
+  input: { name: string; url: string },
+): Promise<WebhookDestination> {
+  if (ctx.role === "member") {
+    throw new Error("Only owners and admins can create webhook destinations.");
+  }
+  const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/webhooks`, {
+    method: "POST",
+    ctx,
+    body: JSON.stringify(input),
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<WebhookDestination>;
+}
+
+export async function disableWebhook(
+  ctx: ConsoleContext,
+  destinationId: string,
+): Promise<void> {
+  if (ctx.role === "member") {
+    throw new Error("Only owners and admins can disable webhook destinations.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/webhooks/${destinationId}`,
+    {
+      method: "DELETE",
+      ctx,
+    },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+}
+
+export async function listWebhookDeliveries(
+  ctx: ConsoleContext,
+  destinationId: string,
+): Promise<WebhookDelivery[]> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot list webhook deliveries.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/webhooks/${destinationId}/deliveries`,
+    {
+      method: "GET",
+      ctx,
+    },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<WebhookDelivery[]>;
+}
+
+export async function replayWebhookDelivery(
+  ctx: ConsoleContext,
+  deliveryId: string,
+): Promise<void> {
+  if (ctx.role === "member") {
+    throw new Error("Only owners and admins can replay webhook deliveries.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/webhooks/deliveries/${deliveryId}/replay`,
+    {
+      method: "POST",
+      ctx,
+    },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
 }
 
 export async function revokeApiClient(
