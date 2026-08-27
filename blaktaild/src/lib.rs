@@ -16,7 +16,9 @@ use zeroize::Zeroize;
 
 pub mod dns;
 pub mod relay_client;
-pub use dns::{configure_system_dns, dns_domain, remove_system_dns, MagicDns};
+pub use dns::{
+    configure_system_dns, dns_domain, published_resolver_suffixes, remove_system_dns, MagicDns,
+};
 pub use relay_client::RelayMesh;
 
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/blaktail";
@@ -123,6 +125,17 @@ pub struct OrgDnsSnapshot {
     pub managed: bool,
     #[serde(default)]
     pub records: Vec<OrgDnsRecord>,
+    #[serde(default)]
+    pub search_domains: Vec<String>,
+    #[serde(default)]
+    pub split: Vec<OrgDnsSplit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OrgDnsSplit {
+    pub suffix: String,
+    #[serde(default)]
+    pub resolvers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -427,7 +440,7 @@ impl Coordinator {
         state.relays = body.relays;
         state.relay_token = body.relay_token;
         state.relay_expires_at = body.relay_expires_at;
-        state.org_dns = body.dns;
+        apply_org_dns_snapshot(state, body.dns);
         Ok(body.peers)
     }
     pub async fn update_advertised_routes(
@@ -1644,6 +1657,12 @@ pub fn validate_interface(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn apply_org_dns_snapshot(state: &mut NodeState, incoming: Option<OrgDnsSnapshot>) {
+    if incoming.is_some() {
+        state.org_dns = incoming;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1815,5 +1834,48 @@ mod tests {
         fs::set_permissions(dir.join("private.key"), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(ensure_private_key(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn poll_without_dns_keeps_last_known_good_snapshot() {
+        let mut state = NodeState {
+            node_id: Uuid::from_u128(1),
+            node_token: "secret".into(),
+            coord: "http://localhost:3000".into(),
+            interface: "blaktail0".into(),
+            assigned_ip: "100.64.0.1/32".into(),
+            assigned_ips: vec!["100.64.0.1/32".into()],
+            dns_name: "self.12345678.blaktail".into(),
+            credential_expires_at: 1,
+            advertised_routes: vec![],
+            exit_node: None,
+            exit_node_active: false,
+            router_previous_ipv4_forward: None,
+            peers: vec![],
+            relays: vec![],
+            relay_token: String::new(),
+            relay_expires_at: 0,
+            relay_endpoint: None,
+            relay_endpoint_reported_at: 0,
+            dns_mode: None,
+            org_dns: Some(OrgDnsSnapshot {
+                revision: 4,
+                managed: true,
+                search_domains: vec!["internal.example".into()],
+                ..OrgDnsSnapshot::default()
+            }),
+        };
+        apply_org_dns_snapshot(&mut state, None);
+        assert_eq!(state.org_dns.as_ref().map(|dns| dns.revision), Some(4));
+        apply_org_dns_snapshot(
+            &mut state,
+            Some(OrgDnsSnapshot {
+                revision: 5,
+                managed: true,
+                ..OrgDnsSnapshot::default()
+            }),
+        );
+        assert_eq!(state.org_dns.as_ref().map(|dns| dns.revision), Some(5));
+        assert!(state.org_dns.as_ref().unwrap().search_domains.is_empty());
     }
 }
