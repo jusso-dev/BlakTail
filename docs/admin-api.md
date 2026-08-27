@@ -20,6 +20,9 @@ rejected.
 ## Writes
 
 - Policy PUT requires the current `etag`.
+- `GET`/`PUT /api/v1/dns` publishes organisation DNS settings. Writes need
+  `dns:write` and the current `etag`. `{"rollback": true}` restores the previous
+  revision.
 - `POST /api/v1/keys` honours `Idempotency-Key` (8–128 characters). Reusing a
   key with a different body returns `409`.
 - Request bodies are rejected above 64 KiB (`413`).

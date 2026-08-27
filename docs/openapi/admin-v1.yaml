@@ -127,6 +127,22 @@ paths:
         "412": { description: etag mismatch }
         "413": { description: Request body larger than 64 KiB }
         "429": { description: Client exceeded 120 requests per minute }
+  /api/v1/dns:
+    get:
+      summary: Read organisation DNS settings plus etag
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      responses:
+        "200": { description: DNS snapshot }
+    put:
+      summary: Publish or roll back organisation DNS settings
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      responses:
+        "200": { description: Published snapshot }
+        "412": { description: etag mismatch }
+        "413": { description: Body exceeded 64 KiB }
+        "429": { description: Rate limit exceeded }
   /api/v1/audit:
     get:
       summary: List audit events

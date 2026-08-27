@@ -5,7 +5,8 @@ import { InvitationManager } from "@/components/invitation-manager";
 import { MembershipManager } from "@/components/membership-manager";
 import { OidcProviderManager } from "@/components/oidc-provider-manager";
 import { PageHeader } from "@/components/page-header";
-import { listApiClients } from "@/lib/coord";
+import { DnsSettings } from "@/components/dns-settings";
+import { getDns, listApiClients } from "@/lib/coord";
 import { listPendingInvitations } from "@/lib/invitations";
 import { listIdentitySettings } from "@/lib/identity-links";
 import { listIdentityProviders, listMemberships } from "@/lib/oidc";
@@ -15,7 +16,7 @@ import { TAGLINE } from "@/lib/tagline";
 
 export default async function SettingsPage() {
   const ctx = await requireConsoleContext();
-  const [invitations, identitySettings, apiClients, providers, memberships] =
+  const [invitations, identitySettings, apiClients, providers, memberships, dns] =
     await Promise.all([
       listPendingInvitations(ctx),
       listIdentitySettings(ctx),
@@ -28,6 +29,7 @@ export default async function SettingsPage() {
       ctx.role === "owner"
         ? listMemberships(ctx.organisationId)
         : Promise.resolve([]),
+      getDns(ctx),
     ]);
 
   return (
@@ -79,6 +81,7 @@ export default async function SettingsPage() {
         {ctx.role === "owner" ? (
           <MembershipManager memberships={memberships} />
         ) : null}
+        <DnsSettings initial={dns} readOnly={ctx.role === "member"} />
         {ctx.role === "owner" ? (
           <ApiClientManager clients={apiClients} />
         ) : null}

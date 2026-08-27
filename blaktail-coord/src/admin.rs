@@ -1,7 +1,8 @@
 use crate::{
     append_audit, bearer_value, conflict, console_session, hash, load_audit_events, load_nodes,
-    now, secret, tombstone_node, ApiError, AppState, AuditQuery, NodeListQuery, Role, Session,
-    Store, ADMIN_API_MAX_BODY_BYTES, ADMIN_API_RATE_LIMIT, ADMIN_API_RATE_WINDOW_SECS,
+    load_org_dns, load_org_dns_tx, load_previous_dns_tx, now, publish_org_dns, secret,
+    tombstone_node, ApiError, AppState, AuditQuery, NodeListQuery, Role, Session, Store,
+    ADMIN_API_MAX_BODY_BYTES, ADMIN_API_RATE_LIMIT, ADMIN_API_RATE_WINDOW_SECS,
 };
 use axum::{
     extract::{DefaultBodyLimit, Path as UrlPath, Query, State},
@@ -30,6 +31,8 @@ pub(crate) enum Scope {
     RoutesWrite,
     #[serde(rename = "policy:write")]
     PolicyWrite,
+    #[serde(rename = "dns:write")]
+    DnsWrite,
     #[serde(rename = "audit:read")]
     AuditRead,
     #[serde(rename = "status:read")]
@@ -44,6 +47,7 @@ impl Scope {
             Self::KeysWrite => "keys:write",
             Self::RoutesWrite => "routes:write",
             Self::PolicyWrite => "policy:write",
+            Self::DnsWrite => "dns:write",
             Self::AuditRead => "audit:read",
             Self::StatusRead => "status:read",
         }
@@ -115,6 +119,7 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .route("/api/v1/keys", post(api_mint_key))
         .route("/api/v1/devices/:node_id/routes", put(api_approve_routes))
         .route("/api/v1/policy", get(api_get_policy).put(api_put_policy))
+        .route("/api/v1/dns", get(api_get_dns).put(api_put_dns))
         .route("/api/v1/audit", get(api_list_audit))
         .layer(DefaultBodyLimit::max(ADMIN_API_MAX_BODY_BYTES))
 }
@@ -137,7 +142,11 @@ fn require_scope(caller: &ApiCaller, scope: Scope) -> Result<(), ApiError> {
 fn scope_is_write(scope: Scope) -> bool {
     matches!(
         scope,
-        Scope::DevicesWrite | Scope::KeysWrite | Scope::RoutesWrite | Scope::PolicyWrite
+        Scope::DevicesWrite
+            | Scope::KeysWrite
+            | Scope::RoutesWrite
+            | Scope::PolicyWrite
+            | Scope::DnsWrite
     )
 }
 
@@ -817,6 +826,70 @@ async fn api_put_policy(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_get_dns(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<crate::org_dns::OrgDnsResponse>>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesRead)?;
+    Ok(Json(Envelope {
+        data: load_org_dns(&s.store, org_id).await?,
+        next_cursor: None,
+    }))
+}
+
+async fn api_put_dns(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Result<Json<Envelope<crate::org_dns::OrgDnsResponse>>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DnsWrite)?;
+    let mut tx = s.store.pool.begin().await?;
+    let current = load_org_dns_tx(&mut tx, org_id).await?;
+    if let Some(expected) = value.get("etag").and_then(|value| value.as_str()) {
+        if expected != current.etag {
+            return Err(ApiError::PreconditionFailed);
+        }
+    }
+    let rollback = value
+        .get("rollback")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let next = if rollback {
+        load_previous_dns_tx(&mut tx, org_id).await?
+    } else {
+        let settings = value.get("dns").cloned().ok_or_else(|| {
+            ApiError::BadRequest("dns is required unless rollback is true".into())
+        })?;
+        crate::org_dns::parse_settings(&settings.to_string())?
+    };
+    publish_org_dns(&mut tx, org_id, &current, &next).await?;
+    append_audit(
+        &mut tx,
+        org_id,
+        &caller.session,
+        if rollback {
+            "dns.rolled_back"
+        } else {
+            "dns.updated"
+        },
+        "dns",
+        Some(&org_id.to_string()),
+        &serde_json::json!({
+            "via": "admin_api",
+            "revision": current.revision + 1,
+            "managed": next.managed,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(Envelope {
+        data: load_org_dns(&s.store, org_id).await?,
+        next_cursor: None,
+    }))
 }
 
 async fn api_list_audit(

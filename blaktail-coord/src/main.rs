@@ -57,6 +57,11 @@ enum Command {
         /// Path to a JSON policy document.
         policy: PathBuf,
     },
+    /// Validate organisation DNS settings offline without a database.
+    CheckDns {
+        /// Path to a JSON DNS settings document.
+        settings: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -69,6 +74,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "policy ok version={} groups={} rules={} tests={} tag_owners={}",
                     report.version, report.groups, report.rules, report.tests, report.tag_owners
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("blaktail-coord: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(Command::CheckDns { settings }) = &cli.command {
+        let document = std::fs::read_to_string(settings)?;
+        match blaktail_coord::check_dns_document(&document) {
+            Ok(report) => {
+                println!(
+                    "dns ok managed={} resolvers={} split={} search={} records={}",
+                    report.managed,
+                    report.global_resolvers,
+                    report.split,
+                    report.search_domains,
+                    report.records
                 );
                 return Ok(());
             }

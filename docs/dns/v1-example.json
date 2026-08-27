@@ -1,0 +1,23 @@
+{
+  "managed": true,
+  "global_resolvers": ["1.1.1.1", "2606:4700:4700::1111"],
+  "split": [
+    {
+      "suffix": "internal.example",
+      "resolvers": ["10.0.0.53"]
+    }
+  ],
+  "search_domains": ["internal.example"],
+  "records": [
+    {
+      "name": "wiki.internal.example",
+      "type": "A",
+      "value": "10.0.0.10"
+    },
+    {
+      "name": "wiki.internal.example",
+      "type": "AAAA",
+      "value": "fd00::10"
+    }
+  ]
+}

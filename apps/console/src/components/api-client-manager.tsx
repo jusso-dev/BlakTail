@@ -14,6 +14,7 @@ const SCOPES = [
   "keys:write",
   "routes:write",
   "policy:write",
+  "dns:write",
   "audit:read",
   "status:read",
 ] as const;
