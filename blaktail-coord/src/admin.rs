@@ -1,8 +1,8 @@
 use crate::{
-    append_audit, bearer_value, conflict, console_session, hash, load_audit_events, load_nodes,
-    load_org_dns, load_org_dns_tx, load_previous_dns_tx, now, publish_org_dns, secret,
-    tombstone_node, ApiError, AppState, AuditQuery, NodeListQuery, Role, Session, Store,
-    ADMIN_API_MAX_BODY_BYTES, ADMIN_API_RATE_LIMIT, ADMIN_API_RATE_WINDOW_SECS,
+    append_audit, bearer_value, bump_control_revision, conflict, console_session, hash,
+    load_audit_events, load_nodes, load_org_dns, load_org_dns_tx, load_previous_dns_tx, now,
+    publish_org_dns, secret, tombstone_node, ApiError, AppState, AuditQuery, NodeListQuery, Role,
+    Session, Store, ADMIN_API_MAX_BODY_BYTES, ADMIN_API_RATE_LIMIT, ADMIN_API_RATE_WINDOW_SECS,
 };
 use axum::{
     extract::{DefaultBodyLimit, Path as UrlPath, Query, State},
@@ -822,6 +822,7 @@ async fn api_put_policy(
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    bump_control_revision(&mut tx, org_id.to_string()).await?;
     append_audit(
         &mut tx,
         org_id,

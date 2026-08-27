@@ -52,14 +52,15 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+const MAX_CONTROL_UPDATE_WAIT_SECS: u64 = 25;
 const DEFAULT_AUDIT_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const NODE_ONLINE_SECS: i64 = 90;
 const EPHEMERAL_OFFLINE_SECS: i64 = 24 * 60 * 60;
@@ -148,6 +149,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 7,
         name: "wireguard-only peers",
         postgres_sql: include_str!("../migrations/postgres/0007_wireguard_only_peers.sql"),
+    },
+    Migration {
+        version: 8,
+        name: "organisation control revision",
+        postgres_sql: include_str!("../migrations/postgres/0008_control_revision.sql"),
     },
 ];
 
@@ -341,6 +347,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             5 => migrate_sqlite_to_v5(&mut tx).await?,
             6 => migrate_sqlite_to_v6(&mut tx).await?,
             7 => migrate_sqlite_to_v7(&mut tx).await?,
+            8 => migrate_sqlite_to_v8(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -353,6 +360,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             5 => "PRAGMA user_version=5",
             6 => "PRAGMA user_version=6",
             7 => "PRAGMA user_version=7",
+            8 => "PRAGMA user_version=8",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -669,6 +677,12 @@ async fn migrate_sqlite_to_v7(
     Ok(())
 }
 
+async fn migrate_sqlite_to_v8(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    ensure_column(tx, "orgs", "control_revision", "INTEGER NOT NULL DEFAULT 1").await
+}
+
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
     let rows =
         sqlx::query("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")
@@ -913,6 +927,7 @@ pub fn app_with_relays_console_and_metrics(
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/:node_id/reauth", post(reauth_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
+        .route("/v1/nodes/:node_id/updates", get(list_updates))
         .route("/v1/nodes/:node_id/routes", put(update_advertised_routes))
         .route(
             "/v1/nodes/:node_id/relay-endpoint",
@@ -1012,6 +1027,7 @@ async fn record_metrics(State(state): State<AppState>, request: Request, next: N
         match (request.method(), path.as_str()) {
             (&Method::POST, "/v1/nodes/register") => Some(metrics::Operation::Register),
             (&Method::GET, "/v1/nodes/:node_id/peers") => Some(metrics::Operation::Peers),
+            (&Method::GET, "/v1/nodes/:node_id/updates") => Some(metrics::Operation::Updates),
             (&Method::DELETE, "/v1/nodes/:node_id")
             | (&Method::DELETE, "/v1/orgs/:org_id/nodes/:node_id") => {
                 Some(metrics::Operation::Revoke)
@@ -2025,6 +2041,7 @@ async fn register_node(
         .bind(input_key_hash)
         .execute(&mut *tx)
         .await?;
+    bump_control_revision(&mut tx, &grant.org_id).await?;
     tx.commit().await?;
     info!(node_id=%id, org_id=%grant.org_id, "node registered");
     let (relay_token, relay_expires_at) = relay_credentials(&s, id);
@@ -2328,10 +2345,39 @@ struct PeersResponse {
     relay_expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dns: Option<org_dns::OrgDnsAgentView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control_updates: Option<ControlUpdatesCapability>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ControlUpdatesCapability {
+    wait_max_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct ControlUpdate {
+    kind: &'static str,
+    revision: i64,
+    #[serde(flatten)]
+    snapshot: PeersResponse,
 }
 
 #[derive(Default, Deserialize)]
 struct PeerSelection {
+    #[serde(default)]
+    exit_node: Option<String>,
+    #[serde(default)]
+    ipv6: bool,
+}
+
+#[derive(Default, Deserialize)]
+struct UpdateSelection {
+    #[serde(default)]
+    since: i64,
+    #[serde(default)]
+    wait: u64,
+    #[serde(default)]
+    version: Option<u32>,
     #[serde(default)]
     exit_node: Option<String>,
     #[serde(default)]
@@ -2491,7 +2537,64 @@ async fn list_peers(
         relay_token,
         relay_expires_at,
         dns,
+        control_updates: Some(ControlUpdatesCapability {
+            wait_max_seconds: MAX_CONTROL_UPDATE_WAIT_SECS,
+        }),
     }))
+}
+
+async fn list_updates(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    Query(selection): Query<UpdateSelection>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    if selection.version.is_some_and(|version| version != 1) {
+        return Err(ApiError::BadRequest(
+            "unsupported control update version".into(),
+        ));
+    }
+    let token = bearer(&headers)?;
+    let org: String = sqlx::query_scalar(
+        "SELECT org_id FROM nodes WHERE id=$1 AND token_hash=$2 AND revoked_at IS NULL AND deleted_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(token)
+    .fetch_optional(&s.store.pool)
+    .await?
+    .ok_or(ApiError::Unauthorized)?;
+    let wait = selection.wait.min(MAX_CONTROL_UPDATE_WAIT_SECS);
+    let started = Instant::now();
+    loop {
+        let revision: i64 = sqlx::query_scalar("SELECT control_revision FROM orgs WHERE id=$1")
+            .bind(&org)
+            .fetch_optional(&s.store.pool)
+            .await?
+            .ok_or(ApiError::CorruptData)?;
+        let changed = selection.since == 0 || revision > selection.since;
+        if changed || started.elapsed() >= Duration::from_secs(wait) {
+            if !changed {
+                return Ok(StatusCode::NO_CONTENT.into_response());
+            }
+            let Json(snapshot) = list_peers(
+                State(s.clone()),
+                UrlPath(node_id),
+                Query(PeerSelection {
+                    exit_node: selection.exit_node,
+                    ipv6: selection.ipv6,
+                }),
+                headers,
+            )
+            .await?;
+            return Ok(Json(ControlUpdate {
+                kind: "snapshot",
+                revision,
+                snapshot,
+            })
+            .into_response());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 #[derive(Deserialize)]
@@ -2730,6 +2833,12 @@ async fn revoke_node(
     if changed == 0 {
         return Err(ApiError::Unauthorized);
     }
+    sqlx::query(
+        "UPDATE orgs SET control_revision=control_revision+1 WHERE id=(SELECT org_id FROM nodes WHERE id=$1)",
+    )
+    .bind(node_id.to_string())
+    .execute(&s.store.pool)
+    .await?;
     info!(%node_id,"node revoked");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3015,6 +3124,7 @@ async fn admin_revoke_node(
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    bump_control_revision(&mut tx, org_id.to_string()).await?;
     append_audit(
         &mut tx,
         org_id,
@@ -3077,6 +3187,7 @@ pub(crate) async fn tombstone_node(
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    bump_control_revision(&mut tx, org_id.to_string()).await?;
     append_audit(
         &mut tx,
         org_id,
@@ -3178,6 +3289,7 @@ async fn put_acl(
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    bump_control_revision(&mut tx, org_id.to_string()).await?;
     append_audit(
         &mut tx,
         org_id,
@@ -3338,6 +3450,7 @@ pub(crate) async fn publish_org_dns(
     if changed == 0 {
         return Err(ApiError::NotFound);
     }
+    bump_control_revision(tx, org_id.to_string()).await?;
     Ok(())
 }
 
@@ -3539,6 +3652,21 @@ pub(crate) async fn append_audit(
     .execute(connection)
     .await?;
     Ok(())
+}
+
+pub(crate) async fn bump_control_revision(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: impl AsRef<str>,
+) -> Result<i64, ApiError> {
+    sqlx::query("UPDATE orgs SET control_revision=control_revision+1 WHERE id=$1")
+        .bind(org_id.as_ref())
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query_scalar("SELECT control_revision FROM orgs WHERE id=$1")
+        .bind(org_id.as_ref())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ApiError::NotFound)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -7018,7 +7146,7 @@ mod tests {
             Uuid::new_v4()
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
-        sqlx::raw_sql("PRAGMA user_version=8")
+        sqlx::raw_sql("PRAGMA user_version=9")
             .execute(&pool)
             .await
             .unwrap();
@@ -8312,5 +8440,103 @@ mod tests {
             .to_ascii_uppercase()
             .find("PRIVATE")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn control_updates_return_snapshot_or_wait_without_crossing_gateway_cap() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "control-stream-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let node =
+            register_test_node(&router, org.id, &owner, "office-one", "office-key", &[]).await;
+        let snapshot: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/updates?since=0&wait=0", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(snapshot["kind"], "snapshot");
+        assert_eq!(snapshot["control_updates"]["wait_max_seconds"], 25);
+        let revision = snapshot["revision"].as_i64().unwrap();
+        assert!(revision >= 1);
+
+        let peers: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(peers.control_updates.as_ref().unwrap().wait_max_seconds, 25);
+
+        let started = Instant::now();
+        let unchanged = call(
+            &router,
+            Method::GET,
+            &format!("/v1/nodes/{}/updates?since={revision}&wait=1", node.id),
+            serde_json::Value::Null,
+            Some(&node.node_token),
+        )
+        .await;
+        assert_eq!(unchanged.status(), StatusCode::NO_CONTENT);
+        assert!(started.elapsed() >= Duration::from_millis(900));
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let waiter = {
+            let router = router.clone();
+            let token = node.node_token.clone();
+            let path = format!("/v1/nodes/{}/updates?since={revision}&wait=5", node.id);
+            tokio::spawn(async move {
+                call(
+                    &router,
+                    Method::GET,
+                    &path,
+                    serde_json::Value::Null,
+                    Some(&token),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/acl", org.id),
+                serde_json::json!({"rules":[]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let woken = waiter.await.unwrap();
+        assert_eq!(woken.status(), StatusCode::OK);
+        let updated: serde_json::Value = body(woken).await;
+        assert_eq!(updated["kind"], "snapshot");
+        assert!(updated["revision"].as_i64().unwrap() > revision);
+
+        assert_eq!(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/updates?since=0&wait=1&version=2", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 }

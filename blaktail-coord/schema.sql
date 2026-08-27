@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS orgs (
  dns_json TEXT NOT NULL DEFAULT '{"managed":true,"global_resolvers":[],"split":[],"search_domains":[],"records":[]}'
    CHECK (json_valid(dns_json)),
  dns_revision INTEGER NOT NULL DEFAULT 0,
- dns_previous_json TEXT
+ dns_previous_json TEXT,
+ control_revision INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS join_keys (
  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,

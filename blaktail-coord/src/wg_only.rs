@@ -1,6 +1,6 @@
 use crate::{
-    append_audit, canonical_ipv4_route, conflict, console_session, ipv4_route_is_within,
-    ipv4_routes_overlap, now, ApiError, AppState, DeviceTag, Role, Session,
+    append_audit, bump_control_revision, canonical_ipv4_route, conflict, console_session,
+    ipv4_route_is_within, ipv4_routes_overlap, now, ApiError, AppState, DeviceTag, Role, Session,
 };
 use axum::{
     extract::{Path as UrlPath, State},
@@ -198,6 +198,7 @@ async fn insert_peer(
     .execute(&mut *tx)
     .await
     .map_err(conflict("wireguard-only peer name or public key already exists"))?;
+    bump_control_revision(&mut tx, org_id.to_string()).await?;
     append_audit(
         &mut tx,
         org_id,
@@ -288,6 +289,7 @@ async fn revoke_peer(
             ApiError::Conflict("wireguard-only peer is already revoked".into())
         });
     }
+    bump_control_revision(&mut tx, org_id.to_string()).await?;
     append_audit(
         &mut tx,
         org_id,

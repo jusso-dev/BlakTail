@@ -21,6 +21,7 @@ const LATENCY_BUCKETS: &[(u64, &str)] = &[
 pub(crate) enum Operation {
     Register,
     Peers,
+    Updates,
     Revoke,
 }
 
@@ -29,6 +30,7 @@ impl Operation {
         match self {
             Self::Register => "register",
             Self::Peers => "peers",
+            Self::Updates => "updates",
             Self::Revoke => "revoke",
         }
     }
@@ -106,6 +108,7 @@ impl OperationMetrics {
 pub struct CoordMetrics {
     register: OperationMetrics,
     peers: OperationMetrics,
+    updates: OperationMetrics,
     revoke: OperationMetrics,
 }
 
@@ -114,6 +117,7 @@ impl CoordMetrics {
         match operation {
             Operation::Register => &self.register,
             Operation::Peers => &self.peers,
+            Operation::Updates => &self.updates,
             Operation::Revoke => &self.revoke,
         }
         .record(status, elapsed);
@@ -128,6 +132,7 @@ impl CoordMetrics {
         );
         self.register.render(&mut output, Operation::Register);
         self.peers.render(&mut output, Operation::Peers);
+        self.updates.render(&mut output, Operation::Updates);
         self.revoke.render(&mut output, Operation::Revoke);
         output.push_str(
             "# HELP blaktail_coord_active_nodes Currently authorised, unexpired nodes.\n\
