@@ -51,11 +51,15 @@ jobs:
         run: >-
           sh -n scripts/package-agent.sh scripts/install-agent.sh
           scripts/agent-checksums.sh scripts/two-vm-test.sh scripts/config-contract-test.sh
-          scripts/conformance/prove-observability.sh scripts/publish-package-repos.sh
+          scripts/conformance/prove-observability.sh scripts/conformance/run-lab.sh
+          scripts/conformance/lab-static-test.sh scripts/publish-package-repos.sh
           scripts/admin-api-smoke.sh scripts/admin-openapi-drift.sh
 
       - name: Admin OpenAPI drift
         run: scripts/admin-openapi-drift.sh
+
+      - name: Conformance lab self-test
+        run: scripts/conformance/lab-static-test.sh
 
       - name: Build and inspect Linux packages
         run: |
