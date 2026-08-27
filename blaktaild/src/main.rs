@@ -1,6 +1,6 @@
 use blaktail_config::{AgentConfig, ConfigHandle, LoadedConfig, ReloadPlan, Service};
 use blaktaild::{
-    configure_system_dns, dns_domain, ensure_private_key, peer_key_hex,
+    apply_peer_map, configure_system_dns, dns_domain, ensure_private_key, peer_key_hex,
     published_resolver_suffixes, read_state, remove_system_dns, restore_peers, sync_once,
     validate_advertised_routes, validate_interface, write_state, Coordinator, MagicDns, Network,
     Registration, RelayMesh, DIRECT_GRACE_SECS, DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
@@ -383,9 +383,36 @@ async fn sync_loop(
             info!("initial peer sync complete; handing over to the service manager");
             return Ok(());
         }
+        let previous_assigned_ips = state.assigned_ips.clone();
+        let previous_addresses = state.interface_addresses();
         tokio::select! {
             _ = tokio::signal::ctrl_c() => { info!("stopping peer sync; interface remains configured"); break; }
-            _ = tokio::time::sleep(Duration::from_secs(poll_seconds.max(1))) => {}
+            result = coordinator.wait_for_control_update(state, 25) => {
+                match result {
+                    Ok(Some(desired)) => {
+                        match apply_peer_map(
+                            network,
+                            state,
+                            state_dir,
+                            desired,
+                            previous_assigned_ips,
+                            previous_addresses,
+                        ) {
+                            Ok(changes) if changes > 0 => info!(changes, "WireGuard peers synchronized"),
+                            Ok(_) => {}
+                            Err(error) => warn!(%error, "peer synchronization failed; retaining existing tunnel configuration"),
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(%error, "control update wait failed; falling back to snapshot poll");
+                        tokio::time::sleep(Duration::from_secs(poll_seconds.max(1))).await;
+                        if let Err(error) = sync_once(coordinator, network, state, state_dir).await {
+                            warn!(%error, "peer synchronization failed; retaining existing tunnel configuration");
+                        }
+                    }
+                }
+            }
         }
     }
     if let Some(active) = mesh.take() {

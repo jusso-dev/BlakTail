@@ -8,6 +8,7 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -115,6 +116,8 @@ pub struct NodeState {
     pub dns_mode: Option<String>,
     #[serde(default)]
     pub org_dns: Option<OrgDnsSnapshot>,
+    #[serde(default)]
+    pub control_revision: i64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -243,6 +246,8 @@ struct PeersResponse {
     relay_expires_at: u64,
     #[serde(default)]
     dns: Option<OrgDnsSnapshot>,
+    #[serde(default)]
+    revision: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -410,6 +415,7 @@ impl Coordinator {
             relay_endpoint_reported_at: 0,
             dns_mode: None,
             org_dns: None,
+            control_revision: 0,
         })
     }
     pub async fn peers(&self, state: &mut NodeState) -> Result<Vec<Peer>, Error> {
@@ -422,6 +428,39 @@ impl Coordinator {
             request = request.query(&[("exit_node", exit_node)]);
         }
         let response = request.send().await?;
+        Self::read_peers_response(state, response).await
+    }
+
+    pub async fn wait_for_control_update(
+        &self,
+        state: &mut NodeState,
+        wait: u64,
+    ) -> Result<Option<Vec<Peer>>, Error> {
+        let wait = wait.min(25);
+        let mut request = self
+            .client
+            .get(format!("{}/v1/nodes/{}/updates", self.base, state.node_id))
+            .bearer_auth(&state.node_token)
+            .timeout(Duration::from_secs(wait + 10));
+        request = request.query(&[
+            ("since", state.control_revision.to_string()),
+            ("wait", wait.to_string()),
+            ("ipv6", "true".into()),
+        ]);
+        if let Some(exit_node) = state.exit_node.as_deref() {
+            request = request.query(&[("exit_node", exit_node)]);
+        }
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            return Ok(None);
+        }
+        Ok(Some(Self::read_peers_response(state, response).await?))
+    }
+
+    async fn read_peers_response(
+        state: &mut NodeState,
+        response: reqwest::Response,
+    ) -> Result<Vec<Peer>, Error> {
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             let message = response
                 .json::<ApiErrorResponse>()
@@ -431,6 +470,9 @@ impl Coordinator {
             return Err(Error::Message(message));
         }
         let body: PeersResponse = response.error_for_status()?.json().await?;
+        if let Some(revision) = body.revision {
+            state.control_revision = revision;
+        }
         if !body.assigned_ips.is_empty() {
             state.assigned_ips = body.assigned_ips;
         }
@@ -1499,7 +1541,35 @@ pub async fn sync_once(
 ) -> Result<usize, Error> {
     let previous_assigned_ips = state.assigned_ips.clone();
     let previous_addresses = state.interface_addresses();
-    let desired = coord.peers(state).await?;
+    let desired = match coord.wait_for_control_update(state, 0).await {
+        Ok(Some(peers)) => peers,
+        Ok(None) => return Ok(0),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "control update snapshot failed; using peers recovery"
+            );
+            coord.peers(state).await?
+        }
+    };
+    apply_peer_map(
+        network,
+        state,
+        dir,
+        desired,
+        previous_assigned_ips,
+        previous_addresses,
+    )
+}
+
+pub fn apply_peer_map(
+    network: &mut dyn Network,
+    state: &mut NodeState,
+    dir: &Path,
+    desired: Vec<Peer>,
+    previous_assigned_ips: Vec<String>,
+    previous_addresses: Vec<String>,
+) -> Result<usize, Error> {
     let desired_addresses = state.interface_addresses();
     if desired_addresses != previous_addresses {
         if let Err(error) = network.set_addresses(&state.interface, &desired_addresses) {
@@ -1809,6 +1879,7 @@ mod tests {
             relay_endpoint_reported_at: 0,
             dns_mode: None,
             org_dns: None,
+            control_revision: 0,
         };
         let mut network = RecordingNetwork::default();
         assert_eq!(restore_peers(&mut network, &state).unwrap(), 1);
@@ -1864,6 +1935,7 @@ mod tests {
                 search_domains: vec!["internal.example".into()],
                 ..OrgDnsSnapshot::default()
             }),
+            control_revision: 3,
         };
         apply_org_dns_snapshot(&mut state, None);
         assert_eq!(state.org_dns.as_ref().map(|dns| dns.revision), Some(4));
@@ -1877,5 +1949,26 @@ mod tests {
         );
         assert_eq!(state.org_dns.as_ref().map(|dns| dns.revision), Some(5));
         assert!(state.org_dns.as_ref().unwrap().search_domains.is_empty());
+    }
+
+    #[test]
+    fn control_update_snapshot_deserializes_revision() {
+        let body: PeersResponse = serde_json::from_value(serde_json::json!({
+            "kind": "snapshot",
+            "revision": 8,
+            "peers": [],
+            "assigned_ips": ["100.64.0.1/32"],
+            "dns_name": "self.12345678.blaktail"
+        }))
+        .unwrap();
+        assert_eq!(body.revision, Some(8));
+        assert!(body.peers.is_empty());
+        let peers: PeersResponse = serde_json::from_value(serde_json::json!({
+            "peers": [],
+            "assigned_ips": [],
+            "dns_name": "self.12345678.blaktail"
+        }))
+        .unwrap();
+        assert_eq!(peers.revision, None);
     }
 }

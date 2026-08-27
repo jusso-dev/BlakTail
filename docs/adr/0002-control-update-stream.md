@@ -74,6 +74,8 @@ raised-timeout) path exist.
 
 ## Follow-up
 
-Implementation, p95 apply targets, reconnect resume, storm/backpressure
-tests, and 1k/10k baselines live in later #43 slices. Those slices must keep
-the 25-second wait cap unless the AWS lab path is changed and re-proven.
+Agents now wait on `GET /v1/nodes/:id/updates` with the last applied
+revision and reconnect after a 204 heartbeat. `--poll-seconds` remains the
+recovery path. Deltas, storm/backpressure tests, and 1k/10k baselines live
+in later #43 slices. Those slices must keep the 25-second wait cap unless
+the AWS lab path is changed and re-proven.
