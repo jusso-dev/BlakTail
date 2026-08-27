@@ -56,5 +56,6 @@ IdPs without permission.
 ## Residual risk
 
 An independent assessment has not been completed. See
-[#52](https://github.com/jusso-dev/BlakTail/issues/52) and
-[docs/threat-model.md](docs/threat-model.md).
+[#52](https://github.com/jusso-dev/BlakTail/issues/52),
+[docs/threat-model.md](docs/threat-model.md), and the current
+[control/evidence matrix](docs/audit-readiness.md).
