@@ -116,13 +116,32 @@ echo "== enrol ${office_name} at ${office_lan}:${LISTEN_PORT}"
   shred -u /tmp/office.key || rm -f /tmp/office.key
 '
 "${COMPOSE[@]}" exec -d agent-office blaktaild --coord-ca /certs/ca.crt run --poll-seconds 5
-for _ in $(seq 1 15); do
+office_up=
+for _ in $(seq 1 45); do
   if "${COMPOSE[@]}" exec -T agent-office wg show blaktail0 >/dev/null 2>&1; then
+    office_up=1
     break
   fi
   sleep 1
 done
-"${COMPOSE[@]}" exec -T agent-office wg set blaktail0 listen-port "$LISTEN_PORT"
+if [[ -z "$office_up" ]]; then
+  echo "FAIL office WireGuard interface missing" >&2
+  "${COMPOSE[@]}" exec -T agent-office sh -c 'ps aux; ip link' >&2 || true
+  exit 1
+fi
+pinned=
+for _ in $(seq 1 10); do
+  if "${COMPOSE[@]}" exec -T agent-office wg set blaktail0 listen-port "$LISTEN_PORT"; then
+    pinned=1
+    break
+  fi
+  sleep 1
+done
+if [[ -z "$pinned" ]]; then
+  echo "FAIL could not pin office listen-port" >&2
+  "${COMPOSE[@]}" exec -T agent-office wg show >&2 || true
+  exit 1
+fi
 
 echo "== install vanilla wg tools"
 "${COMPOSE[@]}" exec -T vanilla-wg sh -ceu '
