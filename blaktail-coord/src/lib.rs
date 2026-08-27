@@ -1,6 +1,7 @@
 mod admin;
 mod metrics;
 mod org_dns;
+mod wg_only;
 
 pub use metrics::CoordMetrics;
 pub use org_dns::{check_dns_document, DnsCheckReport};
@@ -58,7 +59,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 const DEFAULT_AUDIT_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const NODE_ONLINE_SECS: i64 = 90;
 const EPHEMERAL_OFFLINE_SECS: i64 = 24 * 60 * 60;
@@ -142,6 +143,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "organisation DNS settings",
         postgres_sql: include_str!("../migrations/postgres/0006_org_dns.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "wireguard-only peers",
+        postgres_sql: include_str!("../migrations/postgres/0007_wireguard_only_peers.sql"),
     },
 ];
 
@@ -334,6 +340,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             4 => migrate_sqlite_to_v4(&mut tx).await?,
             5 => migrate_sqlite_to_v5(&mut tx).await?,
             6 => migrate_sqlite_to_v6(&mut tx).await?,
+            7 => migrate_sqlite_to_v7(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -345,6 +352,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             4 => "PRAGMA user_version=4",
             5 => "PRAGMA user_version=5",
             6 => "PRAGMA user_version=6",
+            7 => "PRAGMA user_version=7",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -631,6 +639,36 @@ async fn migrate_sqlite_to_v6(
     Ok(())
 }
 
+async fn migrate_sqlite_to_v7(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS wireguard_only_peers (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'wireguard_only' CHECK (kind = 'wireguard_only'),
+            wg_public_key TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            allowed_ips_json TEXT NOT NULL CHECK (json_valid(allowed_ips_json)),
+            tags_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(tags_json)),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER,
+            revoked_at INTEGER,
+            revision INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS wireguard_only_peers_org_name_idx
+            ON wireguard_only_peers(org_id, name) WHERE revoked_at IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS wireguard_only_peers_org_key_idx
+            ON wireguard_only_peers(org_id, wg_public_key) WHERE revoked_at IS NULL;
+        CREATE INDEX IF NOT EXISTS wireguard_only_peers_org_idx
+            ON wireguard_only_peers(org_id, revoked_at);",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
     let rows =
         sqlx::query("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")
@@ -852,6 +890,14 @@ pub fn app_with_relays_console_and_metrics(
         .route("/v1/orgs/:org_id/acl", get(get_acl))
         .route("/v1/orgs/:org_id/acl", put(put_acl))
         .route("/v1/orgs/:org_id/dns", get(get_dns).put(put_dns))
+        .route(
+            "/v1/orgs/:org_id/wireguard-only-peers",
+            get(wg_only::list_console).post(wg_only::create_console),
+        )
+        .route(
+            "/v1/orgs/:org_id/wireguard-only-peers/:peer_id",
+            get(wg_only::get_console).delete(wg_only::revoke_console),
+        )
         .route("/v1/orgs/:org_id/security", get(get_security_policy))
         .route("/v1/orgs/:org_id/security", put(put_security_policy))
         .route("/v1/orgs/:org_id/audit", get(list_audit_events))
@@ -1816,7 +1862,7 @@ impl std::str::FromStr for Role {
 }
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "lowercase")]
-enum DeviceTag {
+pub(crate) enum DeviceTag {
     Office,
     Ranger,
     Store,
@@ -1830,7 +1876,7 @@ impl DeviceTag {
         }
     }
 }
-fn canonical_tags(mut tags: Vec<DeviceTag>) -> Vec<DeviceTag> {
+pub(crate) fn canonical_tags(mut tags: Vec<DeviceTag>) -> Vec<DeviceTag> {
     tags.sort();
     tags.dedup();
     tags
@@ -2262,6 +2308,8 @@ struct Peer {
     dns_name: String,
     tags: Vec<DeviceTag>,
     relay_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    kind: String,
 }
 #[derive(Serialize, Deserialize)]
 struct PeersResponse {
@@ -2359,6 +2407,7 @@ async fn list_peers(
                     dns_name: row.try_get(5)?,
                     tags: tags.clone(),
                     relay_endpoint: row.try_get(9)?,
+                    kind: String::new(),
                 },
                 Subject::new(
                     row.try_get::<String, _>(7)?
@@ -2372,7 +2421,7 @@ async fn list_peers(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut exit_node_active = false;
-    let peers = candidates
+    let mut peers = candidates
         .into_iter()
         .filter_map(|(mut peer, destination, approved)| {
             if !acl.allows(&source, &destination) {
@@ -2398,7 +2447,32 @@ async fn list_peers(
             }
             Some(peer)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    for (id, name, wg_public_key, endpoint, mut allowed_ips, tags) in
+        wg_only::active_export_rows(&s.store.pool, &org).await?
+    {
+        let destination = Subject::new(Role::Member, tags.clone());
+        if !acl.allows(&source, &destination) {
+            continue;
+        }
+        if !selection.ipv6 {
+            allowed_ips.retain(|route| !route.contains(':'));
+        }
+        if allowed_ips.is_empty() {
+            continue;
+        }
+        peers.push(Peer {
+            id,
+            name,
+            wg_public_key,
+            endpoint: Some(endpoint),
+            allowed_ips,
+            dns_name: String::new(),
+            tags,
+            relay_endpoint: None,
+            kind: wg_only::KIND.into(),
+        });
+    }
     let mut assigned_ips: Vec<String> = serde_json::from_str(&source_addresses).unwrap_or_default();
     if !selection.ipv6 {
         assigned_ips.retain(|address| !address.contains(':'));
@@ -2571,7 +2645,7 @@ fn validate_advertised_routes(routes: Vec<String>) -> Result<Vec<String>, ApiErr
     Ok(canonical)
 }
 
-fn canonical_ipv4_route(route: &str) -> Result<String, ApiError> {
+pub(crate) fn canonical_ipv4_route(route: &str) -> Result<String, ApiError> {
     let route = route.trim();
     let (address, prefix) = route
         .split_once('/')
@@ -2604,7 +2678,7 @@ fn canonical_ipv4_route(route: &str) -> Result<String, ApiError> {
     Ok(format!("{address}/{prefix}"))
 }
 
-fn ipv4_routes_overlap(left: &str, right: &str) -> bool {
+pub(crate) fn ipv4_routes_overlap(left: &str, right: &str) -> bool {
     let parse = |route: &str| {
         let (address, prefix) = route.split_once('/').expect("validated CIDR");
         (
@@ -2618,7 +2692,7 @@ fn ipv4_routes_overlap(left: &str, right: &str) -> bool {
     left_address & mask == right_address & mask
 }
 
-fn ipv4_route_is_within(route: &str, container: &str) -> bool {
+pub(crate) fn ipv4_route_is_within(route: &str, container: &str) -> bool {
     let parse = |cidr: &str| {
         let (address, prefix) = cidr.split_once('/').expect("validated CIDR");
         (
@@ -4419,7 +4493,7 @@ mod tests {
 
         let cleanup = connect_postgres(&database_url).await.unwrap();
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS api_idempotency,api_clients,pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
+            "DROP TABLE IF EXISTS wireguard_only_peers,api_idempotency,api_clients,pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
         )
         .execute(&cleanup)
         .await
@@ -4511,7 +4585,7 @@ mod tests {
         second.pool.close().await;
         let cleanup = connect_postgres(&database_url).await.unwrap();
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS api_idempotency,api_clients,pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
+            "DROP TABLE IF EXISTS wireguard_only_peers,api_idempotency,api_clients,pending_bootstrap_orgs,console_assertion_nonces,audit_events,nodes,device_authorizations,join_keys,orgs,coordinator_schema_migrations CASCADE",
         )
         .execute(&cleanup)
         .await
@@ -6892,6 +6966,13 @@ mod tests {
         .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
         assert_eq!(audit_table, "audit_events");
+        let wg_table: String = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='wireguard_only_peers'",
+        )
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(wg_table, "wireguard_only_peers");
     }
 
     #[tokio::test]
@@ -6937,7 +7018,7 @@ mod tests {
             Uuid::new_v4()
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
-        sqlx::raw_sql("PRAGMA user_version=7")
+        sqlx::raw_sql("PRAGMA user_version=8")
             .execute(&pool)
             .await
             .unwrap();
@@ -8023,5 +8104,213 @@ mod tests {
             }
         }
         assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn wireguard_only_peers_are_exported_revoked_and_rejected_for_members() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "wg-only-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let admin = signed_session(org.id, "admin-1", Role::Admin, now() + 60);
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let node =
+            register_test_node(&router, org.id, &owner, "office-one", "office-key", &[]).await;
+        sqlx::query("UPDATE nodes SET tags_json=$1 WHERE id=$2")
+            .bind(r#"["office"]"#)
+            .bind(node.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let create = serde_json::json!({
+            "name": "site-router",
+            "kind": "wireguard_only",
+            "wg_public_key": "siteRouterPublicKeyExample+/=",
+            "endpoint": "203.0.113.10:51820",
+            "allowed_ips": ["10.8.0.0/24"],
+            "tags": ["office"]
+        });
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/wireguard-only-peers", org.id),
+                create.clone(),
+                Some(&member),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/wireguard-only-peers", org.id),
+                serde_json::json!({
+                    "name": "default-route",
+                    "kind": "wireguard_only",
+                    "wg_public_key": "anotherPublicKeyExample+/=",
+                    "endpoint": "203.0.113.11:51820",
+                    "allowed_ips": ["0.0.0.0/0"]
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/wireguard-only-peers", org.id),
+                serde_json::json!({
+                    "name": "private-key",
+                    "kind": "wireguard_only",
+                    "wg_public_key": "-----BEGIN PRIVATE KEY-----",
+                    "endpoint": "203.0.113.11:51820",
+                    "allowed_ips": ["10.8.0.0/24"]
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let created: crate::wg_only::WireGuardOnlyPeer = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/wireguard-only-peers", org.id),
+                create,
+                Some(&admin),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created.kind, "wireguard_only");
+        assert_eq!(created.wg_public_key, "siteRouterPublicKeyExample+/=");
+        assert!(!serde_json::to_string(&created)
+            .unwrap()
+            .to_ascii_uppercase()
+            .contains("PRIVATE"));
+
+        let peers: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        let exported = peers
+            .peers
+            .iter()
+            .find(|peer| peer.kind == "wireguard_only")
+            .expect("policy-selected unmanaged peer is exported");
+        assert_eq!(exported.id, created.id);
+        assert_eq!(exported.endpoint.as_deref(), Some("203.0.113.10:51820"));
+        assert_eq!(exported.allowed_ips, vec!["10.8.0.0/24"]);
+        assert_eq!(exported.dns_name, "");
+        assert_eq!(exported.relay_endpoint, None);
+
+        let tagged: crate::wg_only::WireGuardOnlyPeer = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/wireguard-only-peers", org.id),
+                serde_json::json!({
+                    "name": "store-router",
+                    "kind": "wireguard_only",
+                    "wg_public_key": "storeRouterPublicKeyExample+/=",
+                    "endpoint": "203.0.113.12:51820",
+                    "allowed_ips": ["10.9.0.0/24"],
+                    "tags": ["store"]
+                }),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let filtered: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert!(filtered
+            .peers
+            .iter()
+            .any(|peer| peer.id == created.id && peer.kind == "wireguard_only"));
+        assert!(!filtered.peers.iter().any(|peer| peer.id == tagged.id));
+
+        assert_eq!(
+            call(
+                &router,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/wireguard-only-peers/{}", org.id, created.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let after_revoke: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert!(!after_revoke.peers.iter().any(|peer| peer.id == created.id));
+
+        let writer: crate::admin::ApiClientCreated = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"wg-writer","scopes":["devices:write"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let listed: serde_json::Value = body(
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/v1/wireguard-only-peers")
+                        .header(AUTHORIZATION, format!("Bearer {}", writer.token))
+                        .header("x-blaktail-organisation", org.id.to_string())
+                        .body(Body::from("null"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(listed["data"].as_array().unwrap().len(), 2);
+        assert_eq!(listed["data"][0]["kind"], "wireguard_only");
+        assert!(listed
+            .to_string()
+            .to_ascii_uppercase()
+            .find("PRIVATE")
+            .is_none());
     }
 }

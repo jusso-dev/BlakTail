@@ -120,6 +120,14 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .route("/api/v1/devices/:node_id/routes", put(api_approve_routes))
         .route("/api/v1/policy", get(api_get_policy).put(api_put_policy))
         .route("/api/v1/dns", get(api_get_dns).put(api_put_dns))
+        .route(
+            "/api/v1/wireguard-only-peers",
+            get(api_list_wg_only).post(api_create_wg_only),
+        )
+        .route(
+            "/api/v1/wireguard-only-peers/:peer_id",
+            get(api_get_wg_only).delete(api_revoke_wg_only),
+        )
         .route("/api/v1/audit", get(api_list_audit))
         .layer(DefaultBodyLimit::max(ADMIN_API_MAX_BODY_BYTES))
 }
@@ -908,4 +916,52 @@ async fn api_list_audit(
         data: events,
         next_cursor,
     }))
+}
+
+async fn api_list_wg_only(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Envelope<Vec<crate::wg_only::WireGuardOnlyPeer>>>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesRead)?;
+    Ok(Json(Envelope {
+        data: crate::wg_only::list_for_org(&s, org_id).await?,
+        next_cursor: None,
+    }))
+}
+
+async fn api_create_wg_only(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<crate::wg_only::CreateWireGuardOnlyPeer>,
+) -> Result<(StatusCode, Json<crate::wg_only::WireGuardOnlyPeer>), ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesWrite)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(crate::wg_only::create_for_org(&s, org_id, &caller.session, input).await?),
+    ))
+}
+
+async fn api_get_wg_only(
+    State(s): State<AppState>,
+    UrlPath(peer_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<crate::wg_only::WireGuardOnlyPeer>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesRead)?;
+    Ok(Json(
+        crate::wg_only::get_for_org(&s, org_id, peer_id).await?,
+    ))
+}
+
+async fn api_revoke_wg_only(
+    State(s): State<AppState>,
+    UrlPath(peer_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesWrite)?;
+    crate::wg_only::revoke_for_org(&s, org_id, peer_id, &caller.session).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
