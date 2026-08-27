@@ -843,6 +843,13 @@ async fn api_delete_device(
         &serde_json::json!({"via":"admin_api"}),
     )
     .await?;
+    crate::webhooks::enqueue(
+        &mut tx,
+        org_id,
+        "device.revoked",
+        &serde_json::json!({ "device_id": node_id }),
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -921,6 +928,16 @@ async fn rename_device(
             "friendly_name": friendly_name,
             "previous_friendly_name": previous,
             "technical_name": technical_name,
+        }),
+    )
+    .await?;
+    crate::webhooks::enqueue(
+        &mut tx,
+        org_id,
+        "device.renamed",
+        &serde_json::json!({
+            "device_id": node_id,
+            "friendly_name": friendly_name,
         }),
     )
     .await?;
