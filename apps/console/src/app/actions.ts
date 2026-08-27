@@ -12,7 +12,9 @@ import {
   putDns,
   type OrgDnsSettings,
   createApiClient,
+  createWgOnlyPeer,
   revokeApiClient,
+  revokeWgOnlyPeer,
   revokeNode,
   tombstoneNode,
   updateNodeFriendlyName,
@@ -209,6 +211,84 @@ export async function revokeApiClientAction(
         error instanceof Error
           ? error.message
           : "Could not revoke automation credential.",
+    };
+  }
+}
+
+export async function createWgOnlyPeerAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireOrganisationContext(
+      owningOrganisation(formData),
+    );
+    if (!canMutateTailnet(ctx.role)) {
+      return {
+        ok: false,
+        error: "Only owners and admins can add unmanaged WireGuard peers.",
+      };
+    }
+    const name = String(formData.get("name") ?? "").trim();
+    const wgPublicKey = String(formData.get("wgPublicKey") ?? "").trim();
+    const endpoint = String(formData.get("endpoint") ?? "").trim();
+    const allowedIps = String(formData.get("allowedIps") ?? "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const tags = formData.getAll("tags").map(String).filter(isDeviceTag);
+    if (!name || !wgPublicKey || !endpoint || allowedIps.length === 0) {
+      return {
+        ok: false,
+        error: "Name, public key, endpoint, and AllowedIPs are required.",
+      };
+    }
+    await createWgOnlyPeer(ctx, {
+      name,
+      wg_public_key: wgPublicKey,
+      endpoint,
+      allowed_ips: allowedIps,
+      tags,
+    });
+    revalidatePath("/devices");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not add unmanaged WireGuard peer.",
+    };
+  }
+}
+
+export async function revokeWgOnlyPeerAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireOrganisationContext(
+      owningOrganisation(formData),
+    );
+    if (!canMutateTailnet(ctx.role)) {
+      return {
+        ok: false,
+        error: "Only owners and admins can revoke unmanaged WireGuard peers.",
+      };
+    }
+    const peerId = String(formData.get("peerId") ?? "").trim();
+    if (!peerId) {
+      return { ok: false, error: "Choose an unmanaged peer to revoke." };
+    }
+    await revokeWgOnlyPeer(ctx, peerId);
+    revalidatePath("/devices");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not revoke unmanaged WireGuard peer.",
     };
   }
 }

@@ -148,6 +148,7 @@ const sql = new SQL(databaseUrl, {
   prepare: false,
 });
 const coordinatorNodes = new Map();
+const coordinatorWgOnlyPeers = new Map();
 const coordinatorMutations = [];
 const coordinator = createServer(async (request, response) => {
   let raw = "";
@@ -170,6 +171,54 @@ const coordinator = createServer(async (request, response) => {
   if (nodes && request.method === "GET") {
     response.writeHead(200, { "content-type": "application/json" });
     response.end(JSON.stringify(coordinatorNodes.get(nodes[1]) ?? []));
+    return;
+  }
+  const wgOnlyList = request.url?.match(
+    /^\/v1\/orgs\/([^/]+)\/wireguard-only-peers$/u,
+  );
+  if (wgOnlyList && request.method === "GET") {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify(coordinatorWgOnlyPeers.get(wgOnlyList[1]) ?? []),
+    );
+    return;
+  }
+  if (wgOnlyList && request.method === "POST") {
+    const body = JSON.parse(raw);
+    const peer = {
+      id: `wg-only-${wgOnlyList[1]}-${Date.now()}`,
+      name: body.name,
+      kind: body.kind ?? "wireguard_only",
+      wg_public_key: body.wg_public_key,
+      endpoint: body.endpoint,
+      allowed_ips: body.allowed_ips ?? [],
+      tags: body.tags ?? [],
+      created_at: Math.floor(Date.now() / 1000),
+      expires_at: null,
+      revoked_at: null,
+      revision: 1,
+    };
+    const existing = coordinatorWgOnlyPeers.get(wgOnlyList[1]) ?? [];
+    existing.push(peer);
+    coordinatorWgOnlyPeers.set(wgOnlyList[1], existing);
+    response.writeHead(201, { "content-type": "application/json" });
+    response.end(JSON.stringify(peer));
+    return;
+  }
+  const wgOnlyPeer = request.url?.match(
+    /^\/v1\/orgs\/([^/]+)\/wireguard-only-peers\/([^/]+)$/u,
+  );
+  if (wgOnlyPeer && request.method === "DELETE") {
+    const peers = coordinatorWgOnlyPeers.get(wgOnlyPeer[1]) ?? [];
+    const peer = peers.find((candidate) => candidate.id === wgOnlyPeer[2]);
+    if (!peer) {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "Unmanaged peer not found." }));
+      return;
+    }
+    peer.revoked_at = Math.floor(Date.now() / 1000);
+    response.writeHead(204);
+    response.end();
     return;
   }
   const joinKeys = request.url?.match(
@@ -526,6 +575,47 @@ try {
   assert.match(devicesHTML, /red-machine/u);
   assert.match(devicesHTML, /blue-machine/u);
   assert.match(devicesHTML, /Blue Network/u);
+  assert.match(devicesHTML, /Unmanaged WireGuard peers/u);
+  assert.match(devicesHTML, /wireguard_only/u);
+
+  const emptyUnmanaged = await fetch(`${baseUrl}/api/wg-only-peers`, {
+    headers: { cookie: ownerCookie },
+  });
+  assert.equal(emptyUnmanaged.status, 200);
+  assert.deepEqual((await emptyUnmanaged.json()).peers, []);
+  const createdUnmanaged = await jsonRequest(baseUrl, "/api/wg-only-peers", {
+    cookie: ownerCookie,
+    body: {
+      organisationId: ownerOrganisation.id,
+      name: "site-printer",
+      wgPublicKey: "siteRouterPublicKeyExample+/=",
+      endpoint: "203.0.113.10:51820",
+      allowedIps: ["10.8.0.10/32"],
+      tags: ["office"],
+    },
+  });
+  assert.equal(
+    createdUnmanaged.response.status,
+    200,
+    JSON.stringify(createdUnmanaged.body),
+  );
+  assert.equal(createdUnmanaged.body.kind, "wireguard_only");
+  assert.equal(createdUnmanaged.body.name, "site-printer");
+  const listedUnmanaged = await fetch(`${baseUrl}/api/wg-only-peers`, {
+    headers: { cookie: ownerCookie },
+  });
+  const listedUnmanagedBody = await listedUnmanaged.json();
+  assert.equal(listedUnmanaged.status, 200);
+  assert.deepEqual(listedUnmanagedBody.errors, []);
+  assert.equal(listedUnmanagedBody.peers.length, 1);
+  assert.equal(listedUnmanagedBody.peers[0].kind, "wireguard_only");
+  const unmanagedPage = await fetch(`${baseUrl}/devices`, {
+    headers: { cookie: ownerCookie },
+  });
+  const unmanagedHTML = await unmanagedPage.text();
+  assert.equal(unmanagedPage.status, 200);
+  assert.match(unmanagedHTML, /site-printer/u);
+  assert.match(unmanagedHTML, /Unmanaged/u);
 
   const blueSettings = await fetch(`${baseUrl}/settings`, {
     headers: {
@@ -906,6 +996,37 @@ try {
       `all-networks inventory missing ${visibleValue}`,
     );
   }
+  assert.match(allNetworksHtml, /Unmanaged WireGuard peers/u);
+  assert.match(allNetworksHtml, /site-printer/u);
+  assert.equal(allNetworksHtml.includes("Add unmanaged peer"), false);
+  const memberCreateUnmanaged = await jsonRequest(
+    baseUrl,
+    "/api/wg-only-peers",
+    {
+      cookie: memberCookie,
+      body: {
+        organisationId: ownerOrganisation.id,
+        name: "member-router",
+        wgPublicKey: "memberPublicKeyExample+/=",
+        endpoint: "203.0.113.20:51820",
+        allowedIps: ["10.8.0.20/32"],
+      },
+    },
+  );
+  assert.equal(memberCreateUnmanaged.response.status, 403);
+  const revokedUnmanaged = await jsonRequest(baseUrl, "/api/wg-only-peers", {
+    method: "DELETE",
+    cookie: ownerCookie,
+    body: {
+      organisationId: ownerOrganisation.id,
+      peerId: createdUnmanaged.body.id,
+    },
+  });
+  assert.equal(revokedUnmanaged.response.status, 204);
+  const afterRevoke = await fetch(`${baseUrl}/api/wg-only-peers`, {
+    headers: { cookie: ownerCookie },
+  });
+  assert.equal((await afterRevoke.json()).peers[0].revoked_at !== null, true);
 
   const sessionCookieNames = [
     "better-auth.session_token",
