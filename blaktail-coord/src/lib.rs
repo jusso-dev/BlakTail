@@ -62,6 +62,7 @@ const SCHEMA: &str = include_str!("../schema.sql");
 pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 const MAX_CONTROL_UPDATE_WAIT_SECS: u64 = 25;
 const DEFAULT_AUDIT_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
+const DEFAULT_TOMBSTONE_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 const NODE_ONLINE_SECS: i64 = 90;
 const EPHEMERAL_OFFLINE_SECS: i64 = 24 * 60 * 60;
 const DEFAULT_NODE_KEY_TTL_SECS: i64 = 90 * 24 * 60 * 60;
@@ -2907,6 +2908,7 @@ pub(crate) async fn load_nodes(
     org_id: Uuid,
     query: &NodeListQuery,
 ) -> Result<Vec<NodeRow>, ApiError> {
+    purge_expired_tombstones(store, org_id).await?;
     let include_deleted = query.include_deleted.unwrap_or(false);
     let limit = i64::from(query.limit.unwrap_or(200).clamp(1, 200));
     let current_time = now();
@@ -3609,6 +3611,19 @@ pub(crate) async fn load_audit_events(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(ApiError::Database)
+}
+
+pub(crate) async fn purge_expired_tombstones(store: &Store, org_id: Uuid) -> Result<u64, ApiError> {
+    let cutoff = now() - DEFAULT_TOMBSTONE_RETENTION_SECS;
+    let deleted = sqlx::query(
+        "DELETE FROM nodes WHERE org_id=$1 AND deleted_at IS NOT NULL AND deleted_at<$2",
+    )
+    .bind(org_id.to_string())
+    .bind(cutoff)
+    .execute(&store.pool)
+    .await?
+    .rows_affected();
+    Ok(deleted)
 }
 
 pub(crate) async fn purge_expired_audit(store: &Store, org_id: Uuid) -> Result<(), ApiError> {
@@ -8538,5 +8553,82 @@ mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn expired_tombstones_are_hard_deleted_without_touching_active_nodes() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "tombstone-purge-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let stale =
+            register_test_node(&router, org.id, &owner, "stale-node", "stale-key", &[]).await;
+        let fresh =
+            register_test_node(&router, org.id, &owner, "fresh-node", "fresh-key", &[]).await;
+        let live = register_test_node(&router, org.id, &owner, "live-node", "live-key", &[]).await;
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/nodes/{}/tombstone", org.id, stale.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/nodes/{}/tombstone", org.id, fresh.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        sqlx::query("UPDATE nodes SET deleted_at=$1 WHERE id=$2")
+            .bind(now() - DEFAULT_TOMBSTONE_RETENTION_SECS - 60)
+            .bind(stale.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+
+        let remaining: Vec<NodeRow> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes?include_deleted=true", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert!(remaining.iter().all(|node| node.id != stale.id));
+        assert!(remaining
+            .iter()
+            .any(|node| node.id == fresh.id && node.deleted));
+        assert!(remaining
+            .iter()
+            .any(|node| node.id == live.id && !node.deleted));
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM nodes WHERE org_id=$1")
+            .bind(org.id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        let audit: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE org_id=$1 AND action='node.tombstoned'",
+        )
+        .bind(org.id.to_string())
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(audit, 2);
     }
 }
