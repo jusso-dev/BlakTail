@@ -16,7 +16,7 @@ review still has to cover.
 | Session / HMAC | Console issues sessions; coordinator verifies HMAC | Console tests, coordinator assertion tests | Clock skew, replay, and secret rotation drill |
 | Join keys / node tokens | Shown once, hashed at rest, single-use | Coordinator join/reauth/revoke tests | Operator copy/paste and log-leak review |
 | Admin API | Scoped `bta_` tokens, OpenAPI, body/rate bounds | `scripts/admin-openapi-drift.sh`, admin API tests | Webhook/event delivery and operator-held secrets |
-| ACL / policy | Deny wins; groups; tag owners; offline tests | `blaktail-coord check-policy`, coordinator policy tests, homelab ACL prove | Ports/protocols/SSH and two-agent policy packet proof |
+| ACL / policy | Deny wins; explicit defaults; groups; tag owners; offline tests; etag rollback | `blaktail-coord check-policy`, coordinator policy tests, homelab ACL prove | Packet-level ports/SSH and two-agent allowed-service proof |
 | MagicDNS | Authoritative-only; no public forward of the suffix | DNS unit/wire tests; Linux AWS smoke | Fresh macOS join and no-leak capture |
 | Routes / exit | Advertisement ≠ approval ≠ distribution | Coordinator route tests; `ADVERTISE_SUBNET` drill flag | Live subnet and DNS-while-exit packets |
 | Relay / NAT | Authenticated AU relay; hole punch; fallback | Relay tests; `FORCE_RELAY=1` two-VM flag | Forced-relay metric delta on two NATs |

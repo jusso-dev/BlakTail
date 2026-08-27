@@ -367,6 +367,12 @@ export async function saveAclAction(formData: FormData): Promise<ActionResult> {
     if (!canMutateTailnet(ctx.role)) {
       return { ok: false, error: "Only owners and admins can edit access policy." };
     }
+    const etag = String(formData.get("etag") ?? "");
+    if (formData.get("rollback") === "true") {
+      await putAcl(ctx, { rollback: true }, etag);
+      revalidatePath("/acls");
+      return { ok: true, data: undefined };
+    }
     const raw = String(formData.get("aclJson") ?? "");
     let parsed: unknown;
     try {
@@ -374,7 +380,7 @@ export async function saveAclAction(formData: FormData): Promise<ActionResult> {
     } catch {
       return { ok: false, error: "ACL must be valid JSON." };
     }
-    await putAcl(ctx, parsed);
+    await putAcl(ctx, parsed, etag);
     revalidatePath("/acls");
     return { ok: true, data: undefined };
   } catch (error) {

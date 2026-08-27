@@ -9,6 +9,7 @@ pub use org_dns::{check_dns_document, DnsCheckReport};
 #[derive(Debug, Serialize)]
 pub struct PolicyCheckReport {
     pub version: u32,
+    pub defaults: &'static str,
     pub groups: usize,
     pub hosts: usize,
     pub rules: usize,
@@ -22,6 +23,7 @@ pub fn check_policy_document(document: &str) -> Result<PolicyCheckReport, String
     acl.validate().map_err(|error| error.to_string())?;
     Ok(PolicyCheckReport {
         version: acl.version,
+        defaults: acl.defaults.as_str(),
         groups: acl.groups.len(),
         hosts: acl.hosts.len(),
         rules: acl.rules.len(),
@@ -61,7 +63,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 9;
+pub const CURRENT_SCHEMA_VERSION: i64 = 10;
 const MAX_CONTROL_UPDATE_WAIT_SECS: u64 = 25;
 const MAX_CONTROL_VIEWS: usize = 10_000;
 type ControlViewMap = HashMap<Uuid, (i64, BTreeSet<Uuid>)>;
@@ -164,6 +166,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         name: "oauth access tokens",
         postgres_sql: include_str!("../migrations/postgres/0009_oauth_access_tokens.sql"),
+    },
+    Migration {
+        version: 10,
+        name: "policy revision and previous document",
+        postgres_sql: include_str!("../migrations/postgres/0010_acl_revision.sql"),
     },
 ];
 
@@ -359,6 +366,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             7 => migrate_sqlite_to_v7(&mut tx).await?,
             8 => migrate_sqlite_to_v8(&mut tx).await?,
             9 => migrate_sqlite_to_v9(&mut tx).await?,
+            10 => migrate_sqlite_to_v10(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -373,6 +381,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             7 => "PRAGMA user_version=7",
             8 => "PRAGMA user_version=8",
             9 => "PRAGMA user_version=9",
+            10 => "PRAGMA user_version=10",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -718,6 +727,13 @@ async fn migrate_sqlite_to_v9(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+async fn migrate_sqlite_to_v10(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    ensure_column(tx, "orgs", "acl_revision", "INTEGER NOT NULL DEFAULT 1").await?;
+    ensure_column(tx, "orgs", "acl_previous_json", "TEXT").await
 }
 
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
@@ -1539,7 +1555,118 @@ struct CreateOrg {
     node_key_ttl_seconds: i64,
 }
 fn default_acl() -> serde_json::Value {
-    serde_json::json!({"rules":[]})
+    serde_json::json!({"version": 1, "defaults": "deny", "rules": []})
+}
+
+pub(crate) struct AclRow {
+    pub(crate) json: String,
+    pub(crate) revision: i64,
+    pub(crate) previous: Option<String>,
+}
+
+pub(crate) fn storeable_acl_json(mut value: serde_json::Value) -> Result<String, ApiError> {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("generated");
+        object.remove("etag");
+        object.remove("revision");
+        object.remove("has_previous");
+    }
+    let acl: Acl = serde_json::from_value(value.clone())
+        .map_err(|e| ApiError::BadRequest(format!("invalid ACL: {e}")))?;
+    acl.validate()?;
+    serde_json::to_string(&value).map_err(|_| ApiError::CorruptData)
+}
+
+fn acl_document(row: &AclRow) -> Result<serde_json::Value, ApiError> {
+    let mut document: serde_json::Value =
+        serde_json::from_str(&row.json).map_err(|_| ApiError::CorruptData)?;
+    let acl: Acl = serde_json::from_value(document.clone()).unwrap_or_default();
+    if let Some(object) = document.as_object_mut() {
+        object
+            .entry("defaults")
+            .or_insert_with(|| serde_json::Value::String(acl.defaults.as_str().into()));
+        if acl.defaults == AclDefaults::SameTag {
+            object.insert(
+                "generated".into(),
+                serde_json::json!([{
+                    "kind": "legacy_same_tag",
+                    "action": "allow",
+                    "applies": ["same_tag", "untagged"],
+                    "note": "Implicit same-tag and untagged default. Set defaults to deny to remove it."
+                }]),
+            );
+        } else {
+            object.insert("generated".into(), serde_json::json!([]));
+        }
+        object.insert("etag".into(), serde_json::Value::String(hash(&row.json)));
+        object.insert("revision".into(), serde_json::json!(row.revision));
+        object.insert(
+            "has_previous".into(),
+            serde_json::json!(row
+                .previous
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())),
+        );
+    }
+    Ok(document)
+}
+
+async fn load_acl_row(store: &Store, org_id: Uuid) -> Result<AclRow, ApiError> {
+    let row = sqlx::query("SELECT acl_json,acl_revision,acl_previous_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&store.pool)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(AclRow {
+        json: row.try_get(0)?,
+        revision: row.try_get(1)?,
+        previous: row.try_get(2)?,
+    })
+}
+
+pub(crate) async fn load_acl_row_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: Uuid,
+) -> Result<AclRow, ApiError> {
+    let row = sqlx::query("SELECT acl_json,acl_revision,acl_previous_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    Ok(AclRow {
+        json: row.try_get(0)?,
+        revision: row.try_get(1)?,
+        previous: row.try_get(2)?,
+    })
+}
+
+pub(crate) async fn load_acl_document(
+    store: &Store,
+    org_id: Uuid,
+) -> Result<serde_json::Value, ApiError> {
+    acl_document(&load_acl_row(store, org_id).await?)
+}
+
+pub(crate) async fn publish_acl_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: Uuid,
+    current_json: &str,
+    next_json: &str,
+    revision: i64,
+) -> Result<(), ApiError> {
+    let changed =
+        sqlx::query("UPDATE orgs SET acl_json=$1,acl_revision=$2,acl_previous_json=$3 WHERE id=$4")
+            .bind(next_json)
+            .bind(revision + 1)
+            .bind(current_json)
+            .bind(org_id.to_string())
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    Ok(())
 }
 fn default_node_key_ttl() -> i64 {
     DEFAULT_NODE_KEY_TTL_SECS
@@ -1561,10 +1688,13 @@ async fn prepare_org(
         return Err(ApiError::BadRequest("org name must not be empty".into()));
     }
     validate_node_key_ttl(input.node_key_ttl_seconds)?;
-    let acl: Acl = serde_json::from_value(input.acl.clone())
-        .map_err(|error| ApiError::BadRequest(format!("invalid ACL: {error}")))?;
-    acl.validate()?;
-    let acl_json = input.acl.to_string();
+    let mut acl_value = input.acl.clone();
+    if acl_value.get("defaults").is_none() {
+        if let Some(object) = acl_value.as_object_mut() {
+            object.insert("defaults".into(), serde_json::json!("deny"));
+        }
+    }
+    let acl_json = storeable_acl_json(acl_value)?;
     let current_time = now();
     sqlx::query("DELETE FROM pending_bootstrap_orgs WHERE expires_at<=$1")
         .bind(current_time)
@@ -3357,14 +3487,7 @@ async fn get_acl(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     console_session(&s, &headers, org_id).await?;
-    let acl: String = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
-        .bind(org_id.to_string())
-        .fetch_optional(&s.store.pool)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    Ok(Json(
-        serde_json::from_str(&acl).map_err(|_| ApiError::CorruptData)?,
-    ))
+    Ok(Json(load_acl_document(&s.store, org_id).await?))
 }
 async fn put_acl(
     State(s): State<AppState>,
@@ -3376,47 +3499,48 @@ async fn put_acl(
     if session.role == Role::Member {
         return Err(ApiError::Forbidden);
     }
-    let acl: Acl = serde_json::from_value(value.clone())
-        .map_err(|e| ApiError::BadRequest(format!("invalid ACL: {e}")))?;
-    acl.validate()?;
     let mut tx = s.store.pool.begin().await?;
-    let current: Option<String> = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
-        .bind(org_id.to_string())
-        .fetch_optional(&mut *tx)
-        .await?;
-    let current = current.ok_or(ApiError::NotFound)?;
+    let current = load_acl_row_tx(&mut tx, org_id).await?;
     if let Some(expected) = headers
         .get("if-match")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let etag = hash(&current);
+        let etag = hash(&current.json);
         let quoted = format!("\"{etag}\"");
         if expected != etag && expected != quoted {
             return Err(ApiError::PreconditionFailed);
         }
     }
-    let changed = sqlx::query("UPDATE orgs SET acl_json=$1 WHERE id=$2")
-        .bind(value.to_string())
-        .bind(org_id.to_string())
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if changed == 0 {
-        return Err(ApiError::NotFound);
-    }
+    let rollback = value.get("rollback").and_then(serde_json::Value::as_bool) == Some(true);
+    let next = if rollback {
+        current
+            .previous
+            .clone()
+            .ok_or_else(|| ApiError::BadRequest("no previous policy revision to restore".into()))?
+    } else {
+        storeable_acl_json(value)?
+    };
+    let acl: Acl = serde_json::from_str(&next).map_err(|_| ApiError::CorruptData)?;
+    publish_acl_tx(&mut tx, org_id, &current.json, &next, current.revision).await?;
     bump_control_revision(&mut tx, org_id.to_string()).await?;
     append_audit(
         &mut tx,
         org_id,
         &session,
-        "acl.updated",
+        if rollback {
+            "acl.rolled_back"
+        } else {
+            "acl.updated"
+        },
         "acl",
         Some(&org_id.to_string()),
         &serde_json::json!({
             "rule_count": acl.rules.len(),
-            "sha256": hash(&value.to_string()),
+            "defaults": acl.defaults.as_str(),
+            "sha256": hash(&next),
+            "revision": current.revision + 1,
         }),
     )
     .await?;
@@ -3953,11 +4077,30 @@ fn default_policy_version() -> u32 {
     1
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AclDefaults {
+    #[default]
+    SameTag,
+    Deny,
+}
+
+impl AclDefaults {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SameTag => "same_tag",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Acl {
+pub(crate) struct Acl {
     #[serde(default = "default_policy_version")]
     version: u32,
+    #[serde(default)]
+    pub(crate) defaults: AclDefaults,
     #[serde(default)]
     groups: BTreeMap<String, Vec<String>>,
     #[serde(default)]
@@ -3970,6 +4113,18 @@ struct Acl {
     ssh: Vec<AclSshRule>,
     #[serde(default)]
     tests: Vec<AclTest>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    generated: serde_json::Value,
+    #[serde(default)]
+    #[allow(dead_code)]
+    etag: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    revision: Option<i64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    has_previous: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4008,12 +4163,17 @@ impl Default for Acl {
     fn default() -> Self {
         Self {
             version: 1,
+            defaults: AclDefaults::SameTag,
             groups: BTreeMap::new(),
             tag_owners: BTreeMap::new(),
             hosts: BTreeMap::new(),
             rules: Vec::new(),
             ssh: Vec::new(),
             tests: Vec::new(),
+            generated: serde_json::Value::Null,
+            etag: None,
+            revision: None,
+            has_previous: None,
         }
     }
 }
@@ -4400,10 +4560,15 @@ impl Acl {
         if host.is_some() {
             return false;
         }
-        if s.tags.is_empty() && d.tags.is_empty() {
-            return true;
+        match self.defaults {
+            AclDefaults::Deny => false,
+            AclDefaults::SameTag => {
+                if s.tags.is_empty() && d.tags.is_empty() {
+                    return true;
+                }
+                s.tags.iter().any(|t| d.tags.contains(t))
+            }
         }
-        s.tags.iter().any(|t| d.tags.contains(t))
     }
 
     fn rule_matches(
@@ -4844,7 +5009,7 @@ mod tests {
             router,
             Method::POST,
             "/v1/orgs",
-            serde_json::json!({"id":id,"name":name}),
+            serde_json::json!({"id":id,"name":name,"acl":{"version":1,"defaults":"same_tag","rules":[]}}),
             Some(&service),
         )
         .await;
@@ -6337,6 +6502,26 @@ mod tests {
     }
 
     #[test]
+    fn policy_defaults_deny_closes_implicit_same_tag() {
+        let acl: Acl = serde_json::from_value(serde_json::json!({
+            "defaults": "deny",
+            "rules": []
+        }))
+        .unwrap();
+        let office = Subject::new(Role::Member, vec![DeviceTag::Office]);
+        let other_office = Subject::new(Role::Owner, vec![DeviceTag::Office]);
+        let untagged = Subject::new(Role::Member, vec![]);
+        assert!(!acl.allows(&office, &other_office));
+        assert!(!acl.allows(&untagged, &untagged));
+        let report = check_policy_document(r#"{"defaults":"deny","rules":[]}"#).unwrap();
+        assert_eq!(report.defaults, "deny");
+        assert_eq!(
+            check_policy_document(r#"{"rules":[]}"#).unwrap().defaults,
+            "same_tag"
+        );
+    }
+
+    #[test]
     fn explicit_deny_wins_and_roles_can_allow_cross_tag() {
         let acl: Acl = serde_json::from_value(serde_json::json!({"rules":[
             {"action":"allow","src_roles":["owner","admin"],"dst_tags":["store"]},
@@ -7172,6 +7357,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn policy_get_shows_generated_legacy_default_and_admin_can_roll_back() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "policy-defaults-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let document: serde_json::Value = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/acl", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(document["defaults"], "same_tag");
+        assert_eq!(document["generated"][0]["kind"], "legacy_same_tag");
+        assert_eq!(document["revision"], 1);
+        assert_eq!(document["has_previous"], false);
+        let etag = document["etag"].as_str().unwrap().to_owned();
+
+        let writer: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"policy-writer","scopes":["policy:write","devices:read"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let admin =
+            |method: Method, uri: &'static str, token: String, payload: serde_json::Value| {
+                let router = r.clone();
+                let org_id = org.id;
+                async move {
+                    router
+                        .oneshot(
+                            Request::builder()
+                                .method(method)
+                                .uri(uri)
+                                .header(AUTHORIZATION, format!("Bearer {token}"))
+                                .header("x-blaktail-organisation", org_id.to_string())
+                                .header("content-type", "application/json")
+                                .body(Body::from(payload.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                }
+            };
+        assert_eq!(
+            admin(
+                Method::PUT,
+                "/api/v1/policy",
+                writer.token.clone(),
+                serde_json::json!({"acl":{"defaults":"deny","rules":[]}}),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            admin(
+                Method::PUT,
+                "/api/v1/policy",
+                writer.token.clone(),
+                serde_json::json!({
+                    "etag": etag,
+                    "acl": {
+                        "defaults": "deny",
+                        "rules": [{"action":"allow","src_tags":["office"],"dst_tags":["store"]}]
+                    }
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let published: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/policy",
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(published["data"]["acl"]["defaults"], "deny");
+        assert_eq!(published["data"]["acl"]["generated"], serde_json::json!([]));
+        assert_eq!(published["data"]["has_previous"], true);
+        assert_eq!(published["data"]["revision"], 2);
+        let published_etag = published["data"]["etag"].as_str().unwrap().to_owned();
+        assert_eq!(
+            admin(
+                Method::PUT,
+                "/api/v1/policy",
+                writer.token.clone(),
+                serde_json::json!({"etag": published_etag, "rollback": true}),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let restored: serde_json::Value = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/acl", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(restored["defaults"], "same_tag");
+        assert_eq!(restored["generated"][0]["kind"], "legacy_same_tag");
+        assert_eq!(restored["revision"], 3);
+        assert_eq!(restored["rules"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn named_groups_allow_cross_tag_peers_for_listed_people() {
         let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
@@ -7526,7 +7836,7 @@ mod tests {
             Uuid::new_v4()
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
-        sqlx::raw_sql("PRAGMA user_version=10")
+        sqlx::raw_sql("PRAGMA user_version=11")
             .execute(&pool)
             .await
             .unwrap();

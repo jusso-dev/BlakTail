@@ -42,8 +42,23 @@ export type AclSshDraft = {
   check_period_secs: string;
 };
 
+export const ACL_DEFAULTS = ["same_tag", "deny"] as const;
+export type AclDefaults = (typeof ACL_DEFAULTS)[number];
+
+export type AclGeneratedRule = {
+  kind: string;
+  action?: string;
+  applies?: string[];
+  note?: string;
+};
+
 export type AclPolicyDraft = {
   version: number;
+  defaults: AclDefaults;
+  etag: string;
+  revision: number;
+  has_previous: boolean;
+  generated: AclGeneratedRule[];
   groups: { name: string; members: string[] }[];
   hosts: { name: string; target: string }[];
   tag_owners: { tag: string; owners: string[] }[];
@@ -181,8 +196,29 @@ export function parseAclPolicy(value: unknown): AclPolicyDraft {
       : [];
   const tests = Array.isArray(source.tests) ? source.tests : [];
   const version = source.version === 1 || source.version === undefined ? 1 : Number(source.version);
+  const generated = Array.isArray(source.generated)
+    ? source.generated.flatMap((entry) => {
+        if (!entry || typeof entry !== "object") {
+          return [];
+        }
+        const row = entry as Record<string, unknown>;
+        return [
+          {
+            kind: typeof row.kind === "string" ? row.kind : "legacy_same_tag",
+            action: typeof row.action === "string" ? row.action : undefined,
+            applies: asStringArray(row.applies),
+            note: typeof row.note === "string" ? row.note : undefined,
+          } satisfies AclGeneratedRule,
+        ];
+      })
+    : [];
   return {
     version: Number.isFinite(version) ? version : 1,
+    defaults: source.defaults === "deny" ? "deny" : "same_tag",
+    etag: typeof source.etag === "string" ? source.etag : "",
+    revision: typeof source.revision === "number" ? source.revision : 1,
+    has_previous: source.has_previous === true,
+    generated,
     groups,
     hosts,
     tag_owners,
@@ -258,6 +294,7 @@ export function serializeAclPolicy(policy: AclPolicyDraft): Record<string, unkno
   );
   return {
     version: policy.version || 1,
+    defaults: policy.defaults,
     groups,
     ...(Object.keys(tag_owners).length > 0 ? { tag_owners } : {}),
     ...(Object.keys(hosts).length > 0 ? { hosts } : {}),

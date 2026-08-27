@@ -23,7 +23,7 @@ export default async function AclsPage() {
       <div className="stack">
         <PageHeader
           title="Access"
-          description="Group people, then write allow or deny rules against those groups, roles, or device tags. Policy is stored on the coordinator."
+          description="New organisations start deny-all. Existing documents keep the visible same-tag legacy default until you switch them to deny."
         />
         <div className="panel stack">
           {error ? <p className="error">{error}</p> : null}

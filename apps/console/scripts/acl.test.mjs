@@ -35,8 +35,10 @@ test("ACL drafts keep groups and compact empty selectors", () => {
     expandGroupMembers(["alice@example.test"], people).sort(),
     ["alice-user", "alice@example.test"].sort(),
   );
+  assert.equal(policy.defaults, "same_tag");
   assert.deepEqual(serializeAclPolicy(policy), {
     version: 1,
+    defaults: "same_tag",
     groups: { rangers: ["alice@example.test", "alice-user"] },
     rules: [{ action: "allow", src_groups: ["rangers"], dst_tags: ["store"] }],
   });
@@ -58,6 +60,7 @@ test("ACL drafts keep hosts, ports, and protocols across a round trip", () => {
   assert.deepEqual(policy.hosts, [{ name: "wiki", target: "10.0.0.10" }]);
   assert.deepEqual(serializeAclPolicy(policy), {
     version: 1,
+    defaults: "same_tag",
     groups: {},
     hosts: { wiki: "10.0.0.10" },
     rules: [
@@ -84,6 +87,7 @@ test("ACL drafts keep policy tests and tag owners across a round trip", () => {
   assert.equal(policy.tests.length, 1);
   assert.deepEqual(serializeAclPolicy(policy), {
     version: 1,
+    defaults: "same_tag",
     groups: {},
     tag_owners: { office: ["owner-1"] },
     tests: [{ name: "office isolated", src_tags: ["office"], dst_tags: ["store"], allow: false }],
@@ -119,6 +123,7 @@ test("ACL drafts keep SSH rules across a round trip", () => {
   ]);
   assert.deepEqual(serializeAclPolicy(policy), {
     version: 1,
+    defaults: "same_tag",
     groups: {},
     ssh: [
       {
@@ -129,6 +134,34 @@ test("ACL drafts keep SSH rules across a round trip", () => {
         check_period_secs: 3600,
       },
     ],
+    rules: [],
+  });
+});
+
+test("ACL drafts keep deny defaults and generated legacy rules", () => {
+  const policy = parseAclPolicy({
+    defaults: "deny",
+    etag: "abc",
+    revision: 2,
+    has_previous: true,
+    generated: [
+      {
+        kind: "legacy_same_tag",
+        action: "allow",
+        applies: ["same_tag", "untagged"],
+        note: "legacy",
+      },
+    ],
+    rules: [],
+  });
+  assert.equal(policy.defaults, "deny");
+  assert.equal(policy.etag, "abc");
+  assert.equal(policy.has_previous, true);
+  assert.equal(policy.generated[0]?.kind, "legacy_same_tag");
+  assert.deepEqual(serializeAclPolicy(policy), {
+    version: 1,
+    defaults: "deny",
+    groups: {},
     rules: [],
   });
 });

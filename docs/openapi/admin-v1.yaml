@@ -113,17 +113,18 @@ paths:
         "429": { description: Client exceeded 120 requests per minute }
   /api/v1/policy:
     get:
-      summary: Read ACL plus etag
+      summary: Read ACL plus etag, revision, and generated legacy default
       parameters:
         - $ref: "#/components/parameters/Organisation"
       responses:
         "200": { description: Policy }
     put:
-      summary: Replace ACL with optimistic concurrency
+      summary: Replace or roll back ACL; etag is required
       parameters:
         - $ref: "#/components/parameters/Organisation"
       responses:
         "204": { description: Updated }
+        "400": { description: Missing etag or no previous revision }
         "412": { description: etag mismatch }
         "413": { description: Request body larger than 64 KiB }
         "429": { description: Client exceeded 120 requests per minute }
