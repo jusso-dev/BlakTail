@@ -3,6 +3,27 @@ mod metrics;
 
 pub use metrics::CoordMetrics;
 
+#[derive(Debug, Serialize)]
+pub struct PolicyCheckReport {
+    pub version: u32,
+    pub groups: usize,
+    pub rules: usize,
+    pub tests: usize,
+    pub tag_owners: usize,
+}
+
+pub fn check_policy_document(document: &str) -> Result<PolicyCheckReport, String> {
+    let acl: Acl = serde_json::from_str(document).map_err(|error| error.to_string())?;
+    acl.validate().map_err(|error| error.to_string())?;
+    Ok(PolicyCheckReport {
+        version: acl.version,
+        groups: acl.groups.len(),
+        rules: acl.rules.len(),
+        tests: acl.tests.len(),
+        tag_owners: acl.tag_owners.len(),
+    })
+}
+
 use axum::{
     extract::{MatchedPath, Path as UrlPath, Query, Request, State},
     http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode},
@@ -1270,6 +1291,8 @@ async fn approve_device_authorization(
     } else {
         canonical_tags(input.tags)
     };
+    let acl = load_org_acl(&s.store, org_id).await?;
+    authorize_tag_assignment(&acl, &session, &tags)?;
     let mut tx = s.store.pool.begin().await?;
     let approval_query = match s.store.backend {
         DatabaseBackend::Sqlite => "SELECT id,device_code_hash,expires_at,approved_at,org_id,user_id FROM device_authorizations WHERE user_code_hash=$1",
@@ -1652,6 +1675,8 @@ async fn mint_join_key(
     let id = Uuid::new_v4();
     let expires_at = now() + input.expires_in_seconds;
     let tags = canonical_tags(input.tags);
+    let acl = load_org_acl(&s.store, org_id).await?;
+    authorize_tag_assignment(&acl, &session, &tags)?;
     let mut tx = s.store.pool.begin().await?;
     let changed = sqlx::query("INSERT INTO join_keys(id,org_id,key_hash,expires_at,single_use,created_at,user_id,user_role,tags_json) SELECT $1,id,$2,$3,$4,$5,$6,$7,$8 FROM orgs WHERE id=$9")
         .bind(id.to_string())
@@ -1768,6 +1793,15 @@ enum DeviceTag {
     Office,
     Ranger,
     Store,
+}
+impl DeviceTag {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Office => "office",
+            Self::Ranger => "ranger",
+            Self::Store => "store",
+        }
+    }
 }
 fn canonical_tags(mut tags: Vec<DeviceTag>) -> Vec<DeviceTag> {
     tags.sort();
@@ -3402,13 +3436,59 @@ fn dns_label(name: &str) -> String {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+fn default_policy_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Acl {
+    #[serde(default = "default_policy_version")]
+    version: u32,
     #[serde(default)]
     groups: BTreeMap<String, Vec<String>>,
     #[serde(default)]
+    tag_owners: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     rules: Vec<AclRule>,
+    #[serde(default)]
+    tests: Vec<AclTest>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AclTest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    src_role: Option<Role>,
+    #[serde(default)]
+    src_tags: Vec<DeviceTag>,
+    #[serde(default)]
+    src_user: String,
+    #[serde(default)]
+    src_email: String,
+    #[serde(default)]
+    dst_role: Option<Role>,
+    #[serde(default)]
+    dst_tags: Vec<DeviceTag>,
+    #[serde(default)]
+    dst_user: String,
+    #[serde(default)]
+    dst_email: String,
+    allow: bool,
+}
+
+impl Default for Acl {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            groups: BTreeMap::new(),
+            tag_owners: BTreeMap::new(),
+            rules: Vec::new(),
+            tests: Vec::new(),
+        }
+    }
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3453,8 +3533,76 @@ impl Subject {
         self
     }
 }
+async fn load_org_acl(store: &Store, org_id: Uuid) -> Result<Acl, ApiError> {
+    let acl: String = sqlx::query_scalar("SELECT acl_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&store.pool)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    serde_json::from_str(&acl).map_err(|_| ApiError::CorruptData)
+}
+
+fn authorize_tag_assignment(
+    acl: &Acl,
+    session: &Session,
+    tags: &[DeviceTag],
+) -> Result<(), ApiError> {
+    for tag in tags {
+        let Some(owners) = acl.tag_owners.get(tag.as_str()) else {
+            continue;
+        };
+        if session.role == Role::Owner {
+            continue;
+        }
+        let allowed = owners.iter().any(|owner| {
+            let owner = owner.trim();
+            (!session.user_id.is_empty() && owner.eq_ignore_ascii_case(session.user_id.trim()))
+                || (!session.email.is_empty() && owner.eq_ignore_ascii_case(session.email.trim()))
+                || owner.eq_ignore_ascii_case(session.role.as_str())
+        });
+        if !allowed {
+            return Err(ApiError::Forbidden);
+        }
+    }
+    Ok(())
+}
+
 impl Acl {
     fn validate(&self) -> Result<(), ApiError> {
+        if self.version != 1 {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported policy version {}",
+                self.version
+            )));
+        }
+        if self.tag_owners.len() > 16 {
+            return Err(ApiError::BadRequest(
+                "ACL tag owners are limited to 16 tags".into(),
+            ));
+        }
+        for (tag, owners) in &self.tag_owners {
+            if serde_json::from_value::<DeviceTag>(serde_json::Value::String(tag.clone())).is_err()
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL tag owner key {tag:?} is not a known tag"
+                )));
+            }
+            if owners.is_empty() {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL tag {tag} must list at least one owner"
+                )));
+            }
+            if owners.iter().any(|owner| owner.trim().is_empty()) {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL tag {tag} has an empty owner"
+                )));
+            }
+        }
+        if self.tests.len() > 128 {
+            return Err(ApiError::BadRequest(
+                "ACL tests are limited to 128 assertions".into(),
+            ));
+        }
         if self.groups.len() > 64 {
             return Err(ApiError::BadRequest(
                 "ACL groups are limited to 64 named sets".into(),
@@ -3501,6 +3649,30 @@ impl Acl {
                         "ACL rule refers to unknown group {name}"
                     )));
                 }
+            }
+        }
+        for (index, test) in self.tests.iter().enumerate() {
+            let src = Subject {
+                email: test.src_email.clone(),
+                ..Subject::new(test.src_role.unwrap_or(Role::Member), test.src_tags.clone())
+                    .with_user(test.src_user.clone())
+            };
+            let dst = Subject {
+                email: test.dst_email.clone(),
+                ..Subject::new(test.dst_role.unwrap_or(Role::Member), test.dst_tags.clone())
+                    .with_user(test.dst_user.clone())
+            };
+            let allowed = self.allows(&src, &dst);
+            if allowed != test.allow {
+                let label = if test.name.is_empty() {
+                    format!("#{}", index + 1)
+                } else {
+                    test.name.clone()
+                };
+                return Err(ApiError::BadRequest(format!(
+                    "ACL test {label} expected allow={} but evaluator returned {allowed}",
+                    test.allow
+                )));
             }
         }
         Ok(())
@@ -5288,6 +5460,90 @@ mod tests {
         }))
         .unwrap();
         assert!(unnamed.validate().is_err());
+    }
+
+    #[test]
+    fn policy_tests_and_tag_owners_validate_offline() {
+        let document = serde_json::json!({
+            "version": 1,
+            "groups": {"rangers":["alice-user"]},
+            "tag_owners": {"office":["alice-user","admin"]},
+            "rules":[{"action":"allow","src_groups":["rangers"],"dst_tags":["store"]}],
+            "tests":[
+                {
+                    "name":"ranger reaches store",
+                    "src_user":"alice-user",
+                    "dst_tags":["store"],
+                    "allow": true
+                },
+                {
+                    "name":"office stays isolated",
+                    "src_tags":["office"],
+                    "dst_tags":["store"],
+                    "allow": false
+                }
+            ]
+        });
+        let report = check_policy_document(&document.to_string()).unwrap();
+        assert_eq!(report.tests, 2);
+        assert_eq!(report.tag_owners, 1);
+        let inverted = serde_json::json!({
+            "rules":[{"action":"allow","src_tags":["office"],"dst_tags":["store"]}],
+            "tests":[{"src_tags":["office"],"dst_tags":["store"],"allow":false}]
+        });
+        assert!(check_policy_document(&inverted.to_string()).is_err());
+        assert!(check_policy_document(r#"{"version":2,"rules":[]}"#).is_err());
+        assert!(
+            check_policy_document(r#"{"tag_owners":{"unknown":["alice"]},"rules":[]}"#).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_owners_reject_admin_assignment_unless_listed() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "tag-owners-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let admin = signed_session(org.id, "admin-1", Role::Admin, now() + 60);
+        assert_eq!(
+            call(
+                &r,
+                Method::PUT,
+                &format!("/v1/orgs/{}/acl", org.id),
+                serde_json::json!({
+                    "tag_owners": {"office":["owner-1"]},
+                    "rules":[]
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", org.id),
+                serde_json::json!({"expires_in_seconds":60,"tags":["office"]}),
+                Some(&admin),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", org.id),
+                serde_json::json!({"expires_in_seconds":60,"tags":["office"]}),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::CREATED
+        );
     }
 
     #[tokio::test]

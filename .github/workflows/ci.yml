@@ -46,6 +46,7 @@ jobs:
         run: |
           cargo build --locked -p blaktail-config -p blaktail-coord
           scripts/config-contract-test.sh target/debug/blaktail-config target/debug/blaktail-coord
+          target/debug/blaktail-coord check-policy docs/policy/v1-example.json
 
       - name: Validate rollout scripts
         run: >-

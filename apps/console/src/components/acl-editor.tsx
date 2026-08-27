@@ -118,6 +118,7 @@ export function AclEditor({
                       className="secondary"
                       onClick={() =>
                         setPolicy((current) => ({
+                          ...current,
                           groups: current.groups.filter(
                             (item) => item.name !== group.name,
                           ),
