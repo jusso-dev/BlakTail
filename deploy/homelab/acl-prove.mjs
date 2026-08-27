@@ -120,8 +120,64 @@ if (command === "identity") {
     await chmod(path, 0o600);
     process.stdout.write(`ok minted ${tag} key\n`);
   }
+} else if (command === "create-wg-only") {
+  const name = process.argv[3];
+  const pubkey = process.argv[4];
+  const endpoint = process.argv[5];
+  const allowedIp = process.argv[6];
+  const tag = process.argv[7] ?? "office";
+  if (!name || !pubkey || !endpoint || !allowedIp) {
+    throw new Error(
+      "usage: acl-prove.mjs create-wg-only NAME PUBKEY ENDPOINT ALLOWED_IP [tag]",
+    );
+  }
+  const response = await fetch(
+    `${base}/v1/orgs/${row.coord_org_id}/wireguard-only-peers`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${sign(row)}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        name,
+        kind: "wireguard_only",
+        wg_public_key: pubkey,
+        endpoint,
+        allowed_ips: [allowedIp],
+        tags: [tag],
+      }),
+    },
+  );
+  if (response.status !== 201) {
+    throw new Error(
+      `create wg-only ${response.status} ${await response.text()}`,
+    );
+  }
+  const created = await response.json();
+  process.stdout.write(`${JSON.stringify(created)}\n`);
+} else if (command === "revoke-wg-only") {
+  const peerId = process.argv[3];
+  if (!peerId) {
+    throw new Error("usage: acl-prove.mjs revoke-wg-only PEER_ID");
+  }
+  const response = await fetch(
+    `${base}/v1/orgs/${row.coord_org_id}/wireguard-only-peers/${peerId}`,
+    {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${sign(row)}` },
+    },
+  );
+  if (response.status !== 204 && response.status !== 200) {
+    throw new Error(
+      `revoke wg-only ${response.status} ${await response.text()}`,
+    );
+  }
+  process.stdout.write(`ok revoked ${peerId}\n`);
 } else {
-  throw new Error("usage: acl-prove.mjs identity|mint|put-acl|put-dns|purge-nodes");
+  throw new Error(
+    "usage: acl-prove.mjs identity|mint|put-acl|put-dns|purge-nodes|create-wg-only|revoke-wg-only",
+  );
 }
 
 await sql.close({ timeout: 5 });

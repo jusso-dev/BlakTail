@@ -67,6 +67,23 @@ services:
       coord:
         condition: service_started
 
+  vanilla-wg:
+    image: debian:bookworm-slim
+    profiles: ["acl-prove"]
+    hostname: vanilla-wg
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
+    devices:
+      - /dev/net/tun
+    command: ["sleep", "infinity"]
+    depends_on:
+      coord:
+        condition: service_started
+
 volumes:
   agent-office-data:
   agent-store-data:
