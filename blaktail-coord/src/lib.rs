@@ -12,6 +12,7 @@ pub struct PolicyCheckReport {
     pub groups: usize,
     pub hosts: usize,
     pub rules: usize,
+    pub ssh: usize,
     pub tests: usize,
     pub tag_owners: usize,
 }
@@ -24,6 +25,7 @@ pub fn check_policy_document(document: &str) -> Result<PolicyCheckReport, String
         groups: acl.groups.len(),
         hosts: acl.hosts.len(),
         rules: acl.rules.len(),
+        ssh: acl.ssh.len(),
         tests: acl.tests.len(),
         tag_owners: acl.tag_owners.len(),
     })
@@ -3852,6 +3854,8 @@ struct Acl {
     #[serde(default)]
     rules: Vec<AclRule>,
     #[serde(default)]
+    ssh: Vec<AclSshRule>,
+    #[serde(default)]
     tests: Vec<AclTest>,
 }
 
@@ -3882,6 +3886,8 @@ struct AclTest {
     dst_port: Option<u16>,
     #[serde(default)]
     protocol: Option<AclProtocol>,
+    #[serde(default)]
+    ssh_user: String,
     allow: bool,
 }
 
@@ -3893,6 +3899,7 @@ impl Default for Acl {
             tag_owners: BTreeMap::new(),
             hosts: BTreeMap::new(),
             rules: Vec::new(),
+            ssh: Vec::new(),
             tests: Vec::new(),
         }
     }
@@ -3919,6 +3926,35 @@ struct AclRule {
     dst_ports: Vec<String>,
     #[serde(default)]
     protocols: Vec<AclProtocol>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AclSshRule {
+    action: AclSshAction,
+    #[serde(default)]
+    src_roles: Vec<Role>,
+    #[serde(default)]
+    src_tags: Vec<DeviceTag>,
+    #[serde(default)]
+    src_groups: Vec<String>,
+    #[serde(default)]
+    dst_roles: Vec<Role>,
+    #[serde(default)]
+    dst_tags: Vec<DeviceTag>,
+    #[serde(default)]
+    dst_groups: Vec<String>,
+    users: Vec<String>,
+    #[serde(default)]
+    check_period_secs: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AclSshAction {
+    Allow,
+    Deny,
+    Check,
 }
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -4106,6 +4142,60 @@ impl Acl {
                 ));
             }
         }
+        if self.ssh.len() > 32 {
+            return Err(ApiError::BadRequest(
+                "ACL SSH rules are limited to 32 entries".into(),
+            ));
+        }
+        if self.ssh.iter().any(|rule| {
+            rule.src_roles.is_empty()
+                && rule.src_tags.is_empty()
+                && rule.src_groups.is_empty()
+                && rule.dst_roles.is_empty()
+                && rule.dst_tags.is_empty()
+                && rule.dst_groups.is_empty()
+        }) {
+            return Err(ApiError::BadRequest(
+                "ACL SSH rules must select a source or destination".into(),
+            ));
+        }
+        for rule in &self.ssh {
+            for name in rule.src_groups.iter().chain(rule.dst_groups.iter()) {
+                if !self.groups.contains_key(name) {
+                    return Err(ApiError::BadRequest(format!(
+                        "ACL SSH rule refers to unknown group {name}"
+                    )));
+                }
+            }
+            if rule.users.is_empty() || rule.users.len() > 16 {
+                return Err(ApiError::BadRequest(
+                    "ACL SSH rules must name 1-16 operating-system users".into(),
+                ));
+            }
+            for user in &rule.users {
+                if !valid_ssh_os_user(user) {
+                    return Err(ApiError::BadRequest(format!(
+                        "ACL SSH user {user:?} must be * or a 1-32 character login"
+                    )));
+                }
+            }
+            match (rule.action, rule.check_period_secs) {
+                (AclSshAction::Check, Some(period))
+                    if !(1..=7 * 24 * 60 * 60).contains(&period) =>
+                {
+                    return Err(ApiError::BadRequest(
+                        "ACL SSH check period must be 1-604800 seconds".into(),
+                    ));
+                }
+                (AclSshAction::Check, _) => {}
+                (_, Some(_)) => {
+                    return Err(ApiError::BadRequest(
+                        "ACL SSH check period is only valid on check actions".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
         for (index, test) in self.tests.iter().enumerate() {
             if !test.dst_host.is_empty() && !self.hosts.contains_key(&test.dst_host) {
                 return Err(ApiError::BadRequest(format!(
@@ -4123,6 +4213,19 @@ impl Acl {
                     "ACL ICMP tests cannot name a destination port".into(),
                 ));
             }
+            if !test.ssh_user.is_empty()
+                && (test.dst_port.is_some() || test.protocol.is_some() || !test.dst_host.is_empty())
+            {
+                return Err(ApiError::BadRequest(
+                    "ACL SSH tests cannot name a host, port, or protocol".into(),
+                ));
+            }
+            if !test.ssh_user.is_empty() && !valid_ssh_os_user(&test.ssh_user) {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL SSH test user {:?} must be * or a 1-32 character login",
+                    test.ssh_user
+                )));
+            }
             let src = Subject {
                 email: test.src_email.clone(),
                 ..Subject::new(test.src_role.unwrap_or(Role::Member), test.src_tags.clone())
@@ -4133,13 +4236,17 @@ impl Acl {
                 ..Subject::new(test.dst_role.unwrap_or(Role::Member), test.dst_tags.clone())
                     .with_user(test.dst_user.clone())
             };
-            let allowed = self.allows_flow(
-                &src,
-                &dst,
-                test.dst_port,
-                test.protocol,
-                (!test.dst_host.is_empty()).then_some(test.dst_host.as_str()),
-            );
+            let allowed = if test.ssh_user.is_empty() {
+                self.allows_flow(
+                    &src,
+                    &dst,
+                    test.dst_port,
+                    test.protocol,
+                    (!test.dst_host.is_empty()).then_some(test.dst_host.as_str()),
+                )
+            } else {
+                self.allows_ssh(&src, &dst, &test.ssh_user)
+            };
             if allowed != test.allow {
                 let label = if test.name.is_empty() {
                     format!("#{}", index + 1)
@@ -4236,6 +4343,60 @@ impl Acl {
         }
         port_spec_matches(&rule.dst_ports, port) && protocol_matches(&rule.protocols, protocol)
     }
+
+    fn allows_ssh(&self, s: &Subject, d: &Subject, user: &str) -> bool {
+        let matching: Vec<_> = self
+            .ssh
+            .iter()
+            .filter(|rule| self.ssh_rule_matches(rule, s, d, user))
+            .collect();
+        if matching
+            .iter()
+            .any(|rule| rule.action == AclSshAction::Deny)
+        {
+            return false;
+        }
+        matching
+            .iter()
+            .any(|rule| matches!(rule.action, AclSshAction::Allow | AclSshAction::Check))
+    }
+
+    fn ssh_rule_matches(&self, rule: &AclSshRule, s: &Subject, d: &Subject, user: &str) -> bool {
+        if !selector(
+            &rule.src_roles,
+            &rule.src_tags,
+            &rule.src_groups,
+            s,
+            &self.groups,
+        ) {
+            return false;
+        }
+        if !selector(
+            &rule.dst_roles,
+            &rule.dst_tags,
+            &rule.dst_groups,
+            d,
+            &self.groups,
+        ) {
+            return false;
+        }
+        rule.users
+            .iter()
+            .any(|allowed| allowed == "*" || allowed == user)
+    }
+}
+
+fn valid_ssh_os_user(user: &str) -> bool {
+    if user == "*" {
+        return true;
+    }
+    let mut chars = user.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    user.len() <= 32
+        && (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 fn parse_acl_port_spec(value: &str) -> Result<(u16, u16), ApiError> {
     let value = value.trim();
@@ -6257,6 +6418,97 @@ mod tests {
             Some(AclProtocol::Tcp),
             Some("wiki")
         ));
+    }
+
+    #[test]
+    fn policy_ssh_rules_validate_offline_and_fail_closed() {
+        let document = serde_json::json!({
+            "version": 1,
+            "groups": {"rangers":["alice-user"]},
+            "ssh":[
+                {
+                    "action":"allow",
+                    "src_groups":["rangers"],
+                    "dst_tags":["store"],
+                    "users":["ubuntu","deploy"]
+                },
+                {
+                    "action":"check",
+                    "src_groups":["rangers"],
+                    "dst_tags":["office"],
+                    "users":["*"],
+                    "check_period_secs": 3600
+                },
+                {
+                    "action":"deny",
+                    "src_groups":["rangers"],
+                    "dst_tags":["store"],
+                    "users":["root"]
+                }
+            ],
+            "tests":[
+                {
+                    "name":"ranger ssh deploy",
+                    "src_user":"alice-user",
+                    "dst_tags":["store"],
+                    "ssh_user":"deploy",
+                    "allow": true
+                },
+                {
+                    "name":"ranger ssh root denied",
+                    "src_user":"alice-user",
+                    "dst_tags":["store"],
+                    "ssh_user":"root",
+                    "allow": false
+                },
+                {
+                    "name":"ranger ssh office with check",
+                    "src_user":"alice-user",
+                    "dst_tags":["office"],
+                    "ssh_user":"ubuntu",
+                    "allow": true
+                },
+                {
+                    "name":"same-tag ssh stays denied",
+                    "src_tags":["store"],
+                    "dst_tags":["store"],
+                    "ssh_user":"ubuntu",
+                    "allow": false
+                }
+            ]
+        });
+        let report = check_policy_document(&document.to_string()).unwrap();
+        assert_eq!(report.ssh, 3);
+        assert_eq!(report.tests, 4);
+        let acl: Acl = serde_json::from_value(document).unwrap();
+        let ranger = Subject::new(Role::Member, vec![]).with_user("alice-user");
+        let store = Subject::new(Role::Member, vec![DeviceTag::Store]);
+        assert!(acl.allows_ssh(&ranger, &store, "ubuntu"));
+        assert!(!acl.allows_ssh(&ranger, &store, "root"));
+        assert!(!acl.allows_ssh(
+            &Subject::new(Role::Member, vec![DeviceTag::Store]),
+            &store,
+            "ubuntu"
+        ));
+        assert!(
+            check_policy_document(r#"{"ssh":[{"action":"allow","users":["ubuntu"]}]}"#).is_err()
+        );
+        assert!(check_policy_document(
+            r#"{"ssh":[{"action":"allow","src_tags":["office"],"users":[]}]}"#
+        )
+        .is_err());
+        assert!(check_policy_document(
+            r#"{"ssh":[{"action":"allow","src_tags":["office"],"users":["ubuntu"],"check_period_secs":60}]}"#
+        )
+        .is_err());
+        assert!(check_policy_document(
+            r#"{"ssh":[{"action":"allow","src_tags":["office"],"users":["ubuntu"]}],"tests":[{"ssh_user":"ubuntu","dst_port":22,"allow":true}]}"#
+        )
+        .is_err());
+        assert!(check_policy_document(
+            r#"{"ssh":[{"action":"allow","src_tags":["office"],"users":["ubuntu"],"tty":true}]}"#
+        )
+        .is_err());
     }
 
     #[tokio::test]

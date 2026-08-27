@@ -5,8 +5,10 @@ import { saveAclAction } from "@/app/actions";
 import {
   ACL_PROTOCOLS,
   ACL_ROLES,
+  ACL_SSH_ACTIONS,
   ACL_TAGS,
   emptyRule,
+  emptySshRule,
   expandGroupMembers,
   memberLabel,
   parseAclPolicy,
@@ -16,6 +18,7 @@ import {
   type AclPerson,
   type AclPolicyDraft,
   type AclRuleDraft,
+  type AclSshDraft,
 } from "@/lib/acl";
 import { canMutateTailnet, roleLabel, type OrgRole } from "@/lib/roles";
 
@@ -92,6 +95,15 @@ export function AclEditor({
     setPolicy((current) => ({
       ...current,
       rules: current.rules.map((rule, ruleIndex) =>
+        ruleIndex === index ? next : rule,
+      ),
+    }));
+  }
+
+  function updateSsh(index: number, next: AclSshDraft) {
+    setPolicy((current) => ({
+      ...current,
+      ssh: current.ssh.map((rule, ruleIndex) =>
         ruleIndex === index ? next : rule,
       ),
     }));
@@ -563,6 +575,166 @@ export function AclEditor({
         ) : (
           <p className="muted">Members can read access policy but cannot change it.</p>
         )}
+      </section>
+
+      <section className="acl-section">
+        <div>
+          <h2>SSH</h2>
+          <p className="muted">
+            Decide which operating-system users a source may open on a
+            destination. Check requires periodic re-authentication. Agents do
+            not yet enforce these rules; tests can already assert them.
+          </p>
+        </div>
+        {policy.ssh.length === 0 ? (
+          <p className="muted">No SSH rules yet.</p>
+        ) : (
+          <ol className="acl-rule-list">
+            {policy.ssh.map((rule, index) => (
+              <li key={`ssh-${index}`} className="acl-rule">
+                <div className="acl-rule-head">
+                  <label>
+                    Action
+                    <select
+                      value={rule.action}
+                      disabled={!canMutate}
+                      onChange={(event) =>
+                        updateSsh(index, {
+                          ...rule,
+                          action: event.target.value as AclSshDraft["action"],
+                        })
+                      }
+                    >
+                      {ACL_SSH_ACTIONS.map((action) => (
+                        <option key={action} value={action}>
+                          {action}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {canMutate ? (
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() =>
+                        setPolicy((current) => ({
+                          ...current,
+                          ssh: current.ssh.filter(
+                            (_, ruleIndex) => ruleIndex !== index,
+                          ),
+                        }))
+                      }
+                    >
+                      Remove SSH rule
+                    </button>
+                  ) : null}
+                </div>
+                <div className="acl-rule-grid">
+                  <SelectorSet
+                    legend="From roles"
+                    values={rule.src_roles}
+                    options={ACL_ROLES}
+                    disabled={!canMutate}
+                    labelFor={roleLabel}
+                    onChange={(src_roles) => updateSsh(index, { ...rule, src_roles })}
+                  />
+                  <SelectorSet
+                    legend="From tags"
+                    values={rule.src_tags}
+                    options={ACL_TAGS}
+                    disabled={!canMutate}
+                    labelFor={(tag) => tag}
+                    onChange={(src_tags) => updateSsh(index, { ...rule, src_tags })}
+                  />
+                  <SelectorSet
+                    legend="From groups"
+                    values={rule.src_groups}
+                    options={groupNames}
+                    disabled={!canMutate}
+                    labelFor={(name) => name}
+                    onChange={(src_groups) =>
+                      updateSsh(index, { ...rule, src_groups })
+                    }
+                  />
+                  <SelectorSet
+                    legend="To roles"
+                    values={rule.dst_roles}
+                    options={ACL_ROLES}
+                    disabled={!canMutate}
+                    labelFor={roleLabel}
+                    onChange={(dst_roles) => updateSsh(index, { ...rule, dst_roles })}
+                  />
+                  <SelectorSet
+                    legend="To tags"
+                    values={rule.dst_tags}
+                    options={ACL_TAGS}
+                    disabled={!canMutate}
+                    labelFor={(tag) => tag}
+                    onChange={(dst_tags) => updateSsh(index, { ...rule, dst_tags })}
+                  />
+                  <SelectorSet
+                    legend="To groups"
+                    values={rule.dst_groups}
+                    options={groupNames}
+                    disabled={!canMutate}
+                    labelFor={(name) => name}
+                    onChange={(dst_groups) =>
+                      updateSsh(index, { ...rule, dst_groups })
+                    }
+                  />
+                  <label className="acl-selector">
+                    <span>Operating-system users</span>
+                    <input
+                      value={rule.users.join(",")}
+                      disabled={!canMutate}
+                      placeholder="ubuntu,deploy,*"
+                      onChange={(event) =>
+                        updateSsh(index, {
+                          ...rule,
+                          users: event.target.value
+                            .split(",")
+                            .map((item) => item.trim())
+                            .filter(Boolean),
+                        })
+                      }
+                    />
+                  </label>
+                  {rule.action === "check" ? (
+                    <label className="acl-selector">
+                      <span>Check period (seconds)</span>
+                      <input
+                        value={rule.check_period_secs}
+                        disabled={!canMutate}
+                        placeholder="3600"
+                        onChange={(event) =>
+                          updateSsh(index, {
+                            ...rule,
+                            check_period_secs: event.target.value,
+                          })
+                        }
+                      />
+                    </label>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ol>
+        )}
+        {canMutate ? (
+          <button
+            type="button"
+            className="secondary"
+            data-testid="acl-add-ssh"
+            onClick={() =>
+              setPolicy((current) => ({
+                ...current,
+                ssh: [...current.ssh, emptySshRule()],
+              }))
+            }
+          >
+            Add SSH rule
+          </button>
+        ) : null}
       </section>
 
       {canMutate ? (

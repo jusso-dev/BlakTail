@@ -34,6 +34,14 @@ unknown field rejects the document.
       "protocols": ["tcp"]
     }
   ],
+  "ssh": [
+    {
+      "action": "allow",
+      "src_groups": ["rangers"],
+      "dst_tags": ["store"],
+      "users": ["ubuntu", "deploy"]
+    }
+  ],
   "tests": [
     {
       "name": "ranger reaches store ssh",
@@ -48,6 +56,13 @@ unknown field rejects the document.
       "src_tags": ["office"],
       "dst_tags": ["store"],
       "allow": false
+    },
+    {
+      "name": "ranger ssh deploy",
+      "src_user": "alice-user",
+      "dst_tags": ["store"],
+      "ssh_user": "deploy",
+      "allow": true
     }
   ]
 }
@@ -62,8 +77,13 @@ unknown field rejects the document.
 - `rules` select roles, tags, groups, optional `dst_hosts`, `dst_ports`
   (`22`, `80-443`, or `*`), and `protocols` (`tcp`, `udp`, `icmp`). ICMP
   cannot name ports. Peer-map evaluation still includes a peer when any
-  port on that path is allowed; packet-level enforcement and SSH stay later.
-- `tests` can name `dst_host`, `dst_port`, and `protocol`. A mismatch fails
-  closed. Host-only rules never become the implicit same-tag default.
+  port on that path is allowed; packet-level enforcement stays later.
+- `ssh` selects the same source and destination roles, tags, and groups,
+  plus operating-system `users` (`ubuntu` or `*`) and `allow` / `deny` /
+  `check`. `check` may set `check_period_secs` (1-604800). SSH evaluation
+  has no same-tag default. Agents do not yet enforce these rules.
+- `tests` can name `dst_host`, `dst_port`, and `protocol`, or `ssh_user`
+  for an SSH decision. A mismatch fails closed. Host-only rules never
+  become the implicit same-tag default.
 
 Existing documents without `version` deserialize as v1.
