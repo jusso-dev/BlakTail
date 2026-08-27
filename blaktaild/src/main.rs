@@ -1059,7 +1059,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                 }
             }
             write_state(state_dir, &state)?;
-            let restored = restore_peers(network.as_mut(), &state)?;
+            let restored = restore_peers(network.as_mut(), &state, state_dir)?;
             if restored > 0 {
                 info!(restored, "restored persisted WireGuard peers");
             }
@@ -1098,7 +1098,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                 state.router_previous_ipv4_forward,
             )?;
             write_state(state_dir, &state)?;
-            let restored = restore_peers(network.as_mut(), &state)?;
+            let restored = restore_peers(network.as_mut(), &state, state_dir)?;
             if restored > 0 {
                 info!(restored, "restored persisted WireGuard peers");
             }
@@ -1153,10 +1153,11 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
             );
             for peer in state.peers {
                 println!(
-                    "  {} {} {}",
+                    "  {} {} {} {}",
                     peer.name,
                     peer.endpoint.as_deref().unwrap_or("endpoint unknown"),
-                    peer.allowed_ips.join(",")
+                    peer.allowed_ips.join(","),
+                    peer.ingress_summary()
                 );
             }
         }

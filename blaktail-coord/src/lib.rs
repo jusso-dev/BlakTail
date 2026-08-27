@@ -2548,6 +2548,28 @@ struct Peer {
     relay_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ingress: Option<PeerIngress>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PeerIngress {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    all: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tcp: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    udp: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    icmp: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deny_tcp: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deny_udp: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    deny_icmp: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ssh_users: Vec<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct PeersResponse {
@@ -2679,6 +2701,7 @@ async fn list_peers(
                     tags: tags.clone(),
                     relay_endpoint: row.try_get(9)?,
                     kind: String::new(),
+                    ingress: None,
                 },
                 Subject::new(
                     row.try_get::<String, _>(7)?
@@ -2698,6 +2721,7 @@ async fn list_peers(
             if !acl.allows(&source, &destination) {
                 return None;
             }
+            peer.ingress = Some(acl.peer_ingress(&destination, &source));
             let exit_matches = requested_exit.is_some_and(|requested| {
                 requested == peer.id.to_string()
                     || requested == peer.name
@@ -2742,6 +2766,7 @@ async fn list_peers(
             tags,
             relay_endpoint: None,
             kind: wg_only::KIND.into(),
+            ingress: Some(acl.peer_ingress(&destination, &source)),
         });
     }
     let mut assigned_ips: Vec<String> = serde_json::from_str(&source_addresses).unwrap_or_default();
@@ -4614,7 +4639,8 @@ impl Acl {
         Ok(())
     }
     fn allows(&self, s: &Subject, d: &Subject) -> bool {
-        self.allows_flow(s, d, None, None, None)
+        let ingress = self.peer_ingress(s, d);
+        ingress.all || ingress.icmp || !ingress.tcp.is_empty() || !ingress.udp.is_empty()
     }
 
     fn allows_flow(
@@ -4718,6 +4744,163 @@ impl Acl {
             .any(|rule| matches!(rule.action, AclSshAction::Allow | AclSshAction::Check))
     }
 
+    fn peer_ingress(&self, s: &Subject, d: &Subject) -> PeerIngress {
+        let ssh_users = self.ssh_users_for(s, d);
+        let matching: Vec<_> = self
+            .rules
+            .iter()
+            .filter(|rule| self.rule_matches(rule, s, d, None, None, None))
+            .collect();
+        let unrestricted = |rule: &&AclRule| rule.dst_ports.is_empty() && rule.protocols.is_empty();
+        if matching
+            .iter()
+            .any(|rule| rule.action == Action::Deny && unrestricted(rule))
+        {
+            return PeerIngress {
+                ssh_users,
+                ..PeerIngress::default()
+            };
+        }
+        let all = self.implicit_default_allows(s, d)
+            || matching
+                .iter()
+                .any(|rule| rule.action == Action::Allow && unrestricted(rule));
+        let mut tcp = BTreeSet::new();
+        let mut udp = BTreeSet::new();
+        let mut icmp = all;
+        let mut deny_tcp = BTreeSet::new();
+        let mut deny_udp = BTreeSet::new();
+        let mut deny_icmp = false;
+        if !all {
+            for rule in matching.iter().filter(|rule| rule.action == Action::Allow) {
+                Self::collect_service_specs(rule, &mut tcp, &mut udp, &mut icmp);
+            }
+        }
+        for rule in matching.iter().filter(|rule| rule.action == Action::Deny) {
+            let mut denied_icmp = false;
+            let mut denied_tcp = BTreeSet::new();
+            let mut denied_udp = BTreeSet::new();
+            Self::collect_service_specs(rule, &mut denied_tcp, &mut denied_udp, &mut denied_icmp);
+            deny_tcp.extend(denied_tcp);
+            deny_udp.extend(denied_udp);
+            deny_icmp |= denied_icmp;
+        }
+        if deny_icmp {
+            icmp = false;
+        }
+        if !all && !ssh_users.is_empty() && !specs_cover(&deny_tcp, 22) && !specs_cover(&tcp, 22) {
+            tcp.insert("22".into());
+        }
+        PeerIngress {
+            all,
+            tcp: tcp.into_iter().collect(),
+            udp: udp.into_iter().collect(),
+            icmp,
+            deny_tcp: deny_tcp.into_iter().collect(),
+            deny_udp: deny_udp.into_iter().collect(),
+            deny_icmp,
+            ssh_users,
+        }
+    }
+
+    fn implicit_default_allows(&self, s: &Subject, d: &Subject) -> bool {
+        match self.defaults {
+            AclDefaults::Deny => false,
+            AclDefaults::SameTag => {
+                (s.tags.is_empty() && d.tags.is_empty())
+                    || s.tags.iter().any(|tag| d.tags.contains(tag))
+            }
+        }
+    }
+
+    fn collect_service_specs(
+        rule: &AclRule,
+        tcp: &mut BTreeSet<String>,
+        udp: &mut BTreeSet<String>,
+        icmp: &mut bool,
+    ) {
+        let all_protocols = rule.protocols.is_empty();
+        let tcp_ok = all_protocols || rule.protocols.contains(&AclProtocol::Tcp);
+        let udp_ok = all_protocols || rule.protocols.contains(&AclProtocol::Udp);
+        let icmp_ok = all_protocols || rule.protocols.contains(&AclProtocol::Icmp);
+        if rule.dst_ports.is_empty() {
+            if tcp_ok {
+                tcp.insert("1-65535".into());
+            }
+            if udp_ok {
+                udp.insert("1-65535".into());
+            }
+            if icmp_ok {
+                *icmp = true;
+            }
+            return;
+        }
+        for spec in &rule.dst_ports {
+            if tcp_ok {
+                tcp.insert(spec.clone());
+            }
+            if udp_ok {
+                udp.insert(spec.clone());
+            }
+        }
+    }
+
+    fn ssh_users_for(&self, s: &Subject, d: &Subject) -> Vec<String> {
+        let mut allow = BTreeSet::new();
+        let mut deny = BTreeSet::new();
+        let mut allow_star = false;
+        let mut deny_star = false;
+        for rule in &self.ssh {
+            if !self.ssh_subjects_match(rule, s, d) {
+                continue;
+            }
+            let star = rule.users.iter().any(|user| user == "*");
+            match rule.action {
+                AclSshAction::Deny => {
+                    deny_star |= star;
+                    deny.extend(
+                        rule.users
+                            .iter()
+                            .filter(|user| user.as_str() != "*")
+                            .cloned(),
+                    );
+                }
+                AclSshAction::Allow | AclSshAction::Check => {
+                    allow_star |= star;
+                    allow.extend(
+                        rule.users
+                            .iter()
+                            .filter(|user| user.as_str() != "*")
+                            .cloned(),
+                    );
+                }
+            }
+        }
+        if deny_star {
+            return Vec::new();
+        }
+        if allow_star {
+            return vec!["*".into()];
+        }
+        allow.difference(&deny).cloned().collect()
+    }
+
+    fn ssh_subjects_match(&self, rule: &AclSshRule, s: &Subject, d: &Subject) -> bool {
+        selector(
+            &rule.src_roles,
+            &rule.src_tags,
+            &rule.src_groups,
+            s,
+            &self.groups,
+        ) && selector(
+            &rule.dst_roles,
+            &rule.dst_tags,
+            &rule.dst_groups,
+            d,
+            &self.groups,
+        )
+    }
+
     fn ssh_rule_matches(&self, rule: &AclSshRule, s: &Subject, d: &Subject, user: &str) -> bool {
         if !selector(
             &rule.src_roles,
@@ -4777,6 +4960,12 @@ fn parse_acl_port_spec(value: &str) -> Result<(u16, u16), ApiError> {
         )));
     }
     Ok((start, end))
+}
+
+fn specs_cover(specs: &BTreeSet<String>, port: u16) -> bool {
+    specs.iter().any(|spec| {
+        parse_acl_port_spec(spec).is_ok_and(|(start, end)| (start..=end).contains(&port))
+    })
 }
 
 fn port_spec_matches(specs: &[String], port: Option<u16>) -> bool {
@@ -6888,6 +7077,68 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn peer_ingress_compiles_ports_denies_and_ssh_users() {
+        let same_tag = Acl::default();
+        let office = Subject::new(Role::Member, vec![DeviceTag::Office]);
+        let store = Subject::new(Role::Member, vec![DeviceTag::Store]);
+        let other_office = Subject::new(Role::Owner, vec![DeviceTag::Office]);
+        let same = same_tag.peer_ingress(&office, &other_office);
+        assert!(same.all);
+        assert!(same.icmp);
+        assert!(same.ssh_users.is_empty());
+        assert!(!same_tag.peer_ingress(&office, &store).all);
+
+        let restricted: Acl = serde_json::from_value(serde_json::json!({
+            "defaults": "deny",
+            "groups": {"crew":["alice-user"]},
+            "rules":[
+                {
+                    "action":"allow",
+                    "src_groups":["crew"],
+                    "dst_tags":["store"],
+                    "dst_ports":["8080"],
+                    "protocols":["tcp"]
+                },
+                {
+                    "action":"deny",
+                    "src_groups":["crew"],
+                    "dst_tags":["store"],
+                    "dst_ports":["8081"],
+                    "protocols":["tcp"]
+                }
+            ],
+            "ssh":[
+                {
+                    "action":"allow",
+                    "src_groups":["crew"],
+                    "dst_tags":["store"],
+                    "users":["blaktail"]
+                },
+                {
+                    "action":"deny",
+                    "src_groups":["crew"],
+                    "dst_tags":["store"],
+                    "users":["intruder"]
+                }
+            ]
+        }))
+        .unwrap();
+        let ranger = Subject::new(Role::Member, vec![]).with_user("alice-user");
+        let ingress = restricted.peer_ingress(&ranger, &store);
+        assert!(!ingress.all);
+        assert_eq!(ingress.tcp, vec!["22", "8080"]);
+        assert!(ingress.udp.is_empty());
+        assert!(!ingress.icmp);
+        assert_eq!(ingress.deny_tcp, vec!["8081"]);
+        assert_eq!(ingress.ssh_users, vec!["blaktail"]);
+        assert!(restricted.allows(&ranger, &store));
+        assert!(restricted.allows_flow(&ranger, &store, Some(8080), Some(AclProtocol::Tcp), None));
+        assert!(!restricted.allows_flow(&ranger, &store, Some(8081), Some(AclProtocol::Tcp), None));
+        assert!(restricted.allows_ssh(&ranger, &store, "blaktail"));
+        assert!(!restricted.allows_ssh(&ranger, &store, "intruder"));
+    }
+
     #[tokio::test]
     async fn tag_owners_reject_admin_assignment_unless_listed() {
         let store = Store::memory().await.unwrap();
@@ -7808,6 +8059,63 @@ mod tests {
         assert_eq!(from_alice.peers.len(), 1);
         assert_eq!(from_alice.peers[0].name, "store-1");
         assert!(from_bob.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn peer_snapshot_includes_compiled_ingress() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "ingress-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let office =
+            register_test_node(&router, org.id, &owner, "office-1", "office-key", &[]).await;
+        register_test_node(&router, org.id, &owner, "store-1", "store-key", &[]).await;
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/acl", org.id),
+                serde_json::json!({
+                    "defaults":"deny",
+                    "groups":{"crew":["owner-1"]},
+                    "rules":[{
+                        "action":"allow",
+                        "src_groups":["crew"],
+                        "dst_groups":["crew"],
+                        "dst_ports":["8080"],
+                        "protocols":["tcp"]
+                    }],
+                    "ssh":[{
+                        "action":"allow",
+                        "src_groups":["crew"],
+                        "dst_groups":["crew"],
+                        "users":["blaktail"]
+                    }]
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let from_office: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", office.id),
+                serde_json::Value::Null,
+                Some(&office.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(from_office.peers.len(), 1);
+        assert_eq!(from_office.peers[0].name, "store-1");
+        let ingress = from_office.peers[0].ingress.as_ref().expect("ingress");
+        assert!(!ingress.all);
+        assert_eq!(ingress.tcp, vec!["22", "8080"]);
+        assert_eq!(ingress.ssh_users, vec!["blaktail"]);
+        assert!(!ingress.icmp);
     }
 
     #[tokio::test]
