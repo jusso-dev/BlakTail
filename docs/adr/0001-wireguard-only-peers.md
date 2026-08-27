@@ -44,7 +44,9 @@ peers without a later gateway design.
 ## Follow-up
 
 The console now lists unmanaged peers separately from managed devices and
-creates them with stored kind `wireguard_only`. A vanilla `wg` reachability
-proof and overlap rotation still live in later #45 slices. This record only
-locks the first topology so those slices do not silently grow into a gateway
-product.
+creates them with stored kind `wireguard_only`. Homelab
+`deploy/homelab/prove-wg-only.sh` enrols one Linux agent and a vanilla
+`wg` container (no `blaktaild`) and proves overlay ping both ways, then
+revokes the peer. Overlap rotation still lives in a later #45 slice. This
+record only locks the first topology so those slices do not silently grow
+into a gateway product.
