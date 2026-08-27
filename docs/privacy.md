@@ -52,7 +52,10 @@ Expired browser authorisations are removed by the coordinator, and relay state i
 short-lived in memory. Coordinator audit rows older than the organisation's
 configured retention (default 90 days) are purged when the audit API is read.
 Revoked node rows remain until an owner tombstones them; tombstones keep the
-node id for audit and release the live name and WireGuard key.
+node id for audit and release the live name and WireGuard key. Inventory reads
+hard-delete tombstones older than seven days without touching live nodes;
+`node.tombstoned` audit rows stay until the organisation's audit retention
+expires.
 Console account, session, invitation, bootstrap-state, rate-limit, and audit
 retention follows Better Auth plus the operator's database procedures. Used,
 expired, and revoked invitation rows are not currently purged automatically. Logs
