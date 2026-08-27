@@ -61,7 +61,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 8;
+pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 const MAX_CONTROL_UPDATE_WAIT_SECS: u64 = 25;
 const DEFAULT_AUDIT_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const DEFAULT_TOMBSTONE_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
@@ -157,6 +157,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         name: "organisation control revision",
         postgres_sql: include_str!("../migrations/postgres/0008_control_revision.sql"),
+    },
+    Migration {
+        version: 9,
+        name: "oauth access tokens",
+        postgres_sql: include_str!("../migrations/postgres/0009_oauth_access_tokens.sql"),
     },
 ];
 
@@ -351,6 +356,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             6 => migrate_sqlite_to_v6(&mut tx).await?,
             7 => migrate_sqlite_to_v7(&mut tx).await?,
             8 => migrate_sqlite_to_v8(&mut tx).await?,
+            9 => migrate_sqlite_to_v9(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -364,6 +370,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             6 => "PRAGMA user_version=6",
             7 => "PRAGMA user_version=7",
             8 => "PRAGMA user_version=8",
+            9 => "PRAGMA user_version=9",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -684,6 +691,31 @@ async fn migrate_sqlite_to_v8(
     tx: &mut sqlx::Transaction<'_, sqlx::Any>,
 ) -> Result<(), sqlx::Error> {
     ensure_column(tx, "orgs", "control_revision", "INTEGER NOT NULL DEFAULT 1").await
+}
+
+async fn migrate_sqlite_to_v9(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+            api_client_id TEXT NOT NULL REFERENCES api_clients(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL UNIQUE,
+            token_prefix TEXT NOT NULL,
+            scopes_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(scopes_json)),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            last_used_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS oauth_access_tokens_client_idx
+            ON oauth_access_tokens(api_client_id, expires_at);
+        CREATE INDEX IF NOT EXISTS oauth_access_tokens_org_idx
+            ON oauth_access_tokens(org_id, expires_at);",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
@@ -7414,7 +7446,7 @@ mod tests {
             Uuid::new_v4()
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
-        sqlx::raw_sql("PRAGMA user_version=9")
+        sqlx::raw_sql("PRAGMA user_version=10")
             .execute(&pool)
             .await
             .unwrap();
@@ -7755,7 +7787,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_client_credentials_exchanges_automation_secret() {
         let store = Store::memory().await.unwrap();
-        let r = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
         let org = create_test_org(&r, "oauth-client-org").await;
         let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
         let created: crate::admin::ApiClientCreated = body(
@@ -7787,24 +7819,42 @@ mod tests {
             .unwrap();
         assert_eq!(granted.status(), StatusCode::OK);
         let token: serde_json::Value = body(granted).await;
-        assert_eq!(token["access_token"], created.token);
+        let access_token = token["access_token"].as_str().unwrap().to_string();
+        assert_ne!(access_token, created.token);
+        assert!(access_token.starts_with("bto_"));
         assert_eq!(token["token_type"], "Bearer");
         assert_eq!(token["scope"], "devices:read status:read");
         assert_eq!(token["organisation_id"], org.id.to_string());
-        assert!(token["expires_in"].as_i64().unwrap() > 0);
+        assert_eq!(token["expires_in"].as_i64().unwrap(), 3600);
+        let stored_hash: String =
+            sqlx::query_scalar("SELECT token_hash FROM oauth_access_tokens WHERE token_prefix=$1")
+                .bind(access_token.chars().take(11).collect::<String>())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_hash, crate::hash(&access_token));
+        assert_ne!(stored_hash, access_token);
 
         let status = Request::builder()
             .method(Method::GET)
             .uri("/api/v1/status")
-            .header(
-                AUTHORIZATION,
-                format!("Bearer {}", token["access_token"].as_str().unwrap()),
-            )
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
             .header("x-blaktail-organisation", org.id.to_string())
             .body(Body::from("null"))
             .unwrap();
         assert_eq!(
             r.clone().oneshot(status).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let bootstrap = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/status")
+            .header(AUTHORIZATION, format!("Bearer {}", created.token))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .body(Body::from("null"))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(bootstrap).await.unwrap().status(),
             StatusCode::OK
         );
 
@@ -7824,6 +7874,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(via_basic.status(), StatusCode::OK);
+        let via_basic_token: serde_json::Value = body(via_basic).await;
+        let second_access = via_basic_token["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(second_access, access_token);
+        assert!(second_access.starts_with("bto_"));
 
         let denied = r
             .clone()
@@ -7880,6 +7937,48 @@ mod tests {
         assert_eq!(
             forged.headers().get("www-authenticate").unwrap(),
             "Basic realm=\"BlakTail\""
+        );
+
+        sqlx::query("UPDATE oauth_access_tokens SET expires_at=$1 WHERE token_hash=$2")
+            .bind(now() - 1)
+            .bind(crate::hash(&access_token))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let expired = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/status")
+            .header(AUTHORIZATION, format!("Bearer {access_token}"))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .body(Body::from("null"))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(expired).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        assert_eq!(
+            call(
+                &r,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/api-clients/{}", org.id, created.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let after_revoke = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/status")
+            .header(AUTHORIZATION, format!("Bearer {second_access}"))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .body(Body::from("null"))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(after_revoke).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
         );
     }
 
