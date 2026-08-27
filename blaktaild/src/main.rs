@@ -468,9 +468,8 @@ async fn manage_magic_dns(
         ) {
             Ok(mode) => mode,
             Err(error) => {
-                created.stop();
-                warn!(%error, "could not configure system MagicDNS routing");
-                return;
+                warn!(%error, "could not configure system MagicDNS routing; resolver stays on the overlay address");
+                "listener-only".into()
             }
         };
         info!(%domain, mode, "MagicDNS resolver active");

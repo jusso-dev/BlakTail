@@ -49,4 +49,5 @@ suffix's resolvers. MagicDNS peer names stay coordinator-authoritative:
 `*.blaktail` is never forwarded, unknown `*.blaktail` names stay NXDOMAIN, and
 public names without an extra record or split match stay REFUSED.
 
-Packet-capture leak proofs and a two-agent extra-record E2E remain on #40.
+A two-agent extra-record proof is `deploy/homelab/prove-org-dns.sh`.
+Packet-capture leak proofs remain on #40.

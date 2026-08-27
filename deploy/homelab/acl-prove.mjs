@@ -82,6 +82,20 @@ if (command === "identity") {
     process.stdout.write(`ok tombstoned leftover ${node.name}\n`);
   }
   if (purged === 0) process.stdout.write("ok no leftover prove nodes\n");
+} else if (command === "put-dns") {
+  const body = JSON.parse(process.argv[3] ?? "{}");
+  const response = await fetch(`${base}/v1/orgs/${row.coord_org_id}/dns`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${sign(row)}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(`DNS PUT ${response.status} ${await response.text()}`);
+  }
+  process.stdout.write(`ok DNS PUT ${response.status}\n`);
 } else if (command === "mint") {
   if (!keyDir) throw new Error("ACL_PROVE_KEY_DIR is required");
   for (const tag of ["office", "store"]) {
@@ -107,7 +121,7 @@ if (command === "identity") {
     process.stdout.write(`ok minted ${tag} key\n`);
   }
 } else {
-  throw new Error("usage: acl-prove.mjs identity|mint|put-acl|purge-nodes");
+  throw new Error("usage: acl-prove.mjs identity|mint|put-acl|put-dns|purge-nodes");
 }
 
 await sql.close({ timeout: 5 });
