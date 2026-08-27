@@ -5,11 +5,13 @@ use crate::{
     Session, Store, ADMIN_API_MAX_BODY_BYTES, ADMIN_API_RATE_LIMIT, ADMIN_API_RATE_WINDOW_SECS,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path as UrlPath, Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Form, Path as UrlPath, Query, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    response::IntoResponse,
     routing::{get, post, put},
     Json, Router,
 };
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
@@ -400,6 +402,214 @@ pub(crate) async fn revoke_api_client(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OAuthTokenRequest {
+    #[serde(default)]
+    grant_type: String,
+    #[serde(default)]
+    client_id: String,
+    #[serde(default)]
+    client_secret: String,
+    #[serde(default)]
+    scope: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OAuthTokenResponse {
+    access_token: String,
+    token_type: &'static str,
+    expires_in: i64,
+    scope: String,
+    organisation_id: Uuid,
+}
+
+pub(crate) struct OAuthError {
+    status: StatusCode,
+    error: &'static str,
+    description: &'static str,
+}
+
+impl OAuthError {
+    fn invalid_request(description: &'static str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: "invalid_request",
+            description,
+        }
+    }
+
+    fn invalid_client() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            error: "invalid_client",
+            description: "client authentication failed",
+        }
+    }
+
+    fn unsupported_grant_type() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: "unsupported_grant_type",
+            description: "only client_credentials is supported",
+        }
+    }
+
+    fn invalid_scope() -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: "invalid_scope",
+            description: "requested scope is not granted to this client",
+        }
+    }
+
+    fn server_error() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: "server_error",
+            description: "token service failed",
+        }
+    }
+}
+
+impl IntoResponse for OAuthError {
+    fn into_response(self) -> axum::response::Response {
+        let mut response = (
+            self.status,
+            Json(serde_json::json!({
+                "error": self.error,
+                "error_description": self.description,
+            })),
+        )
+            .into_response();
+        if self.status == StatusCode::UNAUTHORIZED {
+            response.headers_mut().insert(
+                axum::http::header::WWW_AUTHENTICATE,
+                axum::http::HeaderValue::from_static("Basic realm=\"BlakTail\""),
+            );
+        }
+        response
+    }
+}
+
+fn basic_client_auth(headers: &HeaderMap) -> Result<Option<(String, String)>, OAuthError> {
+    let Some(value) = headers.get(AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| OAuthError::invalid_client())?;
+    let Some(encoded) = value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("basic "))
+    else {
+        return Ok(None);
+    };
+    let decoded = STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| OAuthError::invalid_client())?;
+    let decoded = String::from_utf8(decoded).map_err(|_| OAuthError::invalid_client())?;
+    let (id, secret) = decoded
+        .split_once(':')
+        .ok_or_else(OAuthError::invalid_client)?;
+    if id.is_empty() || secret.is_empty() {
+        return Err(OAuthError::invalid_client());
+    }
+    Ok(Some((id.to_owned(), secret.to_owned())))
+}
+
+fn parse_requested_scopes(value: &str) -> Result<Vec<Scope>, OAuthError> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split_whitespace()
+        .map(|part| {
+            serde_json::from_value(serde_json::Value::String(part.to_string()))
+                .map_err(|_| OAuthError::invalid_scope())
+        })
+        .collect()
+}
+
+pub(crate) async fn oauth_token(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Form(input): Form<OAuthTokenRequest>,
+) -> Result<Json<OAuthTokenResponse>, OAuthError> {
+    if input.grant_type != "client_credentials" {
+        return Err(OAuthError::unsupported_grant_type());
+    }
+    let (client_id, client_secret) = match basic_client_auth(&headers)? {
+        Some(credentials) => credentials,
+        None => {
+            if input.client_id.is_empty() || input.client_secret.is_empty() {
+                return Err(OAuthError::invalid_request(
+                    "client_id and client_secret are required",
+                ));
+            }
+            (input.client_id, input.client_secret)
+        }
+    };
+    let client_id = Uuid::parse_str(client_id.trim()).map_err(|_| OAuthError::invalid_client())?;
+    if !client_secret.starts_with(&format!("{API_PREFIX}_")) {
+        return Err(OAuthError::invalid_client());
+    }
+    let current_time = now();
+    let row = sqlx::query(
+        "SELECT org_id,scopes_json,expires_at FROM api_clients WHERE id=$1 AND token_hash=$2 AND revoked_at IS NULL",
+    )
+    .bind(client_id.to_string())
+    .bind(hash(&client_secret))
+    .fetch_optional(&s.store.pool)
+    .await
+    .map_err(|_| OAuthError::server_error())?
+    .ok_or_else(OAuthError::invalid_client)?;
+    let org_id = Uuid::parse_str(
+        &row.try_get::<String, _>(0)
+            .map_err(|_| OAuthError::server_error())?,
+    )
+    .map_err(|_| OAuthError::server_error())?;
+    let scopes: Vec<Scope> = serde_json::from_str(
+        &row.try_get::<String, _>(1)
+            .map_err(|_| OAuthError::server_error())?,
+    )
+    .map_err(|_| OAuthError::server_error())?;
+    let expires_at: Option<i64> = row.try_get(2).map_err(|_| OAuthError::server_error())?;
+    if expires_at.is_some_and(|expires| expires <= current_time) {
+        return Err(OAuthError::invalid_client());
+    }
+    let requested = parse_requested_scopes(&input.scope)?;
+    if requested.iter().any(|scope| !scopes.contains(scope)) {
+        return Err(OAuthError::invalid_scope());
+    }
+    sqlx::query("UPDATE api_clients SET last_used_at=$1 WHERE id=$2")
+        .bind(current_time)
+        .bind(client_id.to_string())
+        .execute(&s.store.pool)
+        .await
+        .map_err(|_| OAuthError::server_error())?;
+    if !s.api_rate.allow(
+        &client_id.to_string(),
+        current_time,
+        ADMIN_API_RATE_LIMIT,
+        ADMIN_API_RATE_WINDOW_SECS,
+    ) {
+        return Err(OAuthError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error: "temporarily_unavailable",
+            description: "client is rate limited",
+        });
+    }
+    Ok(Json(OAuthTokenResponse {
+        access_token: client_secret,
+        token_type: "Bearer",
+        expires_in: expires_at.unwrap_or(current_time + 3600) - current_time,
+        scope: scopes
+            .iter()
+            .map(|scope| scope.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        organisation_id: org_id,
+    }))
 }
 
 async fn api_status(

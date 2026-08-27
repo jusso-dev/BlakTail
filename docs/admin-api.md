@@ -17,6 +17,14 @@ SHA-256 hashes. Send `Authorization: Bearer bta_…` and
 `X-BlakTail-Organisation`. Node tokens, join keys, and anonymous callers are
 rejected.
 
+`POST /oauth/token` accepts the OAuth 2.0 `client_credentials` grant. The
+client id is the automation client UUID; the client secret is the shown-once
+`bta_` token. Credentials may be sent as HTTP Basic or form fields. The
+response access token is that same hashed secret, plus `organisation_id` so
+callers can set `X-BlakTail-Organisation`. Requested `scope` must be empty or
+a subset of the registered scopes; the token still carries the registered
+set. Distinct short-lived access tokens remain later.
+
 ## Writes
 
 - Policy PUT requires the current `etag`.
@@ -41,5 +49,6 @@ CI also runs an in-process Terraform/provider-style contract
 (`admin_api_provider_contract_manages_device_lifecycle`) that mints a `bta_`
 client, enrols a device from a minted key, renames it without changing the
 WireGuard identity, publishes policy and DNS with etags, tombstones the device,
-and proves a read-only token cannot write. OAuth client-credentials remain on
-#37.
+and proves a read-only token cannot write. `POST /oauth/token` issues the
+same `bta_` secret for the `client_credentials` grant. Distinct short-lived
+access tokens remain on #37.

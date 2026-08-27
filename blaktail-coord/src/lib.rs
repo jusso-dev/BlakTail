@@ -927,6 +927,7 @@ pub fn app_with_relays_console_and_metrics(
             delete(admin::revoke_api_client),
         )
         .merge(admin::api_routes())
+        .route("/oauth/token", post(admin::oauth_token))
         .route("/v1/nodes/register", post(register_node))
         .route("/v1/nodes/:node_id/reauth", post(reauth_node))
         .route("/v1/nodes/:node_id/peers", get(list_peers))
@@ -7749,6 +7750,137 @@ mod tests {
                 "{path} must not be anonymous"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn oauth_client_credentials_exchanges_automation_secret() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "oauth-client-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let created: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"terraform","scopes":["devices:read","status:read"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let form = format!(
+            "grant_type=client_credentials&client_id={}&client_secret={}&scope=status:read",
+            created.id, created.token
+        );
+        let granted = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(granted.status(), StatusCode::OK);
+        let token: serde_json::Value = body(granted).await;
+        assert_eq!(token["access_token"], created.token);
+        assert_eq!(token["token_type"], "Bearer");
+        assert_eq!(token["scope"], "devices:read status:read");
+        assert_eq!(token["organisation_id"], org.id.to_string());
+        assert!(token["expires_in"].as_i64().unwrap() > 0);
+
+        let status = Request::builder()
+            .method(Method::GET)
+            .uri("/api/v1/status")
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", token["access_token"].as_str().unwrap()),
+            )
+            .header("x-blaktail-organisation", org.id.to_string())
+            .body(Body::from("null"))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(status).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        let basic = base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", created.id, created.token));
+        let via_basic = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/token")
+                    .header(AUTHORIZATION, format!("Basic {basic}"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("grant_type=client_credentials"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(via_basic.status(), StatusCode::OK);
+
+        let denied = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "grant_type=client_credentials&client_id={}&client_secret={}&scope=policy:write",
+                        created.id, created.token
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::BAD_REQUEST);
+        let denied_body: serde_json::Value = body(denied).await;
+        assert_eq!(denied_body["error"], "invalid_scope");
+
+        let unsupported = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "grant_type=authorization_code&client_id={}&client_secret={}",
+                        created.id, created.token
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsupported.status(), StatusCode::BAD_REQUEST);
+
+        let forged = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "grant_type=client_credentials&client_id={}&client_secret=bta_forged",
+                        created.id
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forged.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            forged.headers().get("www-authenticate").unwrap(),
+            "Basic realm=\"BlakTail\""
+        );
     }
 
     #[tokio::test]
