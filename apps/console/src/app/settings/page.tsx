@@ -29,7 +29,7 @@ export default async function SettingsPage() {
       ctx.role === "owner"
         ? listMemberships(ctx.organisationId)
         : Promise.resolve([]),
-      getDns(ctx),
+      getDns(ctx).catch(() => null),
     ]);
 
   return (
@@ -81,7 +81,16 @@ export default async function SettingsPage() {
         {ctx.role === "owner" ? (
           <MembershipManager memberships={memberships} />
         ) : null}
-        <DnsSettings initial={dns} readOnly={ctx.role === "member"} />
+        {dns ? (
+          <DnsSettings initial={dns} readOnly={ctx.role === "member"} />
+        ) : (
+          <div className="panel stack">
+            <h2>Organisation DNS</h2>
+            <p className="muted">
+              Coordinator DNS settings are unavailable in this environment.
+            </p>
+          </div>
+        )}
         {ctx.role === "owner" ? (
           <ApiClientManager clients={apiClients} />
         ) : null}

@@ -3231,12 +3231,14 @@ fn org_dns_from_row(
     previous: Option<String>,
 ) -> Result<org_dns::OrgDnsResponse, ApiError> {
     let dns = org_dns::parse_settings(&dns_json).unwrap_or_else(|_| org_dns::default_settings());
+    let record_preview = dns.record_preview();
     Ok(org_dns::OrgDnsResponse {
         revision,
         etag: hash(&format!("{revision}:{dns_json}")),
         has_previous: previous.as_deref().is_some_and(|value| !value.is_empty()),
         magic_dns_suffix: org_dns::organisation_magic_dns_suffix(&org_id.to_string()),
         dns,
+        record_preview,
     })
 }
 

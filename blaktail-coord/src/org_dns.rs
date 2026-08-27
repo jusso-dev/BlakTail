@@ -67,12 +67,20 @@ pub struct OrgDnsAgentView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsRoutePreview {
+    pub name: String,
+    pub split_suffix: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrgDnsResponse {
     pub revision: i64,
     pub etag: String,
     pub has_previous: bool,
     pub magic_dns_suffix: String,
     pub dns: OrgDnsSettings,
+    #[serde(default)]
+    pub record_preview: Vec<DnsRoutePreview>,
 }
 
 #[derive(Debug, Serialize)]
@@ -253,9 +261,27 @@ impl OrgDnsSettings {
             records: self.records.clone(),
         }
     }
+
+    pub fn resolver_for(&self, name: &str) -> Result<Option<&SplitDnsRoute>, ApiError> {
+        longest_split_match(name, &self.split)
+    }
+
+    pub fn record_preview(&self) -> Vec<DnsRoutePreview> {
+        self.records
+            .iter()
+            .map(|record| DnsRoutePreview {
+                name: record.name.clone(),
+                split_suffix: self
+                    .resolver_for(&record.name)
+                    .ok()
+                    .flatten()
+                    .map(|route| route.suffix.clone()),
+            })
+            .collect()
+    }
 }
 
-pub fn longest_split_match<'a>(
+fn longest_split_match<'a>(
     name: &str,
     routes: &'a [SplitDnsRoute],
 ) -> Result<Option<&'a SplitDnsRoute>, ApiError> {
