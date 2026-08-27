@@ -52,7 +52,10 @@ jobs:
           sh -n scripts/package-agent.sh scripts/install-agent.sh
           scripts/agent-checksums.sh scripts/two-vm-test.sh scripts/config-contract-test.sh
           scripts/conformance/prove-observability.sh scripts/publish-package-repos.sh
-          scripts/admin-api-smoke.sh
+          scripts/admin-api-smoke.sh scripts/admin-openapi-drift.sh
+
+      - name: Admin OpenAPI drift
+        run: scripts/admin-openapi-drift.sh
 
       - name: Build and inspect Linux packages
         run: |

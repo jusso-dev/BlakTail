@@ -22,7 +22,11 @@ rejected.
 - Policy PUT requires the current `etag`.
 - `POST /api/v1/keys` honours `Idempotency-Key` (8–128 characters). Reusing a
   key with a different body returns `409`.
+- Request bodies are rejected above 64 KiB (`413`).
+- Each `bta_` client is limited to 120 requests per 60-second window (`429`).
 - Errors use `{ error, code, message, request_id }`.
+- CI runs `scripts/admin-openapi-drift.sh` so `docs/openapi/admin-v1.yaml`
+  stays aligned with `api_routes()` in `blaktail-coord`.
 
 A disposable smoke against a running coordinator:
 

@@ -22,10 +22,10 @@ use sqlx::{
     AnyConnection, AnyPool, AssertSqlSafe, Row,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 use thiserror::Error;
@@ -51,6 +51,9 @@ const MAX_CONSOLE_ASSERTION_LIFETIME_SECS: i64 = 60;
 const CONSOLE_ASSERTION_CLOCK_SKEW_SECS: i64 = 5;
 const BOOTSTRAP_RESERVATION_TTL_SECS: i64 = 60 * 60;
 const POSTGRES_MIGRATION_LOCK: i64 = 0x424c_414b_5441_494c;
+pub(crate) const ADMIN_API_MAX_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const ADMIN_API_RATE_LIMIT: u32 = 120;
+pub(crate) const ADMIN_API_RATE_WINDOW_SECS: i64 = 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseBackend {
@@ -671,6 +674,27 @@ async fn ensure_column(
     }
     Ok(())
 }
+#[derive(Clone, Default)]
+pub(crate) struct ApiRateLimiter {
+    inner: Arc<Mutex<HashMap<String, Vec<i64>>>>,
+}
+
+impl ApiRateLimiter {
+    pub(crate) fn allow(&self, key: &str, now: i64, limit: u32, window_secs: i64) -> bool {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stamps = map.entry(key.to_owned()).or_default();
+        stamps.retain(|stamp| now.saturating_sub(*stamp) < window_secs);
+        if stamps.len() as u32 >= limit {
+            return false;
+        }
+        stamps.push(now);
+        true
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct AppState {
     store: Store,
@@ -680,6 +704,7 @@ pub(crate) struct AppState {
     /// Advertised relay endpoints (host:port, UDP) handed to nodes.
     relays: Arc<Vec<String>>,
     console_url: Arc<String>,
+    api_rate: ApiRateLimiter,
 }
 pub fn app(store: Store, region: String, auth_hmac_secret: impl Into<Vec<u8>>) -> Router {
     app_with_relays_and_console(
@@ -742,6 +767,7 @@ pub fn app_with_relays_console_and_metrics(
         relay_auth_secret: relay_auth_secret.into().into(),
         relays: Arc::new(relays),
         console_url: Arc::new(console_url.trim_end_matches('/').to_owned()),
+        api_rate: ApiRateLimiter::default(),
     };
     Router::new()
         .route("/health", get(readiness))
@@ -6500,5 +6526,68 @@ mod tests {
         let envelope: serde_json::Value = body(denied).await;
         assert_eq!(envelope["code"], "unauthorized");
         assert!(envelope["request_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn admin_api_rate_limiter_bounds_a_client_window() {
+        let limiter = ApiRateLimiter::default();
+        assert!(limiter.allow("client-a", 1_000, 2, 60));
+        assert!(limiter.allow("client-a", 1_001, 2, 60));
+        assert!(!limiter.allow("client-a", 1_002, 2, 60));
+        assert!(limiter.allow("client-b", 1_002, 2, 60));
+        assert!(limiter.allow("client-a", 1_061, 2, 60));
+    }
+
+    #[tokio::test]
+    async fn admin_api_rejects_oversized_bodies_and_rate_limits_tokens() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "admin-limits-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let created: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"limits","scopes":["status:read"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let oversized = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/policy")
+            .header(AUTHORIZATION, format!("Bearer {}", created.token))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .header("content-type", "application/json")
+            .body(Body::from("x".repeat(ADMIN_API_MAX_BODY_BYTES + 1)))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(oversized).await.unwrap().status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let mut last = StatusCode::OK;
+        for _ in 0..(ADMIN_API_RATE_LIMIT + 1) {
+            last = r
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/api/v1/status")
+                        .header(AUTHORIZATION, format!("Bearer {}", created.token))
+                        .header("x-blaktail-organisation", org.id.to_string())
+                        .body(Body::from("null"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            if last == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+        }
+        assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
     }
 }

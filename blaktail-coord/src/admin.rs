@@ -1,10 +1,10 @@
 use crate::{
     append_audit, bearer_value, conflict, console_session, hash, load_audit_events, load_nodes,
     now, secret, tombstone_node, ApiError, AppState, AuditQuery, NodeListQuery, Role, Session,
-    Store,
+    Store, ADMIN_API_MAX_BODY_BYTES, ADMIN_API_RATE_LIMIT, ADMIN_API_RATE_WINDOW_SECS,
 };
 use axum::{
-    extract::{Path as UrlPath, Query, State},
+    extract::{DefaultBodyLimit, Path as UrlPath, Query, State},
     http::{HeaderMap, StatusCode},
     routing::{get, post, put},
     Json, Router,
@@ -116,6 +116,7 @@ pub(crate) fn api_routes() -> Router<AppState> {
         .route("/api/v1/devices/:node_id/routes", put(api_approve_routes))
         .route("/api/v1/policy", get(api_get_policy).put(api_put_policy))
         .route("/api/v1/audit", get(api_list_audit))
+        .layer(DefaultBodyLimit::max(ADMIN_API_MAX_BODY_BYTES))
 }
 
 fn require_scope(caller: &ApiCaller, scope: Scope) -> Result<(), ApiError> {
@@ -197,6 +198,14 @@ async fn api_token_session(
         .bind(&client_id)
         .execute(&state.store.pool)
         .await?;
+    if !state.api_rate.allow(
+        &client_id,
+        current_time,
+        ADMIN_API_RATE_LIMIT,
+        ADMIN_API_RATE_WINDOW_SECS,
+    ) {
+        return Err(ApiError::TooManyRequests);
+    }
     Ok(ApiCaller {
         session: Session {
             user_id: format!("api:{client_id}"),
