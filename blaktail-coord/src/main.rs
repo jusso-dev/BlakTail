@@ -72,8 +72,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match blaktail_coord::check_policy_document(&document) {
             Ok(report) => {
                 println!(
-                    "policy ok version={} groups={} rules={} tests={} tag_owners={}",
-                    report.version, report.groups, report.rules, report.tests, report.tag_owners
+                    "policy ok version={} groups={} rules={} ssh={} tests={} tag_owners={}",
+                    report.version,
+                    report.groups,
+                    report.rules,
+                    report.ssh,
+                    report.tests,
+                    report.tag_owners
                 );
                 return Ok(());
             }

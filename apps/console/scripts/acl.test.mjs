@@ -90,3 +90,45 @@ test("ACL drafts keep policy tests and tag owners across a round trip", () => {
     rules: [],
   });
 });
+
+test("ACL drafts keep SSH rules across a round trip", () => {
+  const policy = parseAclPolicy({
+    ssh: [
+      {
+        action: "check",
+        src_groups: ["rangers"],
+        dst_tags: ["store"],
+        users: ["ubuntu", "deploy"],
+        check_period_secs: 3600,
+      },
+    ],
+    rules: [],
+  });
+  assert.deepEqual(policy.ssh, [
+    {
+      action: "check",
+      src_roles: [],
+      src_tags: [],
+      src_groups: ["rangers"],
+      dst_roles: [],
+      dst_tags: ["store"],
+      dst_groups: [],
+      users: ["ubuntu", "deploy"],
+      check_period_secs: "3600",
+    },
+  ]);
+  assert.deepEqual(serializeAclPolicy(policy), {
+    version: 1,
+    groups: {},
+    ssh: [
+      {
+        action: "check",
+        src_groups: ["rangers"],
+        dst_tags: ["store"],
+        users: ["ubuntu", "deploy"],
+        check_period_secs: 3600,
+      },
+    ],
+    rules: [],
+  });
+});

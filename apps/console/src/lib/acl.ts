@@ -27,12 +27,28 @@ export type AclRuleDraft = {
   protocols: AclProtocol[];
 };
 
+export const ACL_SSH_ACTIONS = ["allow", "deny", "check"] as const;
+export type AclSshAction = (typeof ACL_SSH_ACTIONS)[number];
+
+export type AclSshDraft = {
+  action: AclSshAction;
+  src_roles: OrgRole[];
+  src_tags: AclTag[];
+  src_groups: string[];
+  dst_roles: OrgRole[];
+  dst_tags: AclTag[];
+  dst_groups: string[];
+  users: string[];
+  check_period_secs: string;
+};
+
 export type AclPolicyDraft = {
   version: number;
   groups: { name: string; members: string[] }[];
   hosts: { name: string; target: string }[];
   tag_owners: { tag: string; owners: string[] }[];
   rules: AclRuleDraft[];
+  ssh: AclSshDraft[];
   tests: unknown[];
 };
 
@@ -66,6 +82,20 @@ export function emptyRule(): AclRuleDraft {
     dst_hosts: [],
     dst_ports: [],
     protocols: [],
+  };
+}
+
+export function emptySshRule(): AclSshDraft {
+  return {
+    action: "allow",
+    src_roles: [],
+    src_tags: [],
+    src_groups: [],
+    dst_roles: [],
+    dst_tags: [],
+    dst_groups: [],
+    users: [],
+    check_period_secs: "",
   };
 }
 
@@ -104,6 +134,33 @@ export function parseAclPolicy(value: unknown): AclPolicyDraft {
         } satisfies AclRuleDraft;
       })
     : [];
+  const ssh = Array.isArray(source.ssh)
+    ? source.ssh.map((rule) => {
+        const row =
+          rule && typeof rule === "object"
+            ? (rule as Record<string, unknown>)
+            : {};
+        const action = ACL_SSH_ACTIONS.includes(row.action as AclSshAction)
+          ? (row.action as AclSshAction)
+          : "allow";
+        return {
+          action,
+          src_roles: asRoleArray(row.src_roles),
+          src_tags: asTagArray(row.src_tags),
+          src_groups: asStringArray(row.src_groups),
+          dst_roles: asRoleArray(row.dst_roles),
+          dst_tags: asTagArray(row.dst_tags),
+          dst_groups: asStringArray(row.dst_groups),
+          users: asStringArray(row.users),
+          check_period_secs:
+            typeof row.check_period_secs === "number"
+              ? String(row.check_period_secs)
+              : typeof row.check_period_secs === "string"
+                ? row.check_period_secs
+                : "",
+        } satisfies AclSshDraft;
+      })
+    : [];
   const tagOwnersValue = source.tag_owners;
   const tag_owners =
     tagOwnersValue && typeof tagOwnersValue === "object" && !Array.isArray(tagOwnersValue)
@@ -124,7 +181,15 @@ export function parseAclPolicy(value: unknown): AclPolicyDraft {
       : [];
   const tests = Array.isArray(source.tests) ? source.tests : [];
   const version = source.version === 1 || source.version === undefined ? 1 : Number(source.version);
-  return { version: Number.isFinite(version) ? version : 1, groups, hosts, tag_owners, rules, tests };
+  return {
+    version: Number.isFinite(version) ? version : 1,
+    groups,
+    hosts,
+    tag_owners,
+    rules,
+    ssh,
+    tests,
+  };
 }
 
 export function validGroupName(name: string): boolean {
@@ -197,6 +262,26 @@ export function serializeAclPolicy(policy: AclPolicyDraft): Record<string, unkno
     ...(Object.keys(tag_owners).length > 0 ? { tag_owners } : {}),
     ...(Object.keys(hosts).length > 0 ? { hosts } : {}),
     ...(policy.tests.length > 0 ? { tests: policy.tests } : {}),
+    ...(policy.ssh.length > 0
+      ? {
+          ssh: policy.ssh.map((rule) => {
+            const period = Number.parseInt(rule.check_period_secs, 10);
+            return {
+              action: rule.action,
+              ...compact("src_roles", rule.src_roles),
+              ...compact("src_tags", rule.src_tags),
+              ...compact("src_groups", rule.src_groups),
+              ...compact("dst_roles", rule.dst_roles),
+              ...compact("dst_tags", rule.dst_tags),
+              ...compact("dst_groups", rule.dst_groups),
+              users: rule.users.map((user) => user.trim()).filter(Boolean),
+              ...(rule.action === "check" && Number.isFinite(period) && period > 0
+                ? { check_period_secs: period }
+                : {}),
+            };
+          }),
+        }
+      : {}),
     rules: policy.rules.map((rule) => ({
       action: rule.action,
       ...compact("src_roles", rule.src_roles),
