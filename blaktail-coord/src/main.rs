@@ -66,6 +66,7 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cli = Cli::parse();
     if let Some(Command::CheckPolicy { policy }) = &cli.command {
         let document = std::fs::read_to_string(policy)?;

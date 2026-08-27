@@ -972,6 +972,7 @@ pub fn app_with_relays_console_and_metrics(
         api_rate: ApiRateLimiter::default(),
         control_views: Arc::new(Mutex::new(HashMap::new())),
     };
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     tokio::spawn(webhooks::delivery_loop(state.clone()));
     Router::new()
         .route("/health", get(readiness))
