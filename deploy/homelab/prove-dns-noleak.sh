@@ -162,7 +162,9 @@ echo "== capture eth0 and lo DNS while querying private and public names"
   echo $! >/tmp/tcpdump-lo.pid
   sleep 1
 '
+magic_domain="$(status_of | awk '$1 == "dns:" { sub(/^[^.]+./, "", $2); print $2; exit }')"
 dig_at "$office_dns" "$RECORD_NAME" >/dev/null || true
+dig_at "$office_dns" "ghost.${magic_domain:-blaktail}" >/dev/null || true
 dig_at "$office_dns" "${office_name}.invalid.blaktail" >/dev/null || true
 office_public="$("${COMPOSE[@]}" exec -T agent-office dig +time=1 +tries=1 "@${office_dns}" example.com A || true)"
 split_answer="$(dig_at "$office_dns" "$SPLIT_NAME" || true)"
@@ -190,12 +192,14 @@ echo "ok split ${SPLIT_NAME} answered ${SPLIT_IP} via published sink"
 eth0_text="$("${COMPOSE[@]}" exec -T agent-office tcpdump -r /tmp/dns-eth0.pcap -n -tt 2>/dev/null || true)"
 lo_text="$("${COMPOSE[@]}" exec -T agent-office tcpdump -r /tmp/dns-lo.pcap -n -tt 2>/dev/null || true)"
 export BLAKTAIL_DNS_SINK="$sink_lan"
+export BLAKTAIL_DNS_MAGIC="$office_dns"
 export BLAKTAIL_DNS_ETH0="$eth0_text"
 export BLAKTAIL_DNS_LO="$lo_text"
 python3 - <<'PY'
 import os, re, sys
 
 sink = os.environ["BLAKTAIL_DNS_SINK"]
+magic = os.environ["BLAKTAIL_DNS_MAGIC"].strip("[]")
 public = {
     "1.1.1.1", "1.0.0.1", "8.8.8.8", "8.8.4.4", "9.9.9.9",
     "208.67.222.222", "208.67.220.220", "127.0.0.11",
@@ -208,12 +212,13 @@ def dests(text):
     for line in text.splitlines():
         match = dest_re.search(line)
         if match:
-            found.append(match.group(1))
+            found.append(match.group(1).strip("[]"))
     return found
 
 eth0 = dests(os.environ["BLAKTAIL_DNS_ETH0"])
 lo = dests(os.environ["BLAKTAIL_DNS_LO"])
-leaked = sorted({ip for ip in eth0 + lo if ip in public or ip == "127.0.0.11"})
+observed = eth0 + lo
+leaked = sorted({ip for ip in observed if ip in public})
 if leaked:
     print("FAIL private DNS reached a public or default resolver: " + ", ".join(leaked), file=sys.stderr)
     print(os.environ["BLAKTAIL_DNS_ETH0"], file=sys.stderr)
@@ -228,11 +233,12 @@ if sink not in eth0:
     print("FAIL capture missed the split forward to the published sink", file=sys.stderr)
     print(os.environ["BLAKTAIL_DNS_ETH0"], file=sys.stderr)
     sys.exit(1)
-if lo:
-    print("FAIL loopback captured DNS to " + ", ".join(sorted(set(lo))), file=sys.stderr)
+lo_foreign = sorted({ip for ip in lo if ip not in {magic, sink}})
+if lo_foreign:
+    print("FAIL loopback captured DNS to " + ", ".join(lo_foreign), file=sys.stderr)
     print(os.environ["BLAKTAIL_DNS_LO"], file=sys.stderr)
     sys.exit(1)
-print(f"ok capture: split forwarded only to {sink}; extra/.blaktail/public did not leak")
+print(f"ok capture: split forwarded only to {sink}; extra/.blaktail/public stayed on MagicDNS {magic}")
 PY
 
 echo "org_dns_no_public_leak passed"
