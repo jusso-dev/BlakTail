@@ -6,25 +6,56 @@
   "tag_owners": {
     "office": ["owner-1", "admin"]
   },
+  "hosts": {
+    "wiki": "10.0.0.10",
+    "printers": "10.0.0.0/24"
+  },
   "rules": [
     {
       "action": "allow",
       "src_groups": ["rangers"],
-      "dst_tags": ["store"]
+      "dst_tags": ["store"],
+      "dst_ports": ["22", "80-443"],
+      "protocols": ["tcp"]
+    },
+    {
+      "action": "allow",
+      "src_groups": ["rangers"],
+      "dst_hosts": ["wiki"],
+      "dst_ports": ["443"],
+      "protocols": ["tcp"]
     }
   ],
   "tests": [
     {
-      "name": "ranger reaches store",
+      "name": "ranger reaches store ssh",
       "src_user": "alice-user",
       "dst_tags": ["store"],
+      "dst_port": 22,
+      "protocol": "tcp",
       "allow": true
+    },
+    {
+      "name": "ranger dns to store stays denied",
+      "src_user": "alice-user",
+      "dst_tags": ["store"],
+      "dst_port": 53,
+      "protocol": "udp",
+      "allow": false
     },
     {
       "name": "office stays isolated",
       "src_tags": ["office"],
       "dst_tags": ["store"],
       "allow": false
+    },
+    {
+      "name": "ranger reaches wiki https",
+      "src_user": "alice-user",
+      "dst_host": "wiki",
+      "dst_port": 443,
+      "protocol": "tcp",
+      "allow": true
     }
   ]
 }

@@ -3,6 +3,7 @@
 import { useMemo, useState, useTransition } from "react";
 import { saveAclAction } from "@/app/actions";
 import {
+  ACL_PROTOCOLS,
   ACL_ROLES,
   ACL_TAGS,
   emptyRule,
@@ -30,6 +31,7 @@ function SelectorSet<T extends string>({
   options,
   disabled,
   labelFor,
+  emptyHint = "Add a group first if you want to name people here.",
   onChange,
 }: {
   legend: string;
@@ -37,6 +39,7 @@ function SelectorSet<T extends string>({
   options: T[];
   disabled: boolean;
   labelFor: (value: T) => string;
+  emptyHint?: string;
   onChange: (next: T[]) => void;
 }) {
   return (
@@ -53,9 +56,7 @@ function SelectorSet<T extends string>({
             {labelFor(option)}
           </label>
         ))}
-        {options.length === 0 ? (
-          <p className="muted">Add a group first if you want to name people here.</p>
-        ) : null}
+        {options.length === 0 ? <p className="muted">{emptyHint}</p> : null}
       </div>
     </fieldset>
   );
@@ -81,6 +82,8 @@ export function AclEditor({
   const [policy, setPolicy] = useState<AclPolicyDraft>(parsedInitial);
   const [groupName, setGroupName] = useState("");
   const [groupMember, setGroupMember] = useState("");
+  const [hostName, setHostName] = useState("");
+  const [hostTarget, setHostTarget] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
   const groupNames = policy.groups.map((group) => group.name);
@@ -302,6 +305,104 @@ export function AclEditor({
 
       <section className="acl-section">
         <div>
+          <h2>Hosts</h2>
+          <p className="muted">
+            Name a private address or subnet, then use that name as a rule
+            destination. Packet-level enforcement of host-only rules is still
+            later; tests can already assert them.
+          </p>
+        </div>
+        {policy.hosts.length === 0 ? (
+          <p className="muted">No named hosts yet.</p>
+        ) : (
+          <ul className="acl-group-list">
+            {policy.hosts.map((host) => (
+              <li key={host.name} className="acl-group">
+                <div className="acl-group-head">
+                  <strong>{host.name}</strong>
+                  <span className="muted mono">{host.target}</span>
+                  {canMutate ? (
+                    <button
+                      type="button"
+                      className="secondary"
+                      onClick={() =>
+                        setPolicy((current) => ({
+                          ...current,
+                          hosts: current.hosts.filter((item) => item.name !== host.name),
+                          rules: current.rules.map((rule) => ({
+                            ...rule,
+                            dst_hosts: rule.dst_hosts.filter((name) => name !== host.name),
+                          })),
+                        }))
+                      }
+                    >
+                      Remove host
+                    </button>
+                  ) : null}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {canMutate ? (
+          <form
+            className="acl-add-group"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const name = hostName.trim().toLowerCase();
+              const target = hostTarget.trim();
+              if (!validGroupName(name)) {
+                setMessage(
+                  "Host names use lowercase letters, then letters, digits, or hyphens.",
+                );
+                return;
+              }
+              if (policy.hosts.some((host) => host.name === name)) {
+                setMessage("That host name is already in use.");
+                return;
+              }
+              if (!target) {
+                setMessage("Add a private address or CIDR for the host.");
+                return;
+              }
+              setMessage(null);
+              setPolicy((current) => ({
+                ...current,
+                hosts: [...current.hosts, { name, target }],
+              }));
+              setHostName("");
+              setHostTarget("");
+            }}
+          >
+            <label>
+              New host name
+              <input
+                name="host-name"
+                value={hostName}
+                onChange={(event) => setHostName(event.target.value)}
+                placeholder="wiki"
+                autoComplete="off"
+              />
+            </label>
+            <label>
+              Address or CIDR
+              <input
+                name="host-target"
+                value={hostTarget}
+                onChange={(event) => setHostTarget(event.target.value)}
+                placeholder="10.0.0.10"
+                autoComplete="off"
+              />
+            </label>
+            <button type="submit" className="secondary" data-testid="acl-add-host">
+              Add host
+            </button>
+          </form>
+        ) : null}
+      </section>
+
+      <section className="acl-section">
+        <div>
           <h2>Rules</h2>
           <p className="muted">
             Explicit deny wins. A blank source or destination matches everyone
@@ -402,6 +503,44 @@ export function AclEditor({
                       updateRule(index, { ...rule, dst_groups })
                     }
                   />
+                  <SelectorSet
+                    legend="To hosts"
+                    values={rule.dst_hosts}
+                    options={policy.hosts.map((host) => host.name)}
+                    disabled={!canMutate}
+                    labelFor={(name) => name}
+                    emptyHint="Add a host first if you want to name it here."
+                    onChange={(dst_hosts) =>
+                      updateRule(index, { ...rule, dst_hosts })
+                    }
+                  />
+                  <SelectorSet
+                    legend="Protocols"
+                    values={rule.protocols}
+                    options={[...ACL_PROTOCOLS]}
+                    disabled={!canMutate}
+                    labelFor={(protocol) => protocol.toUpperCase()}
+                    onChange={(protocols) =>
+                      updateRule(index, { ...rule, protocols })
+                    }
+                  />
+                  <label className="acl-selector">
+                    <span>Destination ports</span>
+                    <input
+                      value={rule.dst_ports.join(",")}
+                      disabled={!canMutate}
+                      placeholder="22,80-443"
+                      onChange={(event) =>
+                        updateRule(index, {
+                          ...rule,
+                          dst_ports: event.target.value
+                            .split(",")
+                            .map((item) => item.trim())
+                            .filter(Boolean),
+                        })
+                      }
+                    />
+                  </label>
                 </div>
               </li>
             ))}
