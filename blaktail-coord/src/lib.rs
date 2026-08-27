@@ -1,6 +1,7 @@
 mod admin;
 mod metrics;
 mod org_dns;
+mod webhooks;
 mod wg_only;
 
 pub use metrics::CoordMetrics;
@@ -63,7 +64,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub const CURRENT_SCHEMA_VERSION: i64 = 11;
 const MAX_CONTROL_UPDATE_WAIT_SECS: u64 = 25;
 const MAX_CONTROL_VIEWS: usize = 10_000;
 type ControlViewMap = HashMap<Uuid, (i64, BTreeSet<Uuid>)>;
@@ -171,6 +172,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 10,
         name: "policy revision and previous document",
         postgres_sql: include_str!("../migrations/postgres/0010_acl_revision.sql"),
+    },
+    Migration {
+        version: 11,
+        name: "organisation webhook destinations and outbox",
+        postgres_sql: include_str!("../migrations/postgres/0011_webhooks.sql"),
     },
 ];
 
@@ -367,6 +373,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             8 => migrate_sqlite_to_v8(&mut tx).await?,
             9 => migrate_sqlite_to_v9(&mut tx).await?,
             10 => migrate_sqlite_to_v10(&mut tx).await?,
+            11 => migrate_sqlite_to_v11(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -382,6 +389,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             8 => "PRAGMA user_version=8",
             9 => "PRAGMA user_version=9",
             10 => "PRAGMA user_version=10",
+            11 => "PRAGMA user_version=11",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -736,6 +744,47 @@ async fn migrate_sqlite_to_v10(
     ensure_column(tx, "orgs", "acl_previous_json", "TEXT").await
 }
 
+async fn migrate_sqlite_to_v11(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(
+        "CREATE TABLE IF NOT EXISTS webhook_destinations (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            url TEXT NOT NULL,
+            signing_secret TEXT NOT NULL,
+            secret_hash TEXT NOT NULL,
+            secret_prefix TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            UNIQUE(org_id, name)
+        );
+        CREATE TABLE IF NOT EXISTS webhook_outbox (
+            id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+            destination_id TEXT NOT NULL REFERENCES webhook_destinations(id) ON DELETE CASCADE,
+            event_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+            created_at INTEGER NOT NULL,
+            next_attempt_at INTEGER NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            delivered_at INTEGER,
+            dead_lettered_at INTEGER,
+            UNIQUE(destination_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS webhook_outbox_due_idx
+            ON webhook_outbox(next_attempt_at, delivered_at, dead_lettered_at);
+        CREATE INDEX IF NOT EXISTS webhook_destinations_org_idx
+            ON webhook_destinations(org_id, enabled);",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
     let rows =
         sqlx::query("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")
@@ -849,7 +898,7 @@ impl ApiRateLimiter {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    store: Store,
+    pub(crate) store: Store,
     metrics: Arc<CoordMetrics>,
     auth_hmac_secret: Arc<[u8]>,
     relay_auth_secret: Arc<[u8]>,
@@ -923,6 +972,8 @@ pub fn app_with_relays_console_and_metrics(
         api_rate: ApiRateLimiter::default(),
         control_views: Arc::new(Mutex::new(HashMap::new())),
     };
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    tokio::spawn(webhooks::delivery_loop(state.clone()));
     Router::new()
         .route("/health", get(readiness))
         .route("/livez", get(liveness))
@@ -3544,6 +3595,20 @@ async fn put_acl(
         }),
     )
     .await?;
+    webhooks::enqueue(
+        &mut tx,
+        org_id,
+        if rollback {
+            "policy.rolled_back"
+        } else {
+            "policy.published"
+        },
+        &serde_json::json!({
+            "revision": current.revision + 1,
+            "defaults": acl.defaults.as_str(),
+        }),
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3607,6 +3672,20 @@ async fn put_dns(
             "managed": next.managed,
             "split": next.split.len(),
             "records": next.records.len(),
+        }),
+    )
+    .await?;
+    webhooks::enqueue(
+        &mut tx,
+        org_id,
+        if rollback {
+            "dns.rolled_back"
+        } else {
+            "dns.published"
+        },
+        &serde_json::json!({
+            "revision": current.revision + 1,
+            "managed": next.managed,
         }),
     )
     .await?;
@@ -7482,6 +7561,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhooks_block_ssrf_and_deliver_signed_policy_events() {
+        let received = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received_loop = received.clone();
+        tokio::spawn(async move {
+            let hook = {
+                let received = received_loop;
+                move |headers: HeaderMap, body: String| {
+                    let received = received.clone();
+                    async move {
+                        let signature = headers
+                            .get("x-blaktail-signature")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned();
+                        received.lock().unwrap().push((signature, body));
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            };
+            let server = axum::Router::new().route("/hook", axum::routing::post(hook));
+            axum::serve(listener, server).await.ok();
+        });
+
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "webhook-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let writer: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({
+                    "name": "webhook-writer",
+                    "scopes": ["webhooks:write", "policy:write", "devices:read"]
+                }),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let admin = |method: Method, uri: String, token: String, payload: serde_json::Value| {
+            let router = r.clone();
+            let org_id = org.id;
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(AUTHORIZATION, format!("Bearer {token}"))
+                            .header("x-blaktail-organisation", org_id.to_string())
+                            .header("content-type", "application/json")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(
+            admin(
+                Method::POST,
+                "/api/v1/webhooks".into(),
+                writer.token.clone(),
+                serde_json::json!({"name":"meta","url":"https://169.254.169.254/latest"}),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let created: crate::webhooks::WebhookDestination = body(
+            admin(
+                Method::POST,
+                "/api/v1/webhooks".into(),
+                writer.token.clone(),
+                serde_json::json!({
+                    "name": "inventory",
+                    "url": format!("http://{addr}/hook")
+                }),
+            )
+            .await,
+        )
+        .await;
+        assert!(created.secret.as_deref().unwrap().starts_with("btw_"));
+        let policy: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/policy".into(),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            admin(
+                Method::PUT,
+                "/api/v1/policy".into(),
+                writer.token.clone(),
+                serde_json::json!({
+                    "etag": policy["data"]["etag"],
+                    "acl": {"defaults":"deny","rules":[]}
+                }),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while received.lock().unwrap().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let deliveries = received.lock().unwrap().clone();
+        assert_eq!(deliveries.len(), 1);
+        assert!(deliveries[0].0.starts_with("t="));
+        assert!(deliveries[0].1.contains("policy.published") || deliveries[0].1.contains("deny"));
+        let listed: serde_json::Value = body(
+            admin(
+                Method::GET,
+                format!("/api/v1/webhooks/{}/deliveries", created.id),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed["data"][0]["event_type"], "policy.published");
+        assert!(listed["data"][0]["delivered_at"].as_i64().is_some());
+    }
+
+    #[tokio::test]
     async fn named_groups_allow_cross_tag_peers_for_listed_people() {
         let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
@@ -7836,7 +8049,7 @@ mod tests {
             Uuid::new_v4()
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
-        sqlx::raw_sql("PRAGMA user_version=11")
+        sqlx::raw_sql("PRAGMA user_version=12")
             .execute(&pool)
             .await
             .unwrap();

@@ -17,6 +17,8 @@ const SCOPES = [
   "dns:write",
   "audit:read",
   "status:read",
+  "webhooks:read",
+  "webhooks:write",
 ] as const;
 
 export function ApiClientManager({ clients }: { clients: ApiClient[] }) {

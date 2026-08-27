@@ -41,6 +41,10 @@ pub(crate) enum Scope {
     AuditRead,
     #[serde(rename = "status:read")]
     StatusRead,
+    #[serde(rename = "webhooks:read")]
+    WebhooksRead,
+    #[serde(rename = "webhooks:write")]
+    WebhooksWrite,
 }
 
 impl Scope {
@@ -54,13 +58,15 @@ impl Scope {
             Self::DnsWrite => "dns:write",
             Self::AuditRead => "audit:read",
             Self::StatusRead => "status:read",
+            Self::WebhooksRead => "webhooks:read",
+            Self::WebhooksWrite => "webhooks:write",
         }
     }
 }
 
 #[derive(Clone)]
-struct ApiCaller {
-    session: Session,
+pub(crate) struct ApiCaller {
+    pub(crate) session: Session,
     client_id: Option<String>,
     scopes: Vec<Scope>,
 }
@@ -98,10 +104,10 @@ pub(crate) struct ApiClientRecord {
 }
 
 #[derive(Serialize)]
-struct Envelope<T: Serialize> {
-    data: T,
+pub(crate) struct Envelope<T: Serialize> {
+    pub(crate) data: T,
     #[serde(skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<String>,
+    pub(crate) next_cursor: Option<String>,
 }
 
 pub(crate) fn api_routes() -> Router<AppState> {
@@ -133,10 +139,26 @@ pub(crate) fn api_routes() -> Router<AppState> {
             get(api_get_wg_only).delete(api_revoke_wg_only),
         )
         .route("/api/v1/audit", get(api_list_audit))
+        .route(
+            "/api/v1/webhooks",
+            get(crate::webhooks::list_destinations).post(crate::webhooks::create_destination),
+        )
+        .route(
+            "/api/v1/webhooks/:destination_id",
+            axum::routing::delete(crate::webhooks::delete_destination),
+        )
+        .route(
+            "/api/v1/webhooks/:destination_id/deliveries",
+            get(crate::webhooks::list_deliveries),
+        )
+        .route(
+            "/api/v1/webhooks/deliveries/:delivery_id/replay",
+            post(crate::webhooks::replay_delivery),
+        )
         .layer(DefaultBodyLimit::max(ADMIN_API_MAX_BODY_BYTES))
 }
 
-fn require_scope(caller: &ApiCaller, scope: Scope) -> Result<(), ApiError> {
+pub(crate) fn require_scope(caller: &ApiCaller, scope: Scope) -> Result<(), ApiError> {
     if caller.client_id.is_none() {
         if scope_is_write(scope) && caller.session.role == Role::Member {
             return Err(ApiError::Forbidden);
@@ -145,6 +167,7 @@ fn require_scope(caller: &ApiCaller, scope: Scope) -> Result<(), ApiError> {
     }
     if caller.scopes.contains(&scope)
         || (scope == Scope::DevicesRead && caller.scopes.contains(&Scope::DevicesWrite))
+        || (scope == Scope::WebhooksRead && caller.scopes.contains(&Scope::WebhooksWrite))
     {
         return Ok(());
     }
@@ -159,6 +182,7 @@ fn scope_is_write(scope: Scope) -> bool {
             | Scope::RoutesWrite
             | Scope::PolicyWrite
             | Scope::DnsWrite
+            | Scope::WebhooksWrite
     )
 }
 
@@ -182,7 +206,7 @@ async fn authenticate(
     })
 }
 
-async fn authenticate_org_header(
+pub(crate) async fn authenticate_org_header(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(Uuid, ApiCaller), ApiError> {
@@ -1183,6 +1207,20 @@ async fn api_put_policy(
         }),
     )
     .await?;
+    crate::webhooks::enqueue(
+        &mut tx,
+        org_id,
+        if rollback {
+            "policy.rolled_back"
+        } else {
+            "policy.published"
+        },
+        &serde_json::json!({
+            "revision": current.revision + 1,
+            "defaults": acl.defaults.as_str(),
+        }),
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1239,6 +1277,20 @@ async fn api_put_dns(
         Some(&org_id.to_string()),
         &serde_json::json!({
             "via": "admin_api",
+            "revision": current.revision + 1,
+            "managed": next.managed,
+        }),
+    )
+    .await?;
+    crate::webhooks::enqueue(
+        &mut tx,
+        org_id,
+        if rollback {
+            "dns.rolled_back"
+        } else {
+            "dns.published"
+        },
+        &serde_json::json!({
             "revision": current.revision + 1,
             "managed": next.managed,
         }),

@@ -199,6 +199,53 @@ paths:
         "204": { description: Revoked }
         "403": { description: Missing devices:write }
         "409": { description: Already revoked }
+  /api/v1/webhooks:
+    get:
+      summary: List organisation webhook destinations
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      responses:
+        "200": { description: Envelope of destinations without secrets }
+    post:
+      summary: Create a signed HTTPS webhook destination
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+      responses:
+        "201": { description: Destination plus shown-once signing secret }
+        "400": { description: SSRF or invalid URL }
+  /api/v1/webhooks/{destination_id}:
+    delete:
+      summary: Disable a webhook destination
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - name: destination_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Disabled }
+  /api/v1/webhooks/{destination_id}/deliveries:
+    get:
+      summary: List recent deliveries for one destination
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - name: destination_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Envelope of delivery attempts }
+  /api/v1/webhooks/deliveries/{delivery_id}/replay:
+    post:
+      summary: Replay a failed or dead-lettered delivery
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - name: delivery_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204": { description: Requeued }
   /api/v1/audit:
     get:
       summary: List audit events

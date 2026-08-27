@@ -280,6 +280,8 @@ dependencies = [
  "hmac 0.12.1",
  "idna",
  "rand 0.8.7",
+ "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",
