@@ -11,8 +11,11 @@ use std::{
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{net::UdpSocket, task::AbortHandle};
+
+const SPLIT_FORWARD_TIMEOUT: Duration = Duration::from_millis(800);
 
 const DNS_PORT: u16 = 53;
 const DNS_HEADER_LEN: usize = 12;
@@ -27,6 +30,12 @@ pub const MODE_RESOLV_CONF: &str = "resolv-conf";
 struct Records {
     domain: String,
     addresses: HashMap<String, Vec<IpAddr>>,
+    split: Vec<(String, Vec<SocketAddr>)>,
+}
+
+enum DnsAction {
+    Reply(Vec<u8>),
+    Forward(Vec<SocketAddr>),
 }
 
 pub struct MagicDns {
@@ -59,12 +68,21 @@ impl MagicDns {
                     Ok(received) => received,
                     Err(_) => return,
                 };
+                let query = request[..length].to_vec();
                 let records = match task_records.lock() {
                     Ok(records) => records.clone(),
                     Err(_) => return,
                 };
-                if let Some(response) = answer(&request[..length], &records) {
-                    let _ = socket.send_to(&response, source).await;
+                match dns_action(&query, &records) {
+                    Some(DnsAction::Reply(response)) => {
+                        let _ = socket.send_to(&response, source).await;
+                    }
+                    Some(DnsAction::Forward(resolvers)) => {
+                        if let Some(response) = forward_query(&query, &resolvers).await {
+                            let _ = socket.send_to(&response, source).await;
+                        }
+                    }
+                    None => {}
                 }
             }
         });
@@ -120,15 +138,48 @@ fn valid_domain(domain: &str) -> bool {
     !domain.is_empty()
         && domain.len() <= 253
         && domain.ends_with(".blaktail")
-        && domain.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
+        && labels_are_safe(domain)
+}
+
+fn valid_published_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix.len() <= 253
+        && suffix != "blaktail"
+        && !suffix.ends_with(".blaktail")
+        && labels_are_safe(suffix)
+}
+
+fn labels_are_safe(name: &str) -> bool {
+    name.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+pub fn published_resolver_suffixes(state: &NodeState) -> Vec<String> {
+    let Some(snapshot) = &state.org_dns else {
+        return Vec::new();
+    };
+    let mut suffixes = Vec::new();
+    let mut push = |value: &str| {
+        let value = value.trim_end_matches('.').to_ascii_lowercase();
+        if !valid_published_suffix(&value) || suffixes.iter().any(|existing| existing == &value) {
+            return;
+        }
+        suffixes.push(value);
+    };
+    for domain in &snapshot.search_domains {
+        push(domain);
+    }
+    for route in &snapshot.split {
+        push(&route.suffix);
+    }
+    suffixes
 }
 
 fn state_ip(state: &NodeState) -> Result<IpAddr, Error> {
@@ -155,15 +206,81 @@ fn records_from_state(state: &NodeState, domain: &str) -> Records {
             insert_record(&mut addresses, &peer.dns_name, address, domain);
         }
     }
+    let mut split = Vec::new();
     if let Some(snapshot) = &state.org_dns {
         for record in &snapshot.records {
             insert_extra_record(&mut addresses, record);
         }
+        split = split_from_snapshot(snapshot);
     }
     Records {
         domain: domain.into(),
         addresses,
+        split,
     }
+}
+
+fn split_from_snapshot(snapshot: &crate::OrgDnsSnapshot) -> Vec<(String, Vec<SocketAddr>)> {
+    snapshot
+        .split
+        .iter()
+        .filter_map(|route| {
+            let suffix = route.suffix.trim_end_matches('.').to_ascii_lowercase();
+            if !valid_published_suffix(&suffix) {
+                return None;
+            }
+            let resolvers = route
+                .resolvers
+                .iter()
+                .filter_map(|value| parse_resolver(value))
+                .collect::<Vec<_>>();
+            (!resolvers.is_empty()).then_some((suffix, resolvers))
+        })
+        .collect()
+}
+
+fn parse_resolver(value: &str) -> Option<SocketAddr> {
+    let value = value.trim();
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return (address.port() != 0).then_some(address);
+    }
+    Some(SocketAddr::new(value.parse().ok()?, 53))
+}
+
+fn split_resolvers(name: &str, records: &Records) -> Option<Vec<SocketAddr>> {
+    if name == "blaktail" || name.ends_with(".blaktail") {
+        return None;
+    }
+    records
+        .split
+        .iter()
+        .filter(|(suffix, _)| name == suffix.as_str() || name.ends_with(&format!(".{suffix}")))
+        .max_by_key(|(suffix, _)| suffix.len())
+        .map(|(_, resolvers)| resolvers.clone())
+        .filter(|resolvers| !resolvers.is_empty())
+}
+
+async fn forward_query(query: &[u8], resolvers: &[SocketAddr]) -> Option<Vec<u8>> {
+    for resolver in resolvers {
+        let bind = if resolver.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let Ok(upstream) = UdpSocket::bind(bind).await else {
+            continue;
+        };
+        if upstream.send_to(query, *resolver).await.is_err() {
+            continue;
+        }
+        let mut response = [0u8; 1_232];
+        if let Ok(Ok((length, _))) =
+            tokio::time::timeout(SPLIT_FORWARD_TIMEOUT, upstream.recv_from(&mut response)).await
+        {
+            return Some(response[..length].to_vec());
+        }
+    }
+    None
 }
 
 fn insert_record(
@@ -229,6 +346,33 @@ fn address_for_query(addresses: &[IpAddr], query_type: u16) -> Option<IpAddr> {
     })
 }
 
+fn dns_action(query: &[u8], records: &Records) -> Option<DnsAction> {
+    if query.len() < DNS_HEADER_LEN {
+        return None;
+    }
+    let flags = u16::from_be_bytes([query[2], query[3]]);
+    let questions = u16::from_be_bytes([query[4], query[5]]);
+    if flags & 0x8000 != 0 || flags & 0x7800 != 0 || questions != 1 {
+        return error_response(query, 1).map(DnsAction::Reply);
+    }
+    let (name, name_end) = parse_name(query, DNS_HEADER_LEN)?;
+    if name_end + 4 > query.len() {
+        return error_response(query, 1).map(DnsAction::Reply);
+    }
+    let name = name.to_ascii_lowercase();
+    let in_magic = magic_name(&name, &records.domain);
+    if !in_magic && !records.addresses.contains_key(&name) {
+        if let Some(resolvers) = split_resolvers(&name, records) {
+            return Some(DnsAction::Forward(resolvers));
+        }
+    }
+    answer(query, records).map(DnsAction::Reply)
+}
+
+fn magic_name(name: &str, domain: &str) -> bool {
+    !name.contains('.') || name == domain || name.ends_with(&format!(".{domain}"))
+}
+
 fn answer(query: &[u8], records: &Records) -> Option<Vec<u8>> {
     if query.len() < DNS_HEADER_LEN {
         return None;
@@ -247,9 +391,7 @@ fn answer(query: &[u8], records: &Records) -> Option<Vec<u8>> {
     let query_class = u16::from_be_bytes([query[name_end + 2], query[name_end + 3]]);
     let name = name.to_ascii_lowercase();
     let addresses = records.addresses.get(&name);
-    let in_magic = !name.contains('.')
-        || name == records.domain
-        || name.ends_with(&format!(".{}", records.domain));
+    let in_magic = magic_name(&name, &records.domain);
     let in_domain = in_magic || addresses.is_some();
     let address = addresses.and_then(|addresses| address_for_query(addresses, query_type));
     let response_code = if !in_domain {
@@ -330,7 +472,12 @@ fn parse_name(packet: &[u8], mut offset: usize) -> Option<(String, usize)> {
 }
 
 #[cfg(any(not(target_os = "macos"), test))]
-fn managed_resolv_conf(original: &str, dns_ip: IpAddr, domain: &str) -> String {
+fn managed_resolv_conf(
+    original: &str,
+    dns_ip: IpAddr,
+    domain: &str,
+    extra_search: &[String],
+) -> String {
     let search = original
         .lines()
         .find_map(|line| {
@@ -339,12 +486,26 @@ fn managed_resolv_conf(original: &str, dns_ip: IpAddr, domain: &str) -> String {
                 .or_else(|| line.strip_prefix("domain "))
         })
         .unwrap_or("");
+    let mut suffixes = Vec::new();
+    let mut push = |suffix: &str| {
+        let suffix = suffix.trim();
+        if suffix.is_empty()
+            || suffix == domain
+            || suffixes.iter().any(|existing| existing == suffix)
+        {
+            return;
+        }
+        suffixes.push(suffix.to_owned());
+    };
+    for suffix in extra_search {
+        push(suffix);
+    }
+    for suffix in search.split_whitespace() {
+        push(suffix);
+    }
+    suffixes.truncate(5);
     let mut content = format!("{MANAGED_MARKER}\nsearch {domain}");
-    for suffix in search
-        .split_whitespace()
-        .filter(|suffix| *suffix != domain)
-        .take(5)
-    {
+    for suffix in &suffixes {
         content.push(' ');
         content.push_str(suffix);
     }
@@ -364,20 +525,27 @@ pub fn configure_system_dns(
     interface: &str,
     dns_ip: IpAddr,
     domain: &str,
+    extra_suffixes: &[String],
 ) -> Result<String, Error> {
     if !valid_domain(domain) {
         return Err(Error::Message("invalid MagicDNS search domain".into()));
     }
-    configure_platform_dns(state_dir, interface, dns_ip, domain)
+    let extras = extra_suffixes
+        .iter()
+        .map(|suffix| suffix.trim_end_matches('.').to_ascii_lowercase())
+        .filter(|suffix| valid_published_suffix(suffix))
+        .collect::<Vec<_>>();
+    configure_platform_dns(state_dir, interface, dns_ip, domain, &extras)
 }
 
 pub fn remove_system_dns(
     state_dir: &Path,
     interface: &str,
     domain: &str,
+    extra_suffixes: &[String],
     mode: Option<&str>,
 ) -> Result<(), Error> {
-    remove_platform_dns(state_dir, interface, domain, mode)
+    remove_platform_dns(state_dir, interface, domain, extra_suffixes, mode)
 }
 
 #[cfg(target_os = "macos")]
@@ -386,15 +554,43 @@ fn configure_platform_dns(
     _interface: &str,
     dns_ip: IpAddr,
     domain: &str,
+    extra_suffixes: &[String],
 ) -> Result<String, Error> {
     let directory = Path::new("/etc/resolver");
     fs::create_dir_all(directory)?;
-    let path = directory.join(domain);
+    let search = std::iter::once(domain)
+        .chain(extra_suffixes.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
     let desired = format!(
-        "{MANAGED_MARKER}\nnameserver {dns_ip}\nport {DNS_PORT}\nsearch {domain}\nsearch_order 1\ntimeout 1\n"
+        "{MANAGED_MARKER}\nnameserver {dns_ip}\nport {DNS_PORT}\nsearch {search}\nsearch_order 1\ntimeout 1\n"
     );
+    let path = directory.join(domain);
     refuse_unmanaged_file(&path)?;
     write_atomic(&path, desired.as_bytes(), 0o644)?;
+    for suffix in extra_suffixes {
+        let extra = directory.join(suffix);
+        refuse_unmanaged_file(&extra)?;
+        write_atomic(&extra, desired.as_bytes(), 0o644)?;
+    }
+    if let Ok(entries) = fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name == domain || extra_suffixes.iter().any(|suffix| suffix == name) {
+                continue;
+            }
+            let path = entry.path();
+            if fs::read_to_string(&path)
+                .ok()
+                .is_some_and(|content| content.starts_with(MANAGED_MARKER))
+            {
+                let _ = remove_managed_file(&path);
+            }
+        }
+    }
     Ok(MODE_MACOS_RESOLVER.into())
 }
 
@@ -403,12 +599,21 @@ fn remove_platform_dns(
     _state_dir: &Path,
     _interface: &str,
     domain: &str,
+    extra_suffixes: &[String],
     mode: Option<&str>,
 ) -> Result<(), Error> {
-    if (mode.is_some() && mode != Some(MODE_MACOS_RESOLVER)) || !valid_domain(domain) {
+    if mode.is_some() && mode != Some(MODE_MACOS_RESOLVER) {
         return Ok(());
     }
-    remove_managed_file(&Path::new("/etc/resolver").join(domain))
+    if valid_domain(domain) {
+        remove_managed_file(&Path::new("/etc/resolver").join(domain))?;
+    }
+    for suffix in extra_suffixes {
+        if valid_published_suffix(suffix) {
+            remove_managed_file(&Path::new("/etc/resolver").join(suffix))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -417,15 +622,27 @@ fn configure_platform_dns(
     interface: &str,
     dns_ip: IpAddr,
     domain: &str,
+    extra_suffixes: &[String],
 ) -> Result<String, Error> {
     if run_quiet("resolvectl", &["dns", interface, &dns_ip.to_string()]).is_ok() {
-        let route_only = format!("~{domain}");
-        if run_quiet("resolvectl", &["domain", interface, domain, &route_only]).is_ok() {
+        let mut domains = vec![domain.to_owned(), format!("~{domain}")];
+        for suffix in extra_suffixes {
+            domains.push(suffix.clone());
+            domains.push(format!("~{suffix}"));
+        }
+        let mut args = vec!["domain", interface];
+        args.extend(domains.iter().map(String::as_str));
+        if run_quiet("resolvectl", &args).is_ok() {
             return Ok(MODE_SYSTEMD_RESOLVED.into());
         }
         let _ = run_quiet("resolvectl", &["revert", interface]);
     }
 
+    let search = std::iter::once(domain)
+        .chain(extra_suffixes.iter().map(String::as_str))
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut child = Command::new("resolvconf")
         .args(["-a", &format!("{interface}.blaktail")])
         .stdin(Stdio::piped())
@@ -434,14 +651,14 @@ fn configure_platform_dns(
         .spawn();
     if let Ok(ref mut child) = child {
         if let Some(stdin) = child.stdin.as_mut() {
-            let _ = write!(stdin, "nameserver {dns_ip}\nsearch {domain}\n");
+            let _ = write!(stdin, "nameserver {dns_ip}\nsearch {search}\n");
         }
         if child.wait().is_ok_and(|status| status.success()) {
             return Ok(MODE_RESOLVCONF.into());
         }
     }
 
-    configure_resolv_conf(state_dir, dns_ip, domain)?;
+    configure_resolv_conf(state_dir, dns_ip, domain, extra_suffixes)?;
     Ok(MODE_RESOLV_CONF.into())
 }
 
@@ -450,6 +667,7 @@ fn remove_platform_dns(
     state_dir: &Path,
     interface: &str,
     _domain: &str,
+    _extra_suffixes: &[String],
     mode: Option<&str>,
 ) -> Result<(), Error> {
     match mode {
@@ -461,7 +679,12 @@ fn remove_platform_dns(
 }
 
 #[cfg(not(target_os = "macos"))]
-fn configure_resolv_conf(state_dir: &Path, dns_ip: IpAddr, domain: &str) -> Result<(), Error> {
+fn configure_resolv_conf(
+    state_dir: &Path,
+    dns_ip: IpAddr,
+    domain: &str,
+    extra_search: &[String],
+) -> Result<(), Error> {
     let path = Path::new("/etc/resolv.conf");
     if fs::symlink_metadata(path)?.file_type().is_symlink() {
         return Err(Error::Message(
@@ -486,7 +709,7 @@ fn configure_resolv_conf(state_dir: &Path, dns_ip: IpAddr, domain: &str) -> Resu
         fs::copy(path, &backup)?;
     }
     let original = fs::read_to_string(&backup)?;
-    let content = managed_resolv_conf(&original, dns_ip, domain);
+    let content = managed_resolv_conf(&original, dns_ip, domain, extra_search);
     let mode = fs::metadata(path)?.permissions().mode() & 0o777;
     write_atomic(path, content.as_bytes(), mode)
 }
@@ -763,6 +986,8 @@ mod tests {
                     value: "fd12:3456:789a:bcde::10".into(),
                 },
             ],
+            search_domains: vec!["internal.example".into()],
+            split: vec![],
         });
         let records = records_from_state(&state, "12345678.blaktail");
         let a = answer(&query("wiki.internal.example", 1), &records).unwrap();
@@ -806,11 +1031,134 @@ mod tests {
             original,
             IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
             "12345678.blaktail",
+            &[],
         );
         assert!(managed.starts_with(
             "# Managed by blaktaild\nsearch 12345678.blaktail office.example\nnameserver 100.64.0.1\n"
         ));
         assert!(managed.contains("nameserver 192.0.2.53\n"));
         assert!(managed.contains("options edns0\n"));
+    }
+
+    #[test]
+    fn resolv_conf_prepends_published_search_domains() {
+        let original = "search office.example leftover.example\nnameserver 192.0.2.53\n";
+        let managed = managed_resolv_conf(
+            original,
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            "12345678.blaktail",
+            &["internal.example".into(), "12345678.blaktail".into()],
+        );
+        assert!(managed.starts_with(
+            "# Managed by blaktaild\nsearch 12345678.blaktail internal.example office.example leftover.example\nnameserver 100.64.0.1\n"
+        ));
+    }
+
+    fn snapshot_with_split() -> crate::OrgDnsSnapshot {
+        crate::OrgDnsSnapshot {
+            revision: 4,
+            managed: true,
+            records: vec![crate::OrgDnsRecord {
+                name: "wiki.internal.example".into(),
+                record_type: "A".into(),
+                value: "10.0.0.10".into(),
+            }],
+            search_domains: vec!["internal.example".into()],
+            split: vec![crate::OrgDnsSplit {
+                suffix: "internal.example".into(),
+                resolvers: vec!["127.0.0.1:53535".into()],
+            }],
+        }
+    }
+
+    #[test]
+    fn split_suffix_without_local_record_forwards_and_never_forwards_blaktail() {
+        let mut state = state();
+        state.org_dns = Some(snapshot_with_split());
+        let records = records_from_state(&state, "12345678.blaktail");
+        assert!(matches!(
+            dns_action(&query("missing.internal.example", 1), &records),
+            Some(DnsAction::Forward(resolvers))
+                if resolvers == vec!["127.0.0.1:53535".parse().unwrap()]
+        ));
+        assert!(matches!(
+            dns_action(&query("wiki.internal.example", 1), &records),
+            Some(DnsAction::Reply(response)) if response[3] & 0x0f == 0
+        ));
+        assert!(matches!(
+            dns_action(&query("example.com", 1), &records),
+            Some(DnsAction::Reply(response)) if response[3] & 0x0f == 5
+        ));
+        assert!(matches!(
+            dns_action(&query("missing.12345678.blaktail", 1), &records),
+            Some(DnsAction::Reply(response)) if response[3] & 0x0f == 3
+        ));
+        assert_eq!(
+            published_resolver_suffixes(&state),
+            vec!["internal.example".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_stub_forwards_split_names_to_published_resolvers() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut packet = [0u8; 1_232];
+            loop {
+                let Ok((length, source)) = upstream.recv_from(&mut packet).await else {
+                    return;
+                };
+                let mut records = Records::default();
+                records.addresses.insert(
+                    "split.internal.example".into(),
+                    vec![IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7))],
+                );
+                if let Some(response) = answer(&packet[..length], &records) {
+                    let _ = upstream.send_to(&response, source).await;
+                }
+            }
+        });
+
+        let mut state = state();
+        state.org_dns = Some(crate::OrgDnsSnapshot {
+            revision: 5,
+            managed: true,
+            records: vec![],
+            search_domains: vec!["internal.example".into()],
+            split: vec![crate::OrgDnsSplit {
+                suffix: "internal.example".into(),
+                resolvers: vec![upstream_addr.to_string()],
+            }],
+        });
+        let dns = MagicDns::spawn_at(
+            "127.0.0.1:0".parse().unwrap(),
+            &state,
+            "12345678.blaktail".into(),
+        )
+        .await
+        .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut response = [0u8; 512];
+        client
+            .send_to(&query("split.internal.example", 1), dns.listen_addr())
+            .await
+            .unwrap();
+        let length = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&response[length - 4..length], &[10, 9, 8, 7]);
+        client
+            .send_to(&query("example.com", 1), dns.listen_addr())
+            .await
+            .unwrap();
+        let length = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response[3] & 0x0f, 5);
+        assert_eq!(length, query("example.com", 1).len());
+        dns.stop();
     }
 }

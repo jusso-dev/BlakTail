@@ -41,9 +41,12 @@ sent. Members are read-only.
 ## Agent apply
 
 Peer poll responses include the published snapshot as `dns`. Agents persist that
-snapshot and answer extra A/AAAA records locally by full name only. MagicDNS
-peer names stay coordinator-authoritative: `*.blaktail` still NXDOMAIN for
-unknown names, and public names without an extra record stay REFUSED.
+snapshot and keep the last successful copy when a later poll omits `dns` or
+fails. Extra A/AAAA records are answered locally by full name only. Published
+search domains are prepended after the MagicDNS domain (six suffixes total).
+Names under a split suffix without a local extra record are forwarded to that
+suffix's resolvers. MagicDNS peer names stay coordinator-authoritative:
+`*.blaktail` is never forwarded, unknown `*.blaktail` names stay NXDOMAIN, and
+public names without an extra record or split match stay REFUSED.
 
-Split forwarding, search domains, last-known-good apply, packet-capture leak
-proofs, and a two-agent extra-record E2E remain on #40.
+Packet-capture leak proofs and a two-agent extra-record E2E remain on #40.

@@ -1,9 +1,9 @@
 use blaktail_config::{AgentConfig, ConfigHandle, LoadedConfig, ReloadPlan, Service};
 use blaktaild::{
-    configure_system_dns, dns_domain, ensure_private_key, peer_key_hex, read_state,
-    remove_system_dns, restore_peers, sync_once, validate_advertised_routes, validate_interface,
-    write_state, Coordinator, MagicDns, Network, Registration, RelayMesh, DIRECT_GRACE_SECS,
-    DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
+    configure_system_dns, dns_domain, ensure_private_key, peer_key_hex,
+    published_resolver_suffixes, read_state, remove_system_dns, restore_peers, sync_once,
+    validate_advertised_routes, validate_interface, write_state, Coordinator, MagicDns, Network,
+    Registration, RelayMesh, DIRECT_GRACE_SECS, DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
 };
 use clap::{Parser, Subcommand};
 use std::{
@@ -412,6 +412,7 @@ async fn manage_magic_dns(
             state_dir,
             &state.interface,
             &old_domain,
+            &published_resolver_suffixes(state),
             state.dns_mode.as_deref(),
         ) {
             warn!(%error, "could not remove stale MagicDNS configuration");
@@ -430,15 +431,21 @@ async fn manage_magic_dns(
                 return;
             }
         };
-        let mode =
-            match configure_system_dns(state_dir, &state.interface, created.bind_ip(), &domain) {
-                Ok(mode) => mode,
-                Err(error) => {
-                    created.stop();
-                    warn!(%error, "could not configure system MagicDNS routing");
-                    return;
-                }
-            };
+        let extras = published_resolver_suffixes(state);
+        let mode = match configure_system_dns(
+            state_dir,
+            &state.interface,
+            created.bind_ip(),
+            &domain,
+            &extras,
+        ) {
+            Ok(mode) => mode,
+            Err(error) => {
+                created.stop();
+                warn!(%error, "could not configure system MagicDNS routing");
+                return;
+            }
+        };
         info!(%domain, mode, "MagicDNS resolver active");
         state.dns_mode = Some(mode);
         if let Err(error) = write_state(state_dir, state) {
@@ -448,6 +455,16 @@ async fn manage_magic_dns(
     }
     if let Some(active) = dns.as_ref() {
         active.update(state);
+        let extras = published_resolver_suffixes(state);
+        if let Err(error) = configure_system_dns(
+            state_dir,
+            &state.interface,
+            active.bind_ip(),
+            &domain,
+            &extras,
+        ) {
+            warn!(%error, "could not refresh published DNS search and split routing");
+        }
     }
 }
 
@@ -465,6 +482,7 @@ fn shutdown_magic_dns(
         state_dir,
         &state.interface,
         &domain,
+        &published_resolver_suffixes(state),
         state.dns_mode.as_deref(),
     ) {
         Ok(()) => {
@@ -1123,6 +1141,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                     state_dir,
                     &state.interface,
                     &domain,
+                    &published_resolver_suffixes(&state),
                     state.dns_mode.as_deref(),
                 )?;
             }
@@ -1146,6 +1165,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                     state_dir,
                     &state.interface,
                     &domain,
+                    &published_resolver_suffixes(&state),
                     state.dns_mode.as_deref(),
                 )?;
             }
