@@ -19,11 +19,13 @@ rejected.
 
 `POST /oauth/token` accepts the OAuth 2.0 `client_credentials` grant. The
 client id is the automation client UUID; the client secret is the shown-once
-`bta_` token. Credentials may be sent as HTTP Basic or form fields. The
-response access token is that same hashed secret, plus `organisation_id` so
-callers can set `X-BlakTail-Organisation`. Requested `scope` must be empty or
-a subset of the registered scopes; the token still carries the registered
-set. Distinct short-lived access tokens remain later.
+`bta_` token. Credentials may be sent as HTTP Basic or form fields. A
+successful exchange mints a distinct hashed `bto_` access token that expires
+in at most one hour, plus `organisation_id` so callers can set
+`X-BlakTail-Organisation`. The static `bta_` secret remains a bootstrap
+Bearer option. Requested `scope` must be empty or a subset of the registered
+scopes; the access token still carries the registered set. Revoking the
+client rejects later access tokens. Webhook/event delivery remains later.
 
 ## Writes
 
@@ -49,6 +51,6 @@ CI also runs an in-process Terraform/provider-style contract
 (`admin_api_provider_contract_manages_device_lifecycle`) that mints a `bta_`
 client, enrols a device from a minted key, renames it without changing the
 WireGuard identity, publishes policy and DNS with etags, tombstones the device,
-and proves a read-only token cannot write. `POST /oauth/token` issues the
-same `bta_` secret for the `client_credentials` grant. Distinct short-lived
-access tokens remain on #37.
+and proves a read-only token cannot write. `POST /oauth/token` mints a
+short-lived `bto_` access token for the `client_credentials` grant. Webhook
+delivery remains on #37.

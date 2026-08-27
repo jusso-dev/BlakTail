@@ -104,7 +104,8 @@ rechecks the survivor.
 - `DELETE /v1/orgs/{org_id}/nodes/{node_id}` — owner/admin session; revoke a device
 - `POST /v1/orgs/{org_id}/nodes/{node_id}/tombstone` — owner/admin session; remove a device from default inventory
 - `GET/POST /v1/orgs/{org_id}/api-clients` and `DELETE /v1/orgs/{org_id}/api-clients/{id}` — owner-created automation credentials
-- `/api/v1/*` — versioned admin API; `Authorization: Bearer bta_…` plus `X-BlakTail-Organisation`; OpenAPI in [docs/openapi/admin-v1.yaml](openapi/admin-v1.yaml); compatibility policy in [admin-api.md](admin-api.md)
+- `/api/v1/*` — versioned admin API; `Authorization: Bearer bta_…` or a short-lived `bto_` access token plus `X-BlakTail-Organisation`; OpenAPI in [docs/openapi/admin-v1.yaml](openapi/admin-v1.yaml); compatibility policy in [admin-api.md](admin-api.md)
+- `POST /oauth/token` — OAuth client-credentials exchange that mints a hashed `bto_` access token from a `bta_` automation secret
 - `POST /v1/nodes/register` — join key, name, WG public key, and optional public endpoint; the server allocates a tailnet IP
 - `GET /v1/nodes/{node_id}/peers` — bearer node token; active peers only
 - `PUT /v1/nodes/{node_id}/routes` — bearer node token; replace route advertisements and drop stale approvals

@@ -15,7 +15,7 @@ review still has to cover.
 | Bootstrap lock | Public signup disabled; one first-owner ceremony | Console bootstrap/auth HTTP e2e | Host-level recovery and invitation abuse |
 | Session / HMAC | Console issues sessions; coordinator verifies HMAC | Console tests, coordinator assertion tests | Clock skew, replay, and secret rotation drill |
 | Join keys / node tokens | Shown once, hashed at rest, single-use | Coordinator join/reauth/revoke tests | Operator copy/paste and log-leak review |
-| Admin API | Scoped `bta_` tokens, OpenAPI, body/rate bounds | `scripts/admin-openapi-drift.sh`, admin API tests | OAuth client-credentials and provider contract |
+| Admin API | Scoped `bta_` tokens, OpenAPI, body/rate bounds | `scripts/admin-openapi-drift.sh`, admin API tests | Webhook/event delivery and operator-held secrets |
 | ACL / policy | Deny wins; groups; tag owners; offline tests | `blaktail-coord check-policy`, coordinator policy tests, homelab ACL prove | Ports/protocols/SSH and two-agent policy packet proof |
 | MagicDNS | Authoritative-only; no public forward of the suffix | DNS unit/wire tests; Linux AWS smoke | Fresh macOS join and no-leak capture |
 | Routes / exit | Advertisement ≠ approval ≠ distribution | Coordinator route tests; `ADVERTISE_SUBNET` drill flag | Live subnet and DNS-while-exit packets |

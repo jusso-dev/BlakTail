@@ -216,7 +216,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: bta_ automation token. Node tokens and join keys are rejected.
+      description: bta_ automation secret or short-lived bto_ access token. Node tokens and join keys are rejected.
     organisationHeader:
       type: apiKey
       in: header

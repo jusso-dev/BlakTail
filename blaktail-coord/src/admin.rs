@@ -17,6 +17,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 const API_PREFIX: &str = "bta";
+const ACCESS_PREFIX: &str = "bto";
+const ACCESS_TOKEN_TTL_SECS: i64 = 3600;
 const DEFAULT_TOKEN_TTL_SECS: i64 = 90 * 24 * 60 * 60;
 const MAX_TOKEN_TTL_SECS: i64 = 365 * 24 * 60 * 60;
 
@@ -166,6 +168,9 @@ async fn authenticate(
     org_id: Uuid,
 ) -> Result<ApiCaller, ApiError> {
     let token = bearer_value(headers)?;
+    if token.starts_with(&format!("{ACCESS_PREFIX}_")) {
+        return access_token_session(state, token, org_id).await;
+    }
     if token.starts_with(&format!("{API_PREFIX}_")) {
         return api_token_session(state, token, org_id).await;
     }
@@ -212,6 +217,66 @@ async fn api_token_session(
     if expires_at.is_some_and(|expires| expires <= current_time) {
         return Err(ApiError::Unauthorized);
     }
+    sqlx::query("UPDATE api_clients SET last_used_at=$1 WHERE id=$2")
+        .bind(current_time)
+        .bind(&client_id)
+        .execute(&state.store.pool)
+        .await?;
+    if !state.api_rate.allow(
+        &client_id,
+        current_time,
+        ADMIN_API_RATE_LIMIT,
+        ADMIN_API_RATE_WINDOW_SECS,
+    ) {
+        return Err(ApiError::TooManyRequests);
+    }
+    Ok(ApiCaller {
+        session: Session {
+            user_id: format!("api:{client_id}"),
+            role: Role::Admin,
+            name,
+            email: String::new(),
+        },
+        client_id: Some(client_id),
+        scopes,
+    })
+}
+
+async fn access_token_session(
+    state: &AppState,
+    token: &str,
+    org_id: Uuid,
+) -> Result<ApiCaller, ApiError> {
+    let current_time = now();
+    let row = sqlx::query(
+        "SELECT t.api_client_id, c.name, t.scopes_json, t.expires_at, c.revoked_at, c.expires_at
+         FROM oauth_access_tokens t
+         JOIN api_clients c ON c.id = t.api_client_id AND c.org_id = t.org_id
+         WHERE t.token_hash=$1 AND t.org_id=$2",
+    )
+    .bind(hash(token))
+    .bind(org_id.to_string())
+    .fetch_optional(&state.store.pool)
+    .await?
+    .ok_or(ApiError::Unauthorized)?;
+    let client_id: String = row.try_get(0)?;
+    let name: String = row.try_get(1)?;
+    let scopes: Vec<Scope> =
+        serde_json::from_str(&row.try_get::<String, _>(2)?).map_err(|_| ApiError::CorruptData)?;
+    let access_expires_at: i64 = row.try_get(3)?;
+    let revoked_at: Option<i64> = row.try_get(4)?;
+    let client_expires_at: Option<i64> = row.try_get(5)?;
+    if revoked_at.is_some()
+        || access_expires_at <= current_time
+        || client_expires_at.is_some_and(|expires| expires <= current_time)
+    {
+        return Err(ApiError::Unauthorized);
+    }
+    sqlx::query("UPDATE oauth_access_tokens SET last_used_at=$1 WHERE token_hash=$2")
+        .bind(current_time)
+        .bind(hash(token))
+        .execute(&state.store.pool)
+        .await?;
     sqlx::query("UPDATE api_clients SET last_used_at=$1 WHERE id=$2")
         .bind(current_time)
         .bind(&client_id)
@@ -555,7 +620,7 @@ pub(crate) async fn oauth_token(
     }
     let current_time = now();
     let row = sqlx::query(
-        "SELECT org_id,scopes_json,expires_at FROM api_clients WHERE id=$1 AND token_hash=$2 AND revoked_at IS NULL",
+        "SELECT org_id,name,scopes_json,expires_at FROM api_clients WHERE id=$1 AND token_hash=$2 AND revoked_at IS NULL",
     )
     .bind(client_id.to_string())
     .bind(hash(&client_secret))
@@ -568,25 +633,20 @@ pub(crate) async fn oauth_token(
             .map_err(|_| OAuthError::server_error())?,
     )
     .map_err(|_| OAuthError::server_error())?;
+    let name: String = row.try_get(1).map_err(|_| OAuthError::server_error())?;
     let scopes: Vec<Scope> = serde_json::from_str(
-        &row.try_get::<String, _>(1)
+        &row.try_get::<String, _>(2)
             .map_err(|_| OAuthError::server_error())?,
     )
     .map_err(|_| OAuthError::server_error())?;
-    let expires_at: Option<i64> = row.try_get(2).map_err(|_| OAuthError::server_error())?;
-    if expires_at.is_some_and(|expires| expires <= current_time) {
+    let client_expires_at: Option<i64> = row.try_get(3).map_err(|_| OAuthError::server_error())?;
+    if client_expires_at.is_some_and(|expires| expires <= current_time) {
         return Err(OAuthError::invalid_client());
     }
     let requested = parse_requested_scopes(&input.scope)?;
     if requested.iter().any(|scope| !scopes.contains(scope)) {
         return Err(OAuthError::invalid_scope());
     }
-    sqlx::query("UPDATE api_clients SET last_used_at=$1 WHERE id=$2")
-        .bind(current_time)
-        .bind(client_id.to_string())
-        .execute(&s.store.pool)
-        .await
-        .map_err(|_| OAuthError::server_error())?;
     if !s.api_rate.allow(
         &client_id.to_string(),
         current_time,
@@ -599,10 +659,72 @@ pub(crate) async fn oauth_token(
             description: "client is rate limited",
         });
     }
+    let access_expires_at = client_expires_at
+        .unwrap_or(current_time + ACCESS_TOKEN_TTL_SECS)
+        .min(current_time + ACCESS_TOKEN_TTL_SECS);
+    if access_expires_at <= current_time {
+        return Err(OAuthError::invalid_client());
+    }
+    let access_token = secret(ACCESS_PREFIX);
+    let token_prefix = access_token.chars().take(11).collect::<String>();
+    let token_id = Uuid::new_v4();
+    let mut tx = s
+        .store
+        .pool
+        .begin()
+        .await
+        .map_err(|_| OAuthError::server_error())?;
+    sqlx::query("DELETE FROM oauth_access_tokens WHERE api_client_id=$1 AND expires_at<=$2")
+        .bind(client_id.to_string())
+        .bind(current_time)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| OAuthError::server_error())?;
+    sqlx::query(
+        "INSERT INTO oauth_access_tokens(id,org_id,api_client_id,token_hash,token_prefix,scopes_json,created_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",
+    )
+    .bind(token_id.to_string())
+    .bind(org_id.to_string())
+    .bind(client_id.to_string())
+    .bind(hash(&access_token))
+    .bind(&token_prefix)
+    .bind(serde_json::to_string(&scopes).unwrap())
+    .bind(current_time)
+    .bind(access_expires_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| OAuthError::server_error())?;
+    sqlx::query("UPDATE api_clients SET last_used_at=$1 WHERE id=$2")
+        .bind(current_time)
+        .bind(client_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| OAuthError::server_error())?;
+    append_audit(
+        &mut tx,
+        org_id,
+        &Session {
+            user_id: format!("api:{client_id}"),
+            role: Role::Admin,
+            name,
+            email: String::new(),
+        },
+        "oauth.access_token_issued",
+        "oauth_access_token",
+        Some(&token_id.to_string()),
+        &serde_json::json!({
+            "api_client_id": client_id,
+            "token_prefix": token_prefix,
+            "expires_at": access_expires_at,
+        }),
+    )
+    .await
+    .map_err(|_| OAuthError::server_error())?;
+    tx.commit().await.map_err(|_| OAuthError::server_error())?;
     Ok(Json(OAuthTokenResponse {
-        access_token: client_secret,
+        access_token,
         token_type: "Bearer",
-        expires_in: expires_at.unwrap_or(current_time + 3600) - current_time,
+        expires_in: access_expires_at - current_time,
         scope: scopes
             .iter()
             .map(|scope| scope.as_str())

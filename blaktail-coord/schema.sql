@@ -139,3 +139,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS wireguard_only_peers_org_key_idx
  ON wireguard_only_peers(org_id, wg_public_key) WHERE revoked_at IS NULL;
 CREATE INDEX IF NOT EXISTS wireguard_only_peers_org_idx
  ON wireguard_only_peers(org_id, revoked_at);
+CREATE TABLE IF NOT EXISTS oauth_access_tokens (
+ id TEXT PRIMARY KEY,
+ org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+ api_client_id TEXT NOT NULL REFERENCES api_clients(id) ON DELETE CASCADE,
+ token_hash TEXT NOT NULL UNIQUE,
+ token_prefix TEXT NOT NULL,
+ scopes_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(scopes_json)),
+ created_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL,
+ last_used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS oauth_access_tokens_client_idx
+ ON oauth_access_tokens(api_client_id, expires_at);
+CREATE INDEX IF NOT EXISTS oauth_access_tokens_org_idx
+ ON oauth_access_tokens(org_id, expires_at);
