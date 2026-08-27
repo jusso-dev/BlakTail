@@ -278,6 +278,7 @@ dependencies = [
  "chrono",
  "clap",
  "hmac 0.12.1",
+ "idna",
  "rand 0.8.7",
  "serde",
  "serde_json",

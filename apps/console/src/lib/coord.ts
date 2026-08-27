@@ -426,6 +426,53 @@ export async function getAcl(ctx: ConsoleContext): Promise<unknown> {
   return res.json();
 }
 
+export type OrgDnsSettings = {
+  managed: boolean;
+  global_resolvers: string[];
+  split: { suffix: string; resolvers: string[] }[];
+  search_domains: string[];
+  records: { name: string; type: "A" | "AAAA"; value: string }[];
+};
+
+export type OrgDnsResponse = {
+  revision: number;
+  etag: string;
+  has_previous: boolean;
+  magic_dns_suffix: string;
+  dns: OrgDnsSettings;
+};
+
+export async function getDns(ctx: ConsoleContext): Promise<OrgDnsResponse> {
+  const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/dns`, {
+    method: "GET",
+    ctx,
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<OrgDnsResponse>;
+}
+
+export async function putDns(
+  ctx: ConsoleContext,
+  body: { dns?: OrgDnsSettings; rollback?: boolean },
+  etag: string,
+): Promise<OrgDnsResponse> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot publish DNS settings.");
+  }
+  const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/dns`, {
+    method: "PUT",
+    ctx,
+    headers: { "If-Match": etag },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<OrgDnsResponse>;
+}
+
 export async function putAcl(ctx: ConsoleContext, acl: unknown): Promise<void> {
   if (ctx.role === "member") {
     throw new Error("Members cannot edit ACL rules.");

@@ -18,8 +18,9 @@ local process for access, correction, export, and deletion requests.
 - The coordinator's SQLite or PostgreSQL store holds organisation and node identifiers, device names,
   WireGuard public keys, tailnet addresses, advertised endpoints/routes, ACLs,
   hashed join/node/automation credentials, credential expiry, last-seen time,
-  bounded agent OS/architecture/version/capability metadata, and actor-attributed
-  audit events. Hardware serials, location, and process inventory are not collected.
+  bounded agent OS/architecture/version/capability metadata, published organisation
+  DNS settings, and actor-attributed audit events. Hardware serials, location,
+  process inventory, and DNS query names are not collected.
 - A relay keeps node identifiers and public socket addresses in memory. Registrations
   expire after 120 seconds idle. It forwards opaque WireGuard ciphertext and cannot
   decrypt the inner traffic.

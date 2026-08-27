@@ -1,7 +1,9 @@
 mod admin;
 mod metrics;
+mod org_dns;
 
 pub use metrics::CoordMetrics;
+pub use org_dns::{check_dns_document, DnsCheckReport};
 
 #[derive(Debug, Serialize)]
 pub struct PolicyCheckReport {
@@ -54,7 +56,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 const DEFAULT_AUDIT_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const NODE_ONLINE_SECS: i64 = 90;
 const EPHEMERAL_OFFLINE_SECS: i64 = 24 * 60 * 60;
@@ -133,6 +135,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "device inventory, audit retention, and automation clients",
         postgres_sql: include_str!("../migrations/postgres/0005_inventory_admin_api.sql"),
+    },
+    Migration {
+        version: 6,
+        name: "organisation DNS settings",
+        postgres_sql: include_str!("../migrations/postgres/0006_org_dns.sql"),
     },
 ];
 
@@ -324,6 +331,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             3 => migrate_sqlite_to_v3(&mut tx).await?,
             4 => migrate_sqlite_to_v4(&mut tx).await?,
             5 => migrate_sqlite_to_v5(&mut tx).await?,
+            6 => migrate_sqlite_to_v6(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -334,6 +342,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             3 => "PRAGMA user_version=3",
             4 => "PRAGMA user_version=4",
             5 => "PRAGMA user_version=5",
+            6 => "PRAGMA user_version=6",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -605,6 +614,21 @@ async fn migrate_sqlite_to_v5(
     Ok(())
 }
 
+async fn migrate_sqlite_to_v6(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    ensure_column(
+        tx,
+        "orgs",
+        "dns_json",
+        "TEXT NOT NULL DEFAULT '{\"managed\":true,\"global_resolvers\":[],\"split\":[],\"search_domains\":[],\"records\":[]}'",
+    )
+    .await?;
+    ensure_column(tx, "orgs", "dns_revision", "INTEGER NOT NULL DEFAULT 0").await?;
+    ensure_column(tx, "orgs", "dns_previous_json", "TEXT").await?;
+    Ok(())
+}
+
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
     let rows =
         sqlx::query("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")
@@ -825,6 +849,7 @@ pub fn app_with_relays_console_and_metrics(
         )
         .route("/v1/orgs/:org_id/acl", get(get_acl))
         .route("/v1/orgs/:org_id/acl", put(put_acl))
+        .route("/v1/orgs/:org_id/dns", get(get_dns).put(put_dns))
         .route("/v1/orgs/:org_id/security", get(get_security_policy))
         .route("/v1/orgs/:org_id/security", put(put_security_policy))
         .route("/v1/orgs/:org_id/audit", get(list_audit_events))
@@ -2251,6 +2276,8 @@ struct PeersResponse {
     relay_token: String,
     #[serde(default)]
     relay_expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dns: Option<org_dns::OrgDnsAgentView>,
 }
 
 #[derive(Default, Deserialize)]
@@ -2268,7 +2295,7 @@ async fn list_peers(
     headers: HeaderMap,
 ) -> Result<Json<PeersResponse>, ApiError> {
     let token = bearer(&headers)?;
-    let source_row = sqlx::query("SELECT n.org_id,n.user_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=$1 AND n.token_hash=$2 AND n.revoked_at IS NULL AND n.deleted_at IS NULL")
+    let source_row = sqlx::query("SELECT n.org_id,n.user_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json,o.dns_json,o.dns_revision FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=$1 AND n.token_hash=$2 AND n.revoked_at IS NULL AND n.deleted_at IS NULL")
         .bind(node_id.to_string())
         .bind(token)
         .fetch_optional(&s.store.pool)
@@ -2282,6 +2309,8 @@ async fn list_peers(
     let credential_expires_at: i64 = source_row.try_get(5)?;
     let dns_name: String = source_row.try_get(6)?;
     let source_addresses: String = source_row.try_get(7)?;
+    let org_dns_json: String = source_row.try_get(8).unwrap_or_default();
+    let org_dns_revision: i64 = source_row.try_get(9).unwrap_or(0);
     if credential_expires_at <= now() {
         return Err(ApiError::CredentialExpired);
     }
@@ -2303,7 +2332,7 @@ async fn list_peers(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let rows = sqlx::query("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>$3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL AND deleted_at IS NULL AND credential_expires_at>$4 ORDER BY name")
-        .bind(org)
+        .bind(org.clone())
         .bind(node_id.to_string())
         .bind(now() - RELAY_ENDPOINT_FRESH_SECS)
         .bind(now())
@@ -2373,6 +2402,9 @@ async fn list_peers(
         assigned_ips.retain(|address| !address.contains(':'));
     }
     let (relay_token, relay_expires_at) = relay_credentials(&s, node_id);
+    let dns = org_dns::parse_settings(&org_dns_json)
+        .ok()
+        .map(|settings| settings.agent_view(&org, org_dns_revision));
     Ok(Json(PeersResponse {
         peers,
         assigned_ips,
@@ -2382,6 +2414,7 @@ async fn list_peers(
         relays: s.relays.as_ref().clone(),
         relay_token,
         relay_expires_at,
+        dns,
     }))
 }
 
@@ -3084,6 +3117,152 @@ async fn put_acl(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_dns(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<org_dns::OrgDnsResponse>, ApiError> {
+    console_session(&s, &headers, org_id).await?;
+    Ok(Json(load_org_dns(&s.store, org_id).await?))
+}
+
+async fn put_dns(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(value): Json<serde_json::Value>,
+) -> Result<Json<org_dns::OrgDnsResponse>, ApiError> {
+    let session = console_session(&s, &headers, org_id).await?;
+    if session.role == Role::Member {
+        return Err(ApiError::Forbidden);
+    }
+    let mut tx = s.store.pool.begin().await?;
+    let current = load_org_dns_tx(&mut tx, org_id).await?;
+    if let Some(expected) = headers
+        .get("if-match")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let quoted = format!("\"{}\"", current.etag);
+        if expected != current.etag && expected != quoted {
+            return Err(ApiError::PreconditionFailed);
+        }
+    }
+    let rollback = value
+        .get("rollback")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let next = if rollback {
+        load_previous_dns_tx(&mut tx, org_id).await?
+    } else {
+        let settings = value.get("dns").cloned().unwrap_or(value);
+        org_dns::parse_settings(&settings.to_string())?
+    };
+    publish_org_dns(&mut tx, org_id, &current, &next).await?;
+    append_audit(
+        &mut tx,
+        org_id,
+        &session,
+        if rollback {
+            "dns.rolled_back"
+        } else {
+            "dns.updated"
+        },
+        "dns",
+        Some(&org_id.to_string()),
+        &serde_json::json!({
+            "revision": current.revision + 1,
+            "managed": next.managed,
+            "split": next.split.len(),
+            "records": next.records.len(),
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(load_org_dns(&s.store, org_id).await?))
+}
+
+pub(crate) async fn load_org_dns(
+    store: &Store,
+    org_id: Uuid,
+) -> Result<org_dns::OrgDnsResponse, ApiError> {
+    let row = sqlx::query("SELECT dns_json,dns_revision,dns_previous_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&store.pool)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    org_dns_from_row(org_id, row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)
+}
+
+pub(crate) async fn load_org_dns_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: Uuid,
+) -> Result<org_dns::OrgDnsResponse, ApiError> {
+    let row = sqlx::query("SELECT dns_json,dns_revision,dns_previous_json FROM orgs WHERE id=$1")
+        .bind(org_id.to_string())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    org_dns_from_row(org_id, row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)
+}
+
+pub(crate) async fn load_previous_dns_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: Uuid,
+) -> Result<org_dns::OrgDnsSettings, ApiError> {
+    let previous: Option<String> =
+        sqlx::query_scalar("SELECT dns_previous_json FROM orgs WHERE id=$1")
+            .bind(org_id.to_string())
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
+    let previous = previous
+        .ok_or_else(|| ApiError::BadRequest("no previous DNS revision to restore".into()))?;
+    org_dns::parse_settings(&previous)
+}
+
+fn org_dns_from_row(
+    org_id: Uuid,
+    dns_json: String,
+    revision: i64,
+    previous: Option<String>,
+) -> Result<org_dns::OrgDnsResponse, ApiError> {
+    let dns = org_dns::parse_settings(&dns_json).unwrap_or_else(|_| org_dns::default_settings());
+    let record_preview = dns.record_preview();
+    Ok(org_dns::OrgDnsResponse {
+        revision,
+        etag: hash(&format!("{revision}:{dns_json}")),
+        has_previous: previous.as_deref().is_some_and(|value| !value.is_empty()),
+        magic_dns_suffix: org_dns::organisation_magic_dns_suffix(&org_id.to_string()),
+        dns,
+        record_preview,
+    })
+}
+
+pub(crate) async fn publish_org_dns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    org_id: Uuid,
+    current: &org_dns::OrgDnsResponse,
+    next: &org_dns::OrgDnsSettings,
+) -> Result<(), ApiError> {
+    let next_json = serde_json::to_string(next).map_err(|_| ApiError::CorruptData)?;
+    let previous_json = serde_json::to_string(&current.dns).map_err(|_| ApiError::CorruptData)?;
+    let changed =
+        sqlx::query("UPDATE orgs SET dns_json=$1,dns_revision=$2,dns_previous_json=$3 WHERE id=$4")
+            .bind(&next_json)
+            .bind(current.revision + 1)
+            .bind(previous_json)
+            .bind(org_id.to_string())
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    Ok(())
 }
 
 async fn get_security_policy(
@@ -6393,7 +6572,7 @@ mod tests {
             Uuid::new_v4()
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
-        sqlx::raw_sql("PRAGMA user_version=6")
+        sqlx::raw_sql("PRAGMA user_version=7")
             .execute(&pool)
             .await
             .unwrap();
@@ -6704,6 +6883,7 @@ mod tests {
             "/api/v1/devices",
             "/api/v1/keys",
             "/api/v1/policy",
+            "/api/v1/dns",
             "/api/v1/audit",
         ] {
             let response = r
@@ -6782,6 +6962,172 @@ mod tests {
         let envelope: serde_json::Value = body(denied).await;
         assert_eq!(envelope["code"], "unauthorized");
         assert!(envelope["request_id"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn org_dns_settings_publish_rollback_and_reject_leaks() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "dns-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let initial: crate::org_dns::OrgDnsResponse = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/orgs/{}/dns", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(initial.revision, 0);
+        assert!(initial.dns.managed);
+        assert_eq!(
+            call(
+                &r,
+                Method::PUT,
+                &format!("/v1/orgs/{}/dns", org.id),
+                serde_json::json!({
+                    "dns": {
+                        "managed": true,
+                        "split": [{"suffix":"internal.example","resolvers":["10.0.0.53"]}],
+                        "records": [{"name":"wiki.internal.example","type":"A","value":"10.0.0.10"}]
+                    }
+                }),
+                Some(&member),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::PUT,
+                &format!("/v1/orgs/{}/dns", org.id),
+                serde_json::json!({
+                    "dns": {
+                        "split": [{"suffix":"abc.blaktail","resolvers":["1.1.1.1"]}]
+                    }
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let published: crate::org_dns::OrgDnsResponse = body(
+            call(
+                &r,
+                Method::PUT,
+                &format!("/v1/orgs/{}/dns", org.id),
+                serde_json::json!({
+                    "dns": {
+                        "managed": true,
+                        "global_resolvers": ["1.1.1.1"],
+                        "split": [{"suffix":"internal.example","resolvers":["10.0.0.53"]}],
+                        "search_domains": ["internal.example"],
+                        "records": [
+                            {"name":"wiki.internal.example","type":"A","value":"10.0.0.10"},
+                            {"name":"wiki.internal.example","type":"AAAA","value":"fd00::10"}
+                        ]
+                    }
+                }),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(published.revision, 1);
+        assert_eq!(published.dns.split[0].suffix, "internal.example");
+        let stale = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/v1/orgs/{}/dns", org.id))
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", sign_test_assertion(&owner)),
+            )
+            .header("content-type", "application/json")
+            .header("if-match", initial.etag)
+            .body(Body::from(
+                r#"{"dns":{"managed":true,"global_resolvers":["8.8.8.8"]}}"#,
+            ))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(stale).await.unwrap().status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        let writer: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"dns-writer","scopes":["dns:write","devices:read"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let reader: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({"name":"dns-reader","scopes":["devices:read"]}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let forbidden = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/dns")
+            .header(AUTHORIZATION, format!("Bearer {}", reader.token))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"etag":"{}","dns":{{"managed":false}}}}"#,
+                published.etag
+            )))
+            .unwrap();
+        assert_eq!(
+            r.clone().oneshot(forbidden).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        let rolled = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/dns")
+            .header(AUTHORIZATION, format!("Bearer {}", writer.token))
+            .header("x-blaktail-organisation", org.id.to_string())
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"etag":"{}","rollback":true}}"#,
+                published.etag
+            )))
+            .unwrap();
+        let rolled = r.clone().oneshot(rolled).await.unwrap();
+        assert_eq!(rolled.status(), StatusCode::OK);
+        let rolled_body: serde_json::Value = body(rolled).await;
+        assert_eq!(rolled_body["data"]["revision"], 2);
+        assert!(rolled_body["data"]["dns"]["split"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let node = register_test_node(&r, org.id, &owner, "dns-node", "dns-join", &[]).await;
+        let peers = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/v1/nodes/{}/peers", node.id))
+            .header(AUTHORIZATION, format!("Bearer {}", node.node_token))
+            .body(Body::from("null"))
+            .unwrap();
+        let peers: serde_json::Value = body(r.clone().oneshot(peers).await.unwrap()).await;
+        assert_eq!(peers["dns"]["revision"], 2);
+        assert_eq!(
+            peers["dns"]["magic_dns_suffix"],
+            crate::org_dns::organisation_magic_dns_suffix(&org.id.to_string())
+        );
     }
 
     #[test]

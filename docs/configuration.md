@@ -141,8 +141,9 @@ checks:
 
 That EFS exception is smoke-only. Persistent multi-replica deployments use the
 PostgreSQL backend; labelling a long-lived deployment `e2e` is not supported.
-MagicDNS suffixes remain coordinator-derived and are not operator-configurable in
-schema v1, preventing split suffix state.
+MagicDNS suffixes remain coordinator-derived and are not operator-configurable.
+Organisation split DNS, upstreams, search domains, and extra records are a
+separate published snapshot; see [org-dns.md](org-dns.md).
 
 ## Reload
 

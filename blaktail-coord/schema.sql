@@ -5,7 +5,11 @@ CREATE TABLE IF NOT EXISTS orgs (
  node_key_ttl_seconds INTEGER NOT NULL DEFAULT 7776000
    CHECK (node_key_ttl_seconds BETWEEN 86400 AND 31536000),
  audit_retention_seconds INTEGER NOT NULL DEFAULT 7776000
-   CHECK (audit_retention_seconds BETWEEN 86400 AND 31536000)
+   CHECK (audit_retention_seconds BETWEEN 86400 AND 31536000),
+ dns_json TEXT NOT NULL DEFAULT '{"managed":true,"global_resolvers":[],"split":[],"search_domains":[],"records":[]}'
+   CHECK (json_valid(dns_json)),
+ dns_revision INTEGER NOT NULL DEFAULT 0,
+ dns_previous_json TEXT
 );
 CREATE TABLE IF NOT EXISTS join_keys (
  id TEXT PRIMARY KEY, org_id TEXT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
