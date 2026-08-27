@@ -7,9 +7,9 @@ import { PathMotif } from "./path-motif";
 import { Wordmark } from "./wordmark";
 
 const links = [
-  { href: "/devices", label: "All networks" },
+  { href: "/devices", label: "Devices" },
   { href: "/join-keys", label: "Join keys" },
-  { href: "/acls", label: "ACL rules" },
+  { href: "/acls", label: "Access" },
   { href: "/audit", label: "Audit log" },
   { href: "/status", label: "Status" },
   { href: "/settings", label: "Settings" },
@@ -58,6 +58,7 @@ export function ConsoleShell({
                 <Link
                   key={link.href}
                   href={link.href}
+                  data-testid={`nav-${link.href.slice(1)}`}
                   aria-current={current === link.href ? "page" : undefined}
                 >
                   {link.label}

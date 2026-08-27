@@ -22,6 +22,7 @@ use sqlx::{
     AnyConnection, AnyPool, AssertSqlSafe, Row,
 };
 use std::{
+    collections::BTreeMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::Arc,
@@ -2207,19 +2208,20 @@ async fn list_peers(
     headers: HeaderMap,
 ) -> Result<Json<PeersResponse>, ApiError> {
     let token = bearer(&headers)?;
-    let source_row = sqlx::query("SELECT n.org_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=$1 AND n.token_hash=$2 AND n.revoked_at IS NULL AND n.deleted_at IS NULL")
+    let source_row = sqlx::query("SELECT n.org_id,n.user_id,n.user_role,n.tags_json,o.acl_json,n.credential_expires_at,n.dns_name,n.allowed_ips_json FROM nodes n JOIN orgs o ON o.id=n.org_id WHERE n.id=$1 AND n.token_hash=$2 AND n.revoked_at IS NULL AND n.deleted_at IS NULL")
         .bind(node_id.to_string())
         .bind(token)
         .fetch_optional(&s.store.pool)
         .await?
         .ok_or(ApiError::Unauthorized)?;
     let org: String = source_row.try_get(0)?;
-    let source_role: String = source_row.try_get(1)?;
-    let source_tags: String = source_row.try_get(2)?;
-    let acl_json: String = source_row.try_get(3)?;
-    let credential_expires_at: i64 = source_row.try_get(4)?;
-    let dns_name: String = source_row.try_get(5)?;
-    let source_addresses: String = source_row.try_get(6)?;
+    let source_user_id: String = source_row.try_get(1)?;
+    let source_role: String = source_row.try_get(2)?;
+    let source_tags: String = source_row.try_get(3)?;
+    let acl_json: String = source_row.try_get(4)?;
+    let credential_expires_at: i64 = source_row.try_get(5)?;
+    let dns_name: String = source_row.try_get(6)?;
+    let source_addresses: String = source_row.try_get(7)?;
     if credential_expires_at <= now() {
         return Err(ApiError::CredentialExpired);
     }
@@ -2229,17 +2231,18 @@ async fn list_peers(
         .execute(&s.store.pool)
         .await?;
     expire_ephemeral_nodes(&s.store, &org).await?;
-    let source = Subject {
-        role: source_role.parse().map_err(|_| ApiError::CorruptData)?,
-        tags: serde_json::from_str(&source_tags).unwrap_or_default(),
-    };
+    let source = Subject::new(
+        source_role.parse().map_err(|_| ApiError::CorruptData)?,
+        serde_json::from_str(&source_tags).unwrap_or_default(),
+    )
+    .with_user(source_user_id);
     let acl: Acl = serde_json::from_str(&acl_json).map_err(|_| ApiError::CorruptData)?;
     let requested_exit = selection
         .exit_node
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let rows = sqlx::query("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>$3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL AND deleted_at IS NULL AND credential_expires_at>$4 ORDER BY name")
+    let rows = sqlx::query("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>$3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL AND deleted_at IS NULL AND credential_expires_at>$4 ORDER BY name")
         .bind(org)
         .bind(node_id.to_string())
         .bind(now() - RELAY_ENDPOINT_FRESH_SECS)
@@ -2252,9 +2255,9 @@ async fn list_peers(
             let id: String = row.try_get(0)?;
             let ips: String = row.try_get(4)?;
             let tags: Vec<DeviceTag> =
-                serde_json::from_str(&row.try_get::<String, _>(7)?).unwrap_or_default();
+                serde_json::from_str(&row.try_get::<String, _>(8)?).unwrap_or_default();
             let approved: Vec<String> =
-                serde_json::from_str(&row.try_get::<String, _>(9)?).unwrap_or_default();
+                serde_json::from_str(&row.try_get::<String, _>(10)?).unwrap_or_default();
             Ok::<_, ApiError>((
                 Peer {
                     id: Uuid::parse_str(&id).map_err(|_| ApiError::CorruptData)?,
@@ -2264,15 +2267,15 @@ async fn list_peers(
                     allowed_ips: serde_json::from_str(&ips).map_err(|_| ApiError::CorruptData)?,
                     dns_name: row.try_get(5)?,
                     tags: tags.clone(),
-                    relay_endpoint: row.try_get(8)?,
+                    relay_endpoint: row.try_get(9)?,
                 },
-                Subject {
-                    role: row
-                        .try_get::<String, _>(6)?
+                Subject::new(
+                    row.try_get::<String, _>(7)?
                         .parse()
                         .map_err(|_| ApiError::CorruptData)?,
                     tags,
-                },
+                )
+                .with_user(row.try_get::<String, _>(6)?),
                 approved,
             ))
         })
@@ -3377,6 +3380,8 @@ fn dns_label(name: &str) -> String {
 #[serde(deny_unknown_fields)]
 struct Acl {
     #[serde(default)]
+    groups: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     rules: Vec<AclRule>,
 }
 #[derive(Debug, Deserialize)]
@@ -3388,9 +3393,13 @@ struct AclRule {
     #[serde(default)]
     src_tags: Vec<DeviceTag>,
     #[serde(default)]
+    src_groups: Vec<String>,
+    #[serde(default)]
     dst_roles: Vec<Role>,
     #[serde(default)]
     dst_tags: Vec<DeviceTag>,
+    #[serde(default)]
+    dst_groups: Vec<String>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -3401,18 +3410,72 @@ enum Action {
 struct Subject {
     role: Role,
     tags: Vec<DeviceTag>,
+    user_id: String,
+    email: String,
+}
+impl Subject {
+    fn new(role: Role, tags: Vec<DeviceTag>) -> Self {
+        Self {
+            role,
+            tags,
+            user_id: String::new(),
+            email: String::new(),
+        }
+    }
+    fn with_user(mut self, user_id: impl Into<String>) -> Self {
+        self.user_id = user_id.into();
+        self
+    }
 }
 impl Acl {
     fn validate(&self) -> Result<(), ApiError> {
+        if self.groups.len() > 64 {
+            return Err(ApiError::BadRequest(
+                "ACL groups are limited to 64 named sets".into(),
+            ));
+        }
+        for (name, members) in &self.groups {
+            if !valid_acl_group_name(name) {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL group name {name:?} must be 1-32 lowercase letters, digits, or hyphens"
+                )));
+            }
+            if members.is_empty() {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL group {name} must include at least one person"
+                )));
+            }
+            if members.len() > 256 {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL group {name} is limited to 256 people"
+                )));
+            }
+            if members.iter().any(|member| member.trim().is_empty()) {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL group {name} has an empty member"
+                )));
+            }
+        }
         if self.rules.iter().any(|r| {
             r.src_roles.is_empty()
                 && r.src_tags.is_empty()
+                && r.src_groups.is_empty()
                 && r.dst_roles.is_empty()
                 && r.dst_tags.is_empty()
+                && r.dst_groups.is_empty()
         }) {
             return Err(ApiError::BadRequest(
                 "ACL rules must select a source or destination".into(),
             ));
+        }
+        for rule in &self.rules {
+            for name in rule.src_groups.iter().chain(rule.dst_groups.iter()) {
+                if !self.groups.contains_key(name) {
+                    return Err(ApiError::BadRequest(format!(
+                        "ACL rule refers to unknown group {name}"
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -3421,7 +3484,8 @@ impl Acl {
             .rules
             .iter()
             .filter(|r| {
-                selector(&r.src_roles, &r.src_tags, s) && selector(&r.dst_roles, &r.dst_tags, d)
+                selector(&r.src_roles, &r.src_tags, &r.src_groups, s, &self.groups)
+                    && selector(&r.dst_roles, &r.dst_tags, &r.dst_groups, d, &self.groups)
             })
             .collect();
         if matching.iter().any(|r| r.action == Action::Deny) {
@@ -3436,9 +3500,37 @@ impl Acl {
         s.tags.iter().any(|t| d.tags.contains(t))
     }
 }
-fn selector(roles: &[Role], tags: &[DeviceTag], s: &Subject) -> bool {
+fn valid_acl_group_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('a'..='z'))
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+fn selector(
+    roles: &[Role],
+    tags: &[DeviceTag],
+    groups: &[String],
+    s: &Subject,
+    named: &BTreeMap<String, Vec<String>>,
+) -> bool {
     (roles.is_empty() || roles.contains(&s.role))
         && (tags.is_empty() || tags.iter().any(|t| s.tags.contains(t)))
+        && (groups.is_empty()
+            || groups.iter().any(|name| {
+                named
+                    .get(name)
+                    .is_some_and(|members| subject_in_group(s, members))
+            }))
+}
+fn subject_in_group(subject: &Subject, members: &[String]) -> bool {
+    members.iter().any(|member| {
+        let member = member.trim();
+        if member.is_empty() {
+            return false;
+        }
+        (!subject.user_id.is_empty() && member.eq_ignore_ascii_case(subject.user_id.trim()))
+            || (!subject.email.is_empty() && member.eq_ignore_ascii_case(subject.email.trim()))
+    })
 }
 fn bearer(headers: &HeaderMap) -> Result<String, ApiError> {
     Ok(hash(bearer_value(headers)?))
@@ -5097,14 +5189,8 @@ mod tests {
             for source_tag in tags {
                 for dest_role in roles {
                     for dest_tag in tags {
-                        let source = Subject {
-                            role: source_role,
-                            tags: vec![source_tag],
-                        };
-                        let dest = Subject {
-                            role: dest_role,
-                            tags: vec![dest_tag],
-                        };
+                        let source = Subject::new(source_role, vec![source_tag]);
+                        let dest = Subject::new(dest_role, vec![dest_tag]);
                         assert_eq!(
                             acl.allows(&source, &dest),
                             source_tag == dest_tag,
@@ -5123,38 +5209,59 @@ mod tests {
             {"action":"deny","src_tags":["ranger"],"dst_tags":["store"]}
         ]}))
         .unwrap();
-        let store = Subject {
-            role: Role::Member,
-            tags: vec![DeviceTag::Store],
+        let store = Subject::new(Role::Member, vec![DeviceTag::Store]);
+        assert!(acl.allows(&Subject::new(Role::Owner, vec![DeviceTag::Office]), &store));
+        assert!(acl.allows(&Subject::new(Role::Admin, vec![DeviceTag::Office]), &store));
+        assert!(!acl.allows(&Subject::new(Role::Owner, vec![DeviceTag::Ranger]), &store));
+        assert!(!acl.allows(&Subject::new(Role::Member, vec![DeviceTag::Office]), &store));
+    }
+
+    #[test]
+    fn named_groups_match_people_and_unknown_groups_fail_validation() {
+        let acl: Acl = serde_json::from_value(serde_json::json!({
+            "groups": {
+                "rangers": ["alice@example.test", "alice-user"],
+                "stores": ["store-owner"]
+            },
+            "rules": [
+                {"action":"allow","src_groups":["rangers"],"dst_groups":["stores"]},
+                {"action":"deny","src_groups":["rangers"],"dst_tags":["office"]}
+            ]
+        }))
+        .unwrap();
+        acl.validate().unwrap();
+        let ranger = Subject {
+            email: "alice@example.test".into(),
+            ..Subject::new(Role::Member, vec![DeviceTag::Ranger]).with_user("alice-user")
         };
+        let store = Subject::new(Role::Owner, vec![DeviceTag::Store]).with_user("store-owner");
+        let office = Subject::new(Role::Member, vec![DeviceTag::Office]).with_user("other");
+        assert!(acl.allows(&ranger, &store));
         assert!(acl.allows(
             &Subject {
-                role: Role::Owner,
-                tags: vec![DeviceTag::Office]
+                email: "ALICE@example.test".into(),
+                ..Subject::new(Role::Member, vec![])
             },
             &store
         ));
-        assert!(acl.allows(
-            &Subject {
-                role: Role::Admin,
-                tags: vec![DeviceTag::Office]
-            },
-            &store
-        ));
+        assert!(!acl.allows(&ranger, &office));
         assert!(!acl.allows(
-            &Subject {
-                role: Role::Owner,
-                tags: vec![DeviceTag::Ranger]
-            },
+            &Subject::new(Role::Owner, vec![DeviceTag::Office]).with_user("nobody"),
             &store
         ));
-        assert!(!acl.allows(
-            &Subject {
-                role: Role::Member,
-                tags: vec![DeviceTag::Office]
-            },
-            &store
-        ));
+
+        let unknown: Acl = serde_json::from_value(serde_json::json!({
+            "groups": {"rangers":["alice-user"]},
+            "rules":[{"action":"allow","src_groups":["missing"],"dst_tags":["store"]}]
+        }))
+        .unwrap();
+        assert!(unknown.validate().is_err());
+        let unnamed: Acl = serde_json::from_value(serde_json::json!({
+            "groups": {"Rangers":["alice-user"]},
+            "rules":[{"action":"allow","src_groups":["Rangers"],"dst_tags":["store"]}]
+        }))
+        .unwrap();
+        assert!(unnamed.validate().is_err());
     }
 
     #[tokio::test]
@@ -5654,6 +5761,122 @@ mod tests {
         )
         .await;
         assert!(peers.peers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn named_groups_allow_cross_tag_peers_for_listed_people() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let o = create_test_org(&r, "grouped").await;
+        let alice = signed_session(o.id, "alice", Role::Owner, now() + 60);
+        let bob = signed_session(o.id, "bob", Role::Admin, now() + 60);
+        let alice_key: JoinKeyResponse = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", o.id),
+                serde_json::json!({"tags":["ranger"]}),
+                Some(&alice),
+            )
+            .await,
+        )
+        .await;
+        let bob_key: JoinKeyResponse = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/join-keys", o.id),
+                serde_json::json!({"tags":["store"]}),
+                Some(&bob),
+            )
+            .await,
+        )
+        .await;
+        let alice_node: RegisterResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/nodes/register",
+                serde_json::json!({
+                    "join_key": alice_key.key,
+                    "name": "ranger-1",
+                    "wg_public_key": "ranger-key"
+                }),
+                None,
+            )
+            .await,
+        )
+        .await;
+        let bob_node: RegisterResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/nodes/register",
+                serde_json::json!({
+                    "join_key": bob_key.key,
+                    "name": "store-1",
+                    "wg_public_key": "store-key"
+                }),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            call(
+                &r,
+                Method::PUT,
+                &format!("/v1/orgs/{}/acl", o.id),
+                serde_json::json!({
+                    "groups": {"field":["alice"],"shops":["bob"]},
+                    "rules":[{"action":"allow","src_groups":["field"],"dst_groups":["shops"]}]
+                }),
+                Some(&alice),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(
+                &r,
+                Method::PUT,
+                &format!("/v1/orgs/{}/acl", o.id),
+                serde_json::json!({
+                    "groups": {"field":["alice"]},
+                    "rules":[{"action":"allow","src_groups":["missing"],"dst_tags":["store"]}]
+                }),
+                Some(&alice),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let from_alice: PeersResponse = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", alice_node.id),
+                serde_json::Value::Null,
+                Some(&alice_node.node_token),
+            )
+            .await,
+        )
+        .await;
+        let from_bob: PeersResponse = body(
+            call(
+                &r,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", bob_node.id),
+                serde_json::Value::Null,
+                Some(&bob_node.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(from_alice.peers.len(), 1);
+        assert_eq!(from_alice.peers[0].name, "store-1");
+        assert!(from_bob.peers.is_empty());
     }
 
     #[tokio::test]

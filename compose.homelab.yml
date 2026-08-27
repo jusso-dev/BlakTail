@@ -1,0 +1,72 @@
+# Homelab overlay: HTTPS on the LAN so Better Auth production cookies work.
+# 127.0.0.1 is also trusted so Lightpanda can drive the UI through an SSH tunnel.
+services:
+  console:
+    environment:
+      BETTER_AUTH_TRUSTED_ORIGINS: ${BETTER_AUTH_URL},https://127.0.0.1:3443
+  console-migrate:
+    environment:
+      BETTER_AUTH_TRUSTED_ORIGINS: ${BETTER_AUTH_URL},https://127.0.0.1:3443
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "3443:3443"
+    volumes:
+      - ./certs:/certs:ro
+      - ./deploy/homelab/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      console:
+        condition: service_started
+
+  agent-office:
+    image: blaktail-agent
+    build:
+      context: .
+      dockerfile: deploy/docker/agent.Dockerfile
+    profiles: ["acl-prove"]
+    hostname: office-box
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
+    devices:
+      - /dev/net/tun
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - agent-office-data:/var/lib/blaktail
+    environment:
+      BLAKTAIL_COORD_CA: /certs/ca.crt
+    depends_on:
+      coord:
+        condition: service_started
+
+  agent-store:
+    image: blaktail-agent
+    build:
+      context: .
+      dockerfile: deploy/docker/agent.Dockerfile
+    profiles: ["acl-prove"]
+    hostname: store-box
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - apparmor:unconfined
+      - seccomp:unconfined
+    devices:
+      - /dev/net/tun
+    volumes:
+      - ./certs/ca.crt:/certs/ca.crt:ro
+      - agent-store-data:/var/lib/blaktail
+    environment:
+      BLAKTAIL_COORD_CA: /certs/ca.crt
+    depends_on:
+      coord:
+        condition: service_started
+
+volumes:
+  agent-office-data:
+  agent-store-data:

@@ -9,10 +9,10 @@ authorisation.
 
 - `/sign-in` — email and password; shows the shared project mission
 - `/privacy` — public software data-handling and retention statement
-- `/devices` — **All networks** inventory; every row shows its network and
-  supports owning-organisation-checked rename, route approval, and revocation
+- `/devices` — device inventory across linked networks; each row shows its
+  network and expands for rename, routes, tags, and revocation
 - `/join-keys` — mint join keys (owner/admin)
-- `/acls` — read and edit ACL JSON (owner/admin write)
+- `/acls` — people groups and access rules (owner/admin write)
 - `/audit` — latest actor-attributed security and administration changes
 - `/status` — status-only coordinator readiness; region stays in protected diagnostics
 - `/settings` — separate **Network accounts** and **Ways to sign in**, secure
@@ -203,6 +203,20 @@ bun --filter @blaktail/console db:migrate
 bun --filter @blaktail/console test
 bun run build
 bun --filter @blaktail/console test:auth-e2e
+```
+
+UI smoke uses Lightpanda as the browser and Playwright-core over CDP.
+`lightpanda mcp --cdp-port 9222` is the Cursor MCP server (see `.cursor/mcp.json`);
+the Playwright script attaches to that port, or starts `lightpanda serve` itself.
+
+```sh
+# Lightpanda cannot open RFC1918 addresses; tunnel loopback HTTPS instead.
+CONSOLE_URL=https://127.0.0.1:3443 \
+CONSOLE_EMAIL=owner@homelab.test \
+CONSOLE_PASSWORD_FILE=./owner-password \
+CONSOLE_SSH_TUNNEL=homelab \
+CONSOLE_CA_FILE=./certs/ca.crt \
+bun --filter @blaktail/console test:ui
 ```
 
 Do not pull fonts or analytics from offshore CDNs.

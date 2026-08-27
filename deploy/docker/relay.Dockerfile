@@ -7,6 +7,7 @@ COPY blaktail-config ./blaktail-config
 COPY blaktail-coord ./blaktail-coord
 COPY blaktail-relay ./blaktail-relay
 COPY blaktaild ./blaktaild
+COPY blaktail-ios-wg ./blaktail-ios-wg
 RUN cargo build --release -p blaktail-relay -p blaktail-config
 
 FROM debian:12-slim

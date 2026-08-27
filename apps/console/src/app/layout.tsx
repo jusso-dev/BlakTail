@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "BlakTail console",
   description:
-    "Manage BlakTail devices, join keys, and ACL rules for your organisation.",
+    "Manage BlakTail devices, join keys, and access policy for your organisation.",
 };
 
 export default function RootLayout({

@@ -283,7 +283,7 @@ export async function saveAclAction(formData: FormData): Promise<ActionResult> {
   try {
     const ctx = await requireConsoleContext();
     if (!canMutateTailnet(ctx.role)) {
-      return { ok: false, error: "Only owners and admins can edit ACL rules." };
+      return { ok: false, error: "Only owners and admins can edit access policy." };
     }
     const raw = String(formData.get("aclJson") ?? "");
     let parsed: unknown;

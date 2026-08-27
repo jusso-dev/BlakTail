@@ -1,13 +1,20 @@
 import { ConsoleShell } from "@/components/console-shell";
 import { DeviceActions } from "@/components/device-actions";
 import { PageHeader } from "@/components/page-header";
-import { PathMotif } from "@/components/path-motif";
 import { listAllNodes } from "@/lib/coord";
+import { listMemberships } from "@/lib/oidc";
 import { requireConsoleContext } from "@/lib/session";
 
 export default async function DevicesPage() {
   const ctx = await requireConsoleContext();
-  const inventory = await listAllNodes(ctx);
+  const [inventory, memberships] = await Promise.all([
+    listAllNodes(ctx),
+    Promise.all(
+      ctx.organisations.map((organisation) =>
+        listMemberships(organisation.organisationId).catch(() => []),
+      ),
+    ).then((rows) => rows.flat().filter((row) => row.status === "active")),
+  ]);
   const blockedErrors = ctx.blockedOrganisations.map(
     (organisation) =>
       `${organisation.organisationName}: an owner must resolve the linked-account role conflict.`,
@@ -20,39 +27,27 @@ export default async function DevicesPage() {
     <ConsoleShell ctx={ctx} current="/devices">
       <div className="stack">
         <PageHeader
-          eyebrow="Your network"
-          title="All networks"
-          description="Every machine reachable through your linked network accounts. Changes are authorised again against each machine's owning organisation."
+          title="Devices"
+          description="Every machine you can reach through your linked network accounts. Changes stay scoped to the organisation that owns the device."
         />
-        <div className="overview">
-          <div className="panel overview-copy">
-            <p className="eyebrow">Connected places</p>
-            <div className="overview-stats">
-              <div className="overview-stat">
-                <strong>{live.length}</strong>
-                <span>Devices</span>
-              </div>
-              <div className="overview-stat">
-                <strong>{online}</strong>
-                <span>Online</span>
-              </div>
-              <div className="overview-stat">
-                <strong>{networks || ctx.organisations.length}</strong>
-                <span>Networks</span>
-              </div>
-            </div>
-          </div>
-          <div className="overview-path" aria-hidden="true">
-            <PathMotif />
-          </div>
-        </div>
-        <div className="panel">
+        <p className="summary-line">
+          {live.length} devices · {online} online ·{" "}
+          {networks || ctx.organisations.length} networks
+        </p>
+        <div className="panel table-panel">
           {[...blockedErrors, ...inventory.errors].map((error) => (
             <p className="error" key={error}>
               {error}
             </p>
           ))}
-          <DeviceActions nodes={inventory.nodes} />
+          <DeviceActions
+            nodes={inventory.nodes}
+            people={memberships.map((row) => ({
+              userId: row.userId,
+              email: row.email,
+              name: row.name,
+            }))}
+          />
         </div>
       </div>
     </ConsoleShell>

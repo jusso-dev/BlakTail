@@ -91,7 +91,7 @@ state, TLS proxy, logs, backups, DNS, and support tooling in Australia.
 - Browser enrolment and join-key enrolment for automation
 - Linked login identities and one **All networks** inventory
 - Stable technical and MagicDNS identity, with editable audited friendly names
-- Tags, ACL rules, advertised-route approval, revoke, and tombstone
+- Tags, people groups, ACL rules, advertised-route approval, revoke, and tombstone
 - Linux subnet routers and opt-in IPv4 exit nodes
 - Dual-stack overlay addresses (CGNAT IPv4 plus an organisation ULA `/64`)
 - Device posture: last-seen/online, OS, agent version, search

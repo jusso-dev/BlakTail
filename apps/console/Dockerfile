@@ -7,6 +7,7 @@ COPY blaktail-config ./blaktail-config
 COPY blaktail-coord ./blaktail-coord
 COPY blaktail-relay ./blaktail-relay
 COPY blaktaild ./blaktaild
+COPY blaktail-ios-wg ./blaktail-ios-wg
 RUN cargo build --release -p blaktail-config
 
 FROM oven/bun:1.4.0-slim AS deps

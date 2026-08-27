@@ -162,10 +162,13 @@ write. Never rotate only one side. Already consumed nonces remain hashed in the 
 until their expiry cleanup; restarting either service does not make a captured
 assertion reusable.
 
-ACL JSON uses `rules` with `action` (`allow` or `deny`) and optional `src_roles`,
-`src_tags`, `dst_roles`, and `dst_tags` arrays. A blank selector matches all. Explicit
-deny wins over allow. Without a matching rule, tagged nodes can see only peers sharing
-a tag (default deny across tags); legacy untagged nodes can see other untagged nodes.
+ACL JSON uses optional `groups` plus `rules`. A group is a lowercase name mapped to
+people (login emails and/or the user ids stored on enrolled nodes). Rules use
+`action` (`allow` or `deny`) and optional `src_roles`, `src_tags`, `src_groups`,
+`dst_roles`, `dst_tags`, and `dst_groups` arrays. A blank selector matches all.
+Explicit deny wins over allow. Without a matching rule, tagged nodes can see only
+peers sharing a tag (default deny across tags); legacy untagged nodes can see other
+untagged nodes.
 Peer results include a stable MagicDNS name in the form `<node>.<org-prefix>.blaktail`.
 They include approved subnet CIDRs in that router peer's `allowed_ips`. An approved
 `0.0.0.0/0` is returned only when the requesting node supplies a matching

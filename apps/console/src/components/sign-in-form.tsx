@@ -75,7 +75,7 @@ export function SignInForm({
                 />
               </label>
               {error ? <p className="error">{error}</p> : null}
-              <button type="submit" disabled={pending}>
+              <button type="submit" disabled={pending} data-testid="sign-in-submit">
                 {pending ? "Signing in…" : "Sign in"}
               </button>
             </form>

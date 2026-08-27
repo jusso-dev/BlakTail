@@ -1,0 +1,8 @@
+{
+	auto_https off
+}
+
+:3443 {
+	tls /certs/console.crt /certs/console.key
+	reverse_proxy console:3000
+}
