@@ -40,8 +40,10 @@ sent. Members are read-only.
 
 ## Agent apply
 
-Peer poll responses include the published snapshot as `dns`. This slice stores,
-validates, and distributes that snapshot. Agents still answer MagicDNS peer names
-locally and do not yet apply split forwarding, search domains, or extra records.
-Last-known-good apply, packet-capture leak proofs, and a two-agent extra-record
-E2E remain on #40.
+Peer poll responses include the published snapshot as `dns`. Agents persist that
+snapshot and answer extra A/AAAA records locally by full name only. MagicDNS
+peer names stay coordinator-authoritative: `*.blaktail` still NXDOMAIN for
+unknown names, and public names without an extra record stay REFUSED.
+
+Split forwarding, search domains, last-known-good apply, packet-capture leak
+proofs, and a two-agent extra-record E2E remain on #40.

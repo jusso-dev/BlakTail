@@ -111,6 +111,26 @@ pub struct NodeState {
     pub relay_endpoint_reported_at: u64,
     #[serde(default)]
     pub dns_mode: Option<String>,
+    #[serde(default)]
+    pub org_dns: Option<OrgDnsSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OrgDnsSnapshot {
+    #[serde(default)]
+    pub revision: i64,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
+    pub records: Vec<OrgDnsRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OrgDnsRecord {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub record_type: String,
+    pub value: String,
 }
 
 impl NodeState {
@@ -208,6 +228,8 @@ struct PeersResponse {
     relay_token: String,
     #[serde(default)]
     relay_expires_at: u64,
+    #[serde(default)]
+    dns: Option<OrgDnsSnapshot>,
 }
 
 #[derive(Serialize)]
@@ -374,6 +396,7 @@ impl Coordinator {
             relay_endpoint: None,
             relay_endpoint_reported_at: 0,
             dns_mode: None,
+            org_dns: None,
         })
     }
     pub async fn peers(&self, state: &mut NodeState) -> Result<Vec<Peer>, Error> {
@@ -404,6 +427,7 @@ impl Coordinator {
         state.relays = body.relays;
         state.relay_token = body.relay_token;
         state.relay_expires_at = body.relay_expires_at;
+        state.org_dns = body.dns;
         Ok(body.peers)
     }
     pub async fn update_advertised_routes(
@@ -1765,6 +1789,7 @@ mod tests {
             relay_endpoint: None,
             relay_endpoint_reported_at: 0,
             dns_mode: None,
+            org_dns: None,
         };
         let mut network = RecordingNetwork::default();
         assert_eq!(restore_peers(&mut network, &state).unwrap(), 1);

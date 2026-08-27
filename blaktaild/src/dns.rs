@@ -155,6 +155,11 @@ fn records_from_state(state: &NodeState, domain: &str) -> Records {
             insert_record(&mut addresses, &peer.dns_name, address, domain);
         }
     }
+    if let Some(snapshot) = &state.org_dns {
+        for record in &snapshot.records {
+            insert_extra_record(&mut addresses, record);
+        }
+    }
     Records {
         domain: domain.into(),
         addresses,
@@ -193,6 +198,31 @@ fn insert_record(
     insert(name);
 }
 
+fn insert_extra_record(
+    records: &mut HashMap<String, Vec<IpAddr>>,
+    record: &crate::OrgDnsRecord,
+) {
+    let name = record.name.trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name.ends_with(".blaktail") {
+        return;
+    }
+    let Ok(address) = record.value.parse::<IpAddr>() else {
+        return;
+    };
+    let expected = match record.record_type.to_ascii_uppercase().as_str() {
+        "A" => address.is_ipv4(),
+        "AAAA" => address.is_ipv6(),
+        _ => return,
+    };
+    if !expected {
+        return;
+    }
+    let values = records.entry(name).or_default();
+    if !values.contains(&address) {
+        values.push(address);
+    }
+}
+
 fn address_for_query(addresses: &[IpAddr], query_type: u16) -> Option<IpAddr> {
     addresses.iter().copied().find(|address| {
         matches!(
@@ -219,10 +249,11 @@ fn answer(query: &[u8], records: &Records) -> Option<Vec<u8>> {
     let query_type = u16::from_be_bytes([query[name_end], query[name_end + 1]]);
     let query_class = u16::from_be_bytes([query[name_end + 2], query[name_end + 3]]);
     let name = name.to_ascii_lowercase();
-    let in_domain = !name.contains('.')
+    let addresses = records.addresses.get(&name);
+    let in_magic = !name.contains('.')
         || name == records.domain
         || name.ends_with(&format!(".{}", records.domain));
-    let addresses = records.addresses.get(&name);
+    let in_domain = in_magic || addresses.is_some();
     let address = addresses.and_then(|addresses| address_for_query(addresses, query_type));
     let response_code = if !in_domain {
         5 // REFUSED: this authoritative stub never forwards public DNS.
@@ -579,6 +610,7 @@ mod tests {
             relay_endpoint: None,
             relay_endpoint_reported_at: 0,
             dns_mode: None,
+            org_dns: None,
         }
     }
 
@@ -714,6 +746,50 @@ mod tests {
                 .octets()
         );
         dns.stop();
+    }
+
+    #[test]
+    fn answers_published_extra_records_without_forwarding_public_dns() {
+        let mut state = state();
+        state.org_dns = Some(crate::OrgDnsSnapshot {
+            revision: 3,
+            managed: true,
+            records: vec![
+                crate::OrgDnsRecord {
+                    name: "wiki.internal.example".into(),
+                    record_type: "A".into(),
+                    value: "10.0.0.10".into(),
+                },
+                crate::OrgDnsRecord {
+                    name: "wiki.internal.example".into(),
+                    record_type: "AAAA".into(),
+                    value: "fd12:3456:789a:bcde::10".into(),
+                },
+            ],
+        });
+        let records = records_from_state(&state, "12345678.blaktail");
+        let a = answer(&query("wiki.internal.example", 1), &records).unwrap();
+        assert_eq!(a[3] & 0x0f, 0);
+        assert_eq!(&a[a.len() - 4..], &[10, 0, 0, 10]);
+        let aaaa = answer(&query("wiki.internal.example", 28), &records).unwrap();
+        assert_eq!(aaaa[3] & 0x0f, 0);
+        assert_eq!(
+            &aaaa[aaaa.len() - 16..],
+            &"fd12:3456:789a:bcde::10"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets()
+        );
+        let peer = answer(&query("peer.12345678.blaktail", 1), &records).unwrap();
+        assert_eq!(&peer[peer.len() - 4..], &[100, 64, 0, 2]);
+        let short_extra = answer(&query("wiki", 1), &records).unwrap();
+        assert_eq!(short_extra[3] & 0x0f, 3);
+        let missing_extra = answer(&query("missing.internal.example", 1), &records).unwrap();
+        assert_eq!(missing_extra[3] & 0x0f, 5);
+        let public = answer(&query("example.com", 1), &records).unwrap();
+        assert_eq!(public[3] & 0x0f, 5);
+        let private_missing = answer(&query("missing.12345678.blaktail", 1), &records).unwrap();
+        assert_eq!(private_missing[3] & 0x0f, 3);
     }
 
     #[test]
