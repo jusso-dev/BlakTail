@@ -7899,6 +7899,14 @@ mod tests {
         )
         .await;
         assert!(created.secret.as_deref().unwrap().starts_with("btw_"));
+        let stored: String =
+            sqlx::query_scalar("SELECT signing_secret FROM webhook_destinations WHERE id=$1")
+                .bind(created.id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert!(stored.starts_with("bte1."));
+        assert!(!stored.contains(created.secret.as_deref().unwrap()));
         let policy: serde_json::Value = body(
             admin(
                 Method::GET,
