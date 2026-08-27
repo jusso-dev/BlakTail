@@ -65,7 +65,7 @@ value. Defaults apply when a section or field is absent.
 | `agent.state_dir` | `/var/lib/blaktail` | Absolute path |
 | `agent.coordinator_url` | Required by `up` unless flag supplied | HTTPS URL, except loopback development |
 | `agent.interface` | `blaktail0` | 1-15 characters |
-| `agent.poll_seconds` | `30` | 1-3600; recovery interval when the 25s control long-poll fails |
+| `agent.poll_seconds` | `30` | 1-3600; recovery interval when the 25s control long-poll fails. Agents request control `version=2` so the coordinator can send a coalesced peer delta instead of a full snapshot. |
 | `agent.advertised_routes` | Empty list | IPv4/IPv6 CIDRs |
 | `console.region` | Required | Approved Australian region |
 | `console.port` | `3000` | 1-65535 |
