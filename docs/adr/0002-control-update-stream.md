@@ -74,8 +74,12 @@ raised-timeout) path exist.
 
 ## Follow-up
 
-Agents now wait on `GET /v1/nodes/:id/updates` with the last applied
-revision and reconnect after a 204 heartbeat. `--poll-seconds` remains the
-recovery path. Deltas, storm/backpressure tests, and 1k/10k baselines live
-in later #43 slices. Those slices must keep the 25-second wait cap unless
-the AWS lab path is changed and re-proven.
+Agents wait on `GET /v1/nodes/:id/updates` with the last applied revision
+and reconnect after a 204 heartbeat. Protocol `version=2` may receive a
+coalesced `{kind: delta, added, removed}` body when the coordinator still
+has the node's last sent peer set; gapped, missing, or `version=1` history
+falls back to one snapshot. `--poll-seconds` remains the recovery path.
+In-memory views are capped at 10k nodes so a storm resynchronises with
+snapshots rather than growing unbounded. 1k/10k CPU/latency baselines live
+in a later #43 slice. Keep the 25-second wait cap unless the AWS lab path
+is changed and re-proven.

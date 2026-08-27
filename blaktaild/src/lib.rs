@@ -229,7 +229,14 @@ struct RegisterResponse {
 }
 #[derive(Deserialize)]
 struct PeersResponse {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
     peers: Vec<Peer>,
+    #[serde(default)]
+    added: Vec<Peer>,
+    #[serde(default)]
+    removed: Vec<Uuid>,
     #[serde(default)]
     assigned_ips: Vec<String>,
     #[serde(default)]
@@ -446,6 +453,7 @@ impl Coordinator {
             ("since", state.control_revision.to_string()),
             ("wait", wait.to_string()),
             ("ipv6", "true".into()),
+            ("version", "2".into()),
         ]);
         if let Some(exit_node) = state.exit_node.as_deref() {
             request = request.query(&[("exit_node", exit_node)]);
@@ -470,6 +478,7 @@ impl Coordinator {
             return Err(Error::Message(message));
         }
         let body: PeersResponse = response.error_for_status()?.json().await?;
+        let peers = Self::apply_control_peers(&state.peers, &body);
         if let Some(revision) = body.revision {
             state.control_revision = revision;
         }
@@ -483,7 +492,23 @@ impl Coordinator {
         state.relay_token = body.relay_token;
         state.relay_expires_at = body.relay_expires_at;
         apply_org_dns_snapshot(state, body.dns);
-        Ok(body.peers)
+        Ok(peers)
+    }
+
+    fn apply_control_peers(current: &[Peer], body: &PeersResponse) -> Vec<Peer> {
+        if body.kind.as_deref() == Some("delta") {
+            let removed = body.removed.iter().copied().collect::<HashSet<_>>();
+            let mut by_id = current
+                .iter()
+                .filter(|peer| !removed.contains(&peer.id))
+                .map(|peer| (peer.id, peer.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for peer in &body.added {
+                by_id.insert(peer.id, peer.clone());
+            }
+            return by_id.into_values().collect();
+        }
+        body.peers.clone()
     }
     pub async fn update_advertised_routes(
         &self,
@@ -1970,5 +1995,63 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(peers.revision, None);
+    }
+
+    #[test]
+    fn control_update_delta_merges_added_and_removed_peers() {
+        let kept = Uuid::from_u128(1);
+        let gone = Uuid::from_u128(2);
+        let added = Uuid::from_u128(3);
+        let current = vec![
+            Peer {
+                id: kept,
+                name: "kept".into(),
+                wg_public_key: "kept-key".into(),
+                endpoint: None,
+                allowed_ips: vec!["100.64.0.2/32".into()],
+                dns_name: "kept.blaktail".into(),
+                tags: vec![],
+                relay_endpoint: None,
+            },
+            Peer {
+                id: gone,
+                name: "gone".into(),
+                wg_public_key: "gone-key".into(),
+                endpoint: None,
+                allowed_ips: vec!["100.64.0.3/32".into()],
+                dns_name: "gone.blaktail".into(),
+                tags: vec![],
+                relay_endpoint: None,
+            },
+        ];
+        let body = PeersResponse {
+            kind: Some("delta".into()),
+            peers: vec![],
+            added: vec![Peer {
+                id: added,
+                name: "added".into(),
+                wg_public_key: "added-key".into(),
+                endpoint: None,
+                allowed_ips: vec!["100.64.0.4/32".into()],
+                dns_name: "added.blaktail".into(),
+                tags: vec![],
+                relay_endpoint: None,
+            }],
+            removed: vec![gone],
+            assigned_ips: vec![],
+            dns_name: String::new(),
+            credential_expires_at: 0,
+            exit_node_active: false,
+            relays: vec![],
+            relay_token: String::new(),
+            relay_expires_at: 0,
+            dns: None,
+            revision: Some(9),
+        };
+        let merged = Coordinator::apply_control_peers(&current, &body);
+        assert_eq!(
+            merged.iter().map(|peer| peer.id).collect::<Vec<_>>(),
+            vec![kept, added]
+        );
     }
 }

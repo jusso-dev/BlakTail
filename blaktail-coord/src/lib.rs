@@ -50,7 +50,7 @@ use sqlx::{
     AnyConnection, AnyPool, AssertSqlSafe, Row,
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
@@ -63,6 +63,8 @@ use uuid::Uuid;
 const SCHEMA: &str = include_str!("../schema.sql");
 pub const CURRENT_SCHEMA_VERSION: i64 = 9;
 const MAX_CONTROL_UPDATE_WAIT_SECS: u64 = 25;
+const MAX_CONTROL_VIEWS: usize = 10_000;
+type ControlViewMap = HashMap<Uuid, (i64, BTreeSet<Uuid>)>;
 const DEFAULT_AUDIT_RETENTION_SECS: i64 = 90 * 24 * 60 * 60;
 const DEFAULT_TOMBSTONE_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 const NODE_ONLINE_SECS: i64 = 90;
@@ -839,6 +841,7 @@ pub(crate) struct AppState {
     relays: Arc<Vec<String>>,
     console_url: Arc<String>,
     api_rate: ApiRateLimiter,
+    control_views: Arc<Mutex<ControlViewMap>>,
 }
 pub fn app(store: Store, region: String, auth_hmac_secret: impl Into<Vec<u8>>) -> Router {
     app_with_relays_and_console(
@@ -902,6 +905,7 @@ pub fn app_with_relays_console_and_metrics(
         relays: Arc::new(relays),
         console_url: Arc::new(console_url.trim_end_matches('/').to_owned()),
         api_rate: ApiRateLimiter::default(),
+        control_views: Arc::new(Mutex::new(HashMap::new())),
     };
     Router::new()
         .route("/health", get(readiness))
@@ -2351,7 +2355,7 @@ async fn reauth_node(
     }))
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 struct Peer {
     id: Uuid,
     name: String,
@@ -2394,6 +2398,10 @@ struct ControlUpdatesCapability {
 struct ControlUpdate {
     kind: &'static str,
     revision: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    added: Vec<Peer>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<Uuid>,
     #[serde(flatten)]
     snapshot: PeersResponse,
 }
@@ -2585,7 +2593,10 @@ async fn list_updates(
     Query(selection): Query<UpdateSelection>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
-    if selection.version.is_some_and(|version| version != 1) {
+    if selection
+        .version
+        .is_some_and(|version| version != 1 && version != 2)
+    {
         return Err(ApiError::BadRequest(
             "unsupported control update version".into(),
         ));
@@ -2622,15 +2633,84 @@ async fn list_updates(
                 headers,
             )
             .await?;
-            return Ok(Json(ControlUpdate {
-                kind: "snapshot",
+            let update = control_update_from_snapshot(
+                &s,
+                node_id,
                 revision,
                 snapshot,
-            })
-            .into_response());
+                selection.since,
+                selection.version,
+            );
+            return Ok(Json(update).into_response());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+}
+
+fn control_update_from_snapshot(
+    state: &AppState,
+    node_id: Uuid,
+    revision: i64,
+    snapshot: PeersResponse,
+    since: i64,
+    version: Option<u32>,
+) -> ControlUpdate {
+    let current_ids = snapshot
+        .peers
+        .iter()
+        .map(|peer| peer.id)
+        .collect::<BTreeSet<_>>();
+    let baseline = remember_and_baseline(&state.control_views, node_id, revision, &current_ids);
+    if version == Some(2) {
+        if let Some((baseline_revision, previous_ids)) = baseline {
+            if since > 0 && baseline_revision == since {
+                let added = snapshot
+                    .peers
+                    .iter()
+                    .filter(|peer| !previous_ids.contains(&peer.id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let removed = previous_ids
+                    .difference(&current_ids)
+                    .copied()
+                    .collect::<Vec<_>>();
+                return ControlUpdate {
+                    kind: "delta",
+                    revision,
+                    added,
+                    removed,
+                    snapshot: PeersResponse {
+                        peers: Vec::new(),
+                        ..snapshot
+                    },
+                };
+            }
+        }
+    }
+    ControlUpdate {
+        kind: "snapshot",
+        revision,
+        added: Vec::new(),
+        removed: Vec::new(),
+        snapshot,
+    }
+}
+
+fn remember_and_baseline(
+    views: &Mutex<ControlViewMap>,
+    node_id: Uuid,
+    revision: i64,
+    current_ids: &BTreeSet<Uuid>,
+) -> Option<(i64, BTreeSet<Uuid>)> {
+    let mut views = views
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let baseline = views.get(&node_id).cloned();
+    if views.len() >= MAX_CONTROL_VIEWS && !views.contains_key(&node_id) {
+        views.clear();
+    }
+    views.insert(node_id, (revision, current_ids.clone()));
+    baseline
 }
 
 #[derive(Deserialize)]
@@ -9028,7 +9108,7 @@ mod tests {
             call(
                 &router,
                 Method::GET,
-                &format!("/v1/nodes/{}/updates?since=0&wait=1&version=2", node.id),
+                &format!("/v1/nodes/{}/updates?since=0&wait=1&version=3", node.id),
                 serde_json::Value::Null,
                 Some(&node.node_token),
             )
@@ -9036,6 +9116,131 @@ mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[tokio::test]
+    async fn control_updates_coalesce_peer_add_and_revoke_into_one_delta() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "control-delta-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let office =
+            register_test_node(&router, org.id, &owner, "office-one", "office-key", &[]).await;
+        let snapshot: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/updates?since=0&wait=0&version=2", office.id),
+                serde_json::Value::Null,
+                Some(&office.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(snapshot["kind"], "snapshot");
+        let revision = snapshot["revision"].as_i64().unwrap();
+
+        let store_node =
+            register_test_node(&router, org.id, &owner, "store-one", "store-key", &[]).await;
+        let extra =
+            register_test_node(&router, org.id, &owner, "store-two", "store-two-key", &[]).await;
+        assert_eq!(
+            call(
+                &router,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/nodes/{}", org.id, extra.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let v1: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!(
+                    "/v1/nodes/{}/updates?since={revision}&wait=0&version=1",
+                    office.id
+                ),
+                serde_json::Value::Null,
+                Some(&office.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v1["kind"], "snapshot");
+        assert!(v1["added"].is_null());
+        assert!(v1["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|peer| { peer["id"] == store_node.id.to_string() }));
+
+        let snapshot_again: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/updates?since=0&wait=0&version=2", office.id),
+                serde_json::Value::Null,
+                Some(&office.node_token),
+            )
+            .await,
+        )
+        .await;
+        let baseline = snapshot_again["revision"].as_i64().unwrap();
+        let third = register_test_node(
+            &router,
+            org.id,
+            &owner,
+            "store-three",
+            "store-three-key",
+            &[],
+        )
+        .await;
+        assert_eq!(
+            call(
+                &router,
+                Method::DELETE,
+                &format!("/v1/orgs/{}/nodes/{}", org.id, store_node.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let delta: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!(
+                    "/v1/nodes/{}/updates?since={baseline}&wait=0&version=2",
+                    office.id
+                ),
+                serde_json::Value::Null,
+                Some(&office.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(delta["kind"], "delta");
+        assert!(delta["revision"].as_i64().unwrap() > baseline);
+        let added = delta["added"].as_array().unwrap();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0]["id"], third.id.to_string());
+        let removed = delta["removed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(removed.contains(&store_node.id.to_string()));
+        assert!(!removed.contains(&extra.id.to_string()));
+        assert!(delta["peers"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
