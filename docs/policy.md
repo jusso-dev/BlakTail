@@ -22,18 +22,25 @@ unknown field rejects the document.
   "tag_owners": {
     "office": ["owner-1", "admin"]
   },
+  "hosts": {
+    "wiki": "10.0.0.10"
+  },
   "rules": [
     {
       "action": "allow",
       "src_groups": ["rangers"],
-      "dst_tags": ["store"]
+      "dst_tags": ["store"],
+      "dst_ports": ["22", "80-443"],
+      "protocols": ["tcp"]
     }
   ],
   "tests": [
     {
-      "name": "ranger reaches store",
+      "name": "ranger reaches store ssh",
       "src_user": "alice-user",
       "dst_tags": ["store"],
+      "dst_port": 22,
+      "protocol": "tcp",
       "allow": true
     },
     {
@@ -50,8 +57,13 @@ unknown field rejects the document.
 - `tag_owners` lists who may assign that tag on a join key or browser
   approval. An unlisted tag keeps the previous owner/admin behaviour. The
   organisation owner remains a break-glass assigner.
-- `rules` still select roles, tags, and groups. Ports, protocols, SSH, and
-  hosts are not in v1.
-- `tests` are evaluated before activation. A mismatch fails closed.
+- `hosts` names private IPv4 or unique-local IPv6 addresses and CIDRs.
+  `.blaktail` and default routes are rejected.
+- `rules` select roles, tags, groups, optional `dst_hosts`, `dst_ports`
+  (`22`, `80-443`, or `*`), and `protocols` (`tcp`, `udp`, `icmp`). ICMP
+  cannot name ports. Peer-map evaluation still includes a peer when any
+  port on that path is allowed; packet-level enforcement and SSH stay later.
+- `tests` can name `dst_host`, `dst_port`, and `protocol`. A mismatch fails
+  closed. Host-only rules never become the implicit same-tag default.
 
 Existing documents without `version` deserialize as v1.

@@ -9,6 +9,7 @@ pub use org_dns::{check_dns_document, DnsCheckReport};
 pub struct PolicyCheckReport {
     pub version: u32,
     pub groups: usize,
+    pub hosts: usize,
     pub rules: usize,
     pub tests: usize,
     pub tag_owners: usize,
@@ -20,6 +21,7 @@ pub fn check_policy_document(document: &str) -> Result<PolicyCheckReport, String
     Ok(PolicyCheckReport {
         version: acl.version,
         groups: acl.groups.len(),
+        hosts: acl.hosts.len(),
         rules: acl.rules.len(),
         tests: acl.tests.len(),
         tag_owners: acl.tag_owners.len(),
@@ -46,7 +48,7 @@ use sqlx::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
     time::Instant,
@@ -3629,6 +3631,8 @@ struct Acl {
     #[serde(default)]
     tag_owners: BTreeMap<String, Vec<String>>,
     #[serde(default)]
+    hosts: BTreeMap<String, String>,
+    #[serde(default)]
     rules: Vec<AclRule>,
     #[serde(default)]
     tests: Vec<AclTest>,
@@ -3655,6 +3659,12 @@ struct AclTest {
     dst_user: String,
     #[serde(default)]
     dst_email: String,
+    #[serde(default)]
+    dst_host: String,
+    #[serde(default)]
+    dst_port: Option<u16>,
+    #[serde(default)]
+    protocol: Option<AclProtocol>,
     allow: bool,
 }
 
@@ -3664,6 +3674,7 @@ impl Default for Acl {
             version: 1,
             groups: BTreeMap::new(),
             tag_owners: BTreeMap::new(),
+            hosts: BTreeMap::new(),
             rules: Vec::new(),
             tests: Vec::new(),
         }
@@ -3685,12 +3696,26 @@ struct AclRule {
     dst_tags: Vec<DeviceTag>,
     #[serde(default)]
     dst_groups: Vec<String>,
+    #[serde(default)]
+    dst_hosts: Vec<String>,
+    #[serde(default)]
+    dst_ports: Vec<String>,
+    #[serde(default)]
+    protocols: Vec<AclProtocol>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 enum Action {
     Allow,
     Deny,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AclProtocol {
+    Tcp,
+    Udp,
+    Icmp,
 }
 struct Subject {
     role: Role,
@@ -3782,6 +3807,19 @@ impl Acl {
                 "ACL tests are limited to 128 assertions".into(),
             ));
         }
+        if self.hosts.len() > 64 {
+            return Err(ApiError::BadRequest(
+                "ACL hosts are limited to 64 named addresses".into(),
+            ));
+        }
+        for (name, target) in &self.hosts {
+            if !valid_acl_group_name(name) {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL host name {name:?} must be 1-32 lowercase letters, digits, or hyphens"
+                )));
+            }
+            parse_acl_host_target(target)?;
+        }
         if self.groups.len() > 64 {
             return Err(ApiError::BadRequest(
                 "ACL groups are limited to 64 named sets".into(),
@@ -3816,6 +3854,7 @@ impl Acl {
                 && r.dst_roles.is_empty()
                 && r.dst_tags.is_empty()
                 && r.dst_groups.is_empty()
+                && r.dst_hosts.is_empty()
         }) {
             return Err(ApiError::BadRequest(
                 "ACL rules must select a source or destination".into(),
@@ -3829,8 +3868,44 @@ impl Acl {
                     )));
                 }
             }
+            for name in &rule.dst_hosts {
+                if !self.hosts.contains_key(name) {
+                    return Err(ApiError::BadRequest(format!(
+                        "ACL rule refers to unknown host {name}"
+                    )));
+                }
+            }
+            if rule.dst_ports.len() > 16 {
+                return Err(ApiError::BadRequest(
+                    "ACL rules are limited to 16 destination port ranges".into(),
+                ));
+            }
+            for spec in &rule.dst_ports {
+                parse_acl_port_spec(spec)?;
+            }
+            if rule.protocols.contains(&AclProtocol::Icmp) && !rule.dst_ports.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "ACL ICMP rules cannot name destination ports".into(),
+                ));
+            }
         }
         for (index, test) in self.tests.iter().enumerate() {
+            if !test.dst_host.is_empty() && !self.hosts.contains_key(&test.dst_host) {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL test refers to unknown host {}",
+                    test.dst_host
+                )));
+            }
+            if test.dst_port == Some(0) {
+                return Err(ApiError::BadRequest(
+                    "ACL test destination port must be 1-65535".into(),
+                ));
+            }
+            if test.protocol == Some(AclProtocol::Icmp) && test.dst_port.is_some() {
+                return Err(ApiError::BadRequest(
+                    "ACL ICMP tests cannot name a destination port".into(),
+                ));
+            }
             let src = Subject {
                 email: test.src_email.clone(),
                 ..Subject::new(test.src_role.unwrap_or(Role::Member), test.src_tags.clone())
@@ -3841,7 +3916,13 @@ impl Acl {
                 ..Subject::new(test.dst_role.unwrap_or(Role::Member), test.dst_tags.clone())
                     .with_user(test.dst_user.clone())
             };
-            let allowed = self.allows(&src, &dst);
+            let allowed = self.allows_flow(
+                &src,
+                &dst,
+                test.dst_port,
+                test.protocol,
+                (!test.dst_host.is_empty()).then_some(test.dst_host.as_str()),
+            );
             if allowed != test.allow {
                 let label = if test.name.is_empty() {
                     format!("#{}", index + 1)
@@ -3857,13 +3938,21 @@ impl Acl {
         Ok(())
     }
     fn allows(&self, s: &Subject, d: &Subject) -> bool {
+        self.allows_flow(s, d, None, None, None)
+    }
+
+    fn allows_flow(
+        &self,
+        s: &Subject,
+        d: &Subject,
+        port: Option<u16>,
+        protocol: Option<AclProtocol>,
+        host: Option<&str>,
+    ) -> bool {
         let matching: Vec<_> = self
             .rules
             .iter()
-            .filter(|r| {
-                selector(&r.src_roles, &r.src_tags, &r.src_groups, s, &self.groups)
-                    && selector(&r.dst_roles, &r.dst_tags, &r.dst_groups, d, &self.groups)
-            })
+            .filter(|r| self.rule_matches(r, s, d, port, protocol, host))
             .collect();
         if matching.iter().any(|r| r.action == Action::Deny) {
             return false;
@@ -3871,12 +3960,189 @@ impl Acl {
         if matching.iter().any(|r| r.action == Action::Allow) {
             return true;
         }
+        if host.is_some() {
+            return false;
+        }
         if s.tags.is_empty() && d.tags.is_empty() {
             return true;
         }
         s.tags.iter().any(|t| d.tags.contains(t))
     }
+
+    fn rule_matches(
+        &self,
+        rule: &AclRule,
+        s: &Subject,
+        d: &Subject,
+        port: Option<u16>,
+        protocol: Option<AclProtocol>,
+        host: Option<&str>,
+    ) -> bool {
+        if !selector(
+            &rule.src_roles,
+            &rule.src_tags,
+            &rule.src_groups,
+            s,
+            &self.groups,
+        ) {
+            return false;
+        }
+        match host {
+            Some(name) => {
+                if !rule.dst_hosts.is_empty() && !rule.dst_hosts.iter().any(|item| item == name) {
+                    return false;
+                }
+                if !selector(
+                    &rule.dst_roles,
+                    &rule.dst_tags,
+                    &rule.dst_groups,
+                    d,
+                    &self.groups,
+                ) {
+                    return false;
+                }
+            }
+            None => {
+                if !rule.dst_hosts.is_empty() {
+                    return false;
+                }
+                if !selector(
+                    &rule.dst_roles,
+                    &rule.dst_tags,
+                    &rule.dst_groups,
+                    d,
+                    &self.groups,
+                ) {
+                    return false;
+                }
+            }
+        }
+        port_spec_matches(&rule.dst_ports, port) && protocol_matches(&rule.protocols, protocol)
+    }
 }
+fn parse_acl_port_spec(value: &str) -> Result<(u16, u16), ApiError> {
+    let value = value.trim();
+    if value == "*" {
+        return Ok((1, 65535));
+    }
+    let (start, end) = if let Some((start, end)) = value.split_once('-') {
+        (start, end)
+    } else {
+        (value, value)
+    };
+    let start: u16 = start.parse().map_err(|_| {
+        ApiError::BadRequest(format!("ACL port {value:?} must be 1-65535 or a range"))
+    })?;
+    let end: u16 = end.parse().map_err(|_| {
+        ApiError::BadRequest(format!("ACL port {value:?} must be 1-65535 or a range"))
+    })?;
+    if start == 0 || end == 0 || start > end {
+        return Err(ApiError::BadRequest(format!(
+            "ACL port {value:?} must be 1-65535 or a start-end range"
+        )));
+    }
+    Ok((start, end))
+}
+
+fn port_spec_matches(specs: &[String], port: Option<u16>) -> bool {
+    if specs.is_empty() {
+        return true;
+    }
+    let Some(port) = port else {
+        return true;
+    };
+    specs.iter().any(|spec| {
+        parse_acl_port_spec(spec).is_ok_and(|(start, end)| (start..=end).contains(&port))
+    })
+}
+
+fn protocol_matches(protocols: &[AclProtocol], protocol: Option<AclProtocol>) -> bool {
+    match protocol {
+        None => true,
+        Some(wanted) => protocols.is_empty() || protocols.contains(&wanted),
+    }
+}
+
+fn parse_acl_host_target(value: &str) -> Result<(), ApiError> {
+    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if value.is_empty() || value.contains("blaktail") {
+        return Err(ApiError::BadRequest(
+            "ACL hosts cannot be empty or use .blaktail names".into(),
+        ));
+    }
+    if value == "0.0.0.0/0" || value == "::/0" {
+        return Err(ApiError::BadRequest(
+            "ACL hosts cannot name a default route".into(),
+        ));
+    }
+    if let Ok(address) = value.parse::<IpAddr>() {
+        return require_private_host_ip(address, &value);
+    }
+    let (address, prefix) = value.split_once('/').ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "ACL host {value} must be an IPv4/IPv6 address or CIDR"
+        ))
+    })?;
+    let address: IpAddr = address.parse().map_err(|_| {
+        ApiError::BadRequest(format!(
+            "ACL host {value} must be an IPv4/IPv6 address or CIDR"
+        ))
+    })?;
+    let prefix: u8 = prefix
+        .parse()
+        .map_err(|_| ApiError::BadRequest(format!("ACL host {value} has an invalid prefix")))?;
+    match address {
+        IpAddr::V4(ip) => {
+            if prefix > 32 {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL host {value} has an invalid prefix"
+                )));
+            }
+            let mask = ipv4_mask(prefix);
+            if u32::from(ip) & !mask != 0 {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL host {value} is not a network address"
+                )));
+            }
+            require_private_host_ip(address, &value)
+        }
+        IpAddr::V6(ip) => {
+            if prefix > 128 {
+                return Err(ApiError::BadRequest(format!(
+                    "ACL host {value} has an invalid prefix"
+                )));
+            }
+            if prefix < 128 {
+                let bits = u128::from(ip);
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    !0u128 << (128 - prefix)
+                };
+                if bits & !mask != 0 {
+                    return Err(ApiError::BadRequest(format!(
+                        "ACL host {value} is not a network address"
+                    )));
+                }
+            }
+            require_private_host_ip(address, &value)
+        }
+    }
+}
+
+fn require_private_host_ip(address: IpAddr, value: &str) -> Result<(), ApiError> {
+    let private = match address {
+        IpAddr::V4(ip) => ip.is_private() || matches!(ip.octets(), [100, 64..=127, _, _]),
+        IpAddr::V6(ip) => (ip.octets()[0] & 0xfe) == 0xfc,
+    };
+    if address.is_unspecified() || address.is_multicast() || address.is_loopback() || !private {
+        return Err(ApiError::BadRequest(format!(
+            "ACL host {value} must be a private IPv4 or unique-local IPv6 address"
+        )));
+    }
+    Ok(())
+}
+
 fn valid_acl_group_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some('a'..='z'))
@@ -5675,6 +5941,105 @@ mod tests {
         assert!(
             check_policy_document(r#"{"tag_owners":{"unknown":["alice"]},"rules":[]}"#).is_err()
         );
+    }
+
+    #[test]
+    fn policy_ports_hosts_and_protocols_validate_offline() {
+        let document = serde_json::json!({
+            "version": 1,
+            "groups": {"rangers":["alice-user"]},
+            "hosts": {
+                "wiki": "10.0.0.10",
+                "printers": "10.0.0.0/24",
+                "ula": "fd12:3456:789a::/48"
+            },
+            "rules":[
+                {
+                    "action":"allow",
+                    "src_groups":["rangers"],
+                    "dst_tags":["store"],
+                    "dst_ports":["22","80-443"],
+                    "protocols":["tcp"]
+                },
+                {
+                    "action":"allow",
+                    "src_groups":["rangers"],
+                    "dst_hosts":["wiki"],
+                    "dst_ports":["443"],
+                    "protocols":["tcp"]
+                }
+            ],
+            "tests":[
+                {
+                    "name":"ssh to store",
+                    "src_user":"alice-user",
+                    "dst_tags":["store"],
+                    "dst_port": 22,
+                    "protocol":"tcp",
+                    "allow": true
+                },
+                {
+                    "name":"dns to store stays denied",
+                    "src_user":"alice-user",
+                    "dst_tags":["store"],
+                    "dst_port": 53,
+                    "protocol":"udp",
+                    "allow": false
+                },
+                {
+                    "name":"wiki https",
+                    "src_user":"alice-user",
+                    "dst_host":"wiki",
+                    "dst_port": 443,
+                    "protocol":"tcp",
+                    "allow": true
+                },
+                {
+                    "name":"wiki ssh denied",
+                    "src_user":"alice-user",
+                    "dst_host":"wiki",
+                    "dst_port": 22,
+                    "protocol":"tcp",
+                    "allow": false
+                }
+            ]
+        });
+        let report = check_policy_document(&document.to_string()).unwrap();
+        assert_eq!(report.hosts, 3);
+        assert_eq!(report.tests, 4);
+        assert!(check_policy_document(
+            r#"{"hosts":{"wiki":"example.com"},"rules":[{"action":"allow","dst_hosts":["wiki"]}]}"#
+        )
+        .is_err());
+        assert!(check_policy_document(
+            r#"{"hosts":{"wiki":"10.0.0.10"},"rules":[{"action":"allow","dst_hosts":["missing"]}]}"#
+        )
+        .is_err());
+        assert!(check_policy_document(
+            r#"{"rules":[{"action":"allow","src_tags":["office"],"dst_ports":["0"]}]}"#
+        )
+        .is_err());
+        assert!(check_policy_document(r#"{"hosts":{"open":"0.0.0.0/0"},"rules":[]}"#).is_err());
+        let peer_rule: Acl = serde_json::from_value(serde_json::json!({
+            "groups": {"rangers":["alice-user"]},
+            "hosts": {"wiki":"10.0.0.10"},
+            "rules":[
+                {"action":"allow","src_groups":["rangers"],"dst_tags":["store"],"dst_ports":["22"]},
+                {"action":"allow","src_groups":["rangers"],"dst_hosts":["wiki"]}
+            ]
+        }))
+        .unwrap();
+        let ranger = Subject::new(Role::Member, vec![]).with_user("alice-user");
+        let store = Subject::new(Role::Member, vec![DeviceTag::Store]);
+        assert!(peer_rule.allows(&ranger, &store));
+        assert!(!peer_rule.allows_flow(&ranger, &store, Some(53), Some(AclProtocol::Udp), None));
+        assert!(peer_rule.allows_flow(
+            &ranger,
+            &Subject::new(Role::Member, vec![]),
+            Some(443),
+            Some(AclProtocol::Tcp),
+            Some("wiki")
+        ));
     }
 
     #[tokio::test]

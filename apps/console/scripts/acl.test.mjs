@@ -42,6 +42,36 @@ test("ACL drafts keep groups and compact empty selectors", () => {
   });
 });
 
+test("ACL drafts keep hosts, ports, and protocols across a round trip", () => {
+  const policy = parseAclPolicy({
+    hosts: { wiki: "10.0.0.10" },
+    rules: [
+      {
+        action: "allow",
+        src_groups: ["rangers"],
+        dst_hosts: ["wiki"],
+        dst_ports: ["443"],
+        protocols: ["tcp"],
+      },
+    ],
+  });
+  assert.deepEqual(policy.hosts, [{ name: "wiki", target: "10.0.0.10" }]);
+  assert.deepEqual(serializeAclPolicy(policy), {
+    version: 1,
+    groups: {},
+    hosts: { wiki: "10.0.0.10" },
+    rules: [
+      {
+        action: "allow",
+        src_groups: ["rangers"],
+        dst_hosts: ["wiki"],
+        dst_ports: ["443"],
+        protocols: ["tcp"],
+      },
+    ],
+  });
+});
+
 test("ACL drafts keep policy tests and tag owners across a round trip", () => {
   const policy = parseAclPolicy({
     version: 1,

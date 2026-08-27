@@ -11,6 +11,9 @@ export type AclPerson = {
   name: string;
 };
 
+export const ACL_PROTOCOLS = ["tcp", "udp", "icmp"] as const;
+export type AclProtocol = (typeof ACL_PROTOCOLS)[number];
+
 export type AclRuleDraft = {
   action: "allow" | "deny";
   src_roles: OrgRole[];
@@ -19,11 +22,15 @@ export type AclRuleDraft = {
   dst_roles: OrgRole[];
   dst_tags: AclTag[];
   dst_groups: string[];
+  dst_hosts: string[];
+  dst_ports: string[];
+  protocols: AclProtocol[];
 };
 
 export type AclPolicyDraft = {
   version: number;
   groups: { name: string; members: string[] }[];
+  hosts: { name: string; target: string }[];
   tag_owners: { tag: string; owners: string[] }[];
   rules: AclRuleDraft[];
   tests: unknown[];
@@ -56,6 +63,9 @@ export function emptyRule(): AclRuleDraft {
     dst_roles: [],
     dst_tags: [],
     dst_groups: [],
+    dst_hosts: [],
+    dst_ports: [],
+    protocols: [],
   };
 }
 
@@ -86,6 +96,11 @@ export function parseAclPolicy(value: unknown): AclPolicyDraft {
           dst_roles: asRoleArray(row.dst_roles),
           dst_tags: asTagArray(row.dst_tags),
           dst_groups: asStringArray(row.dst_groups),
+          dst_hosts: asStringArray(row.dst_hosts),
+          dst_ports: asStringArray(row.dst_ports),
+          protocols: asStringArray(row.protocols).filter((item): item is AclProtocol =>
+            ACL_PROTOCOLS.includes(item as AclProtocol),
+          ),
         } satisfies AclRuleDraft;
       })
     : [];
@@ -99,9 +114,17 @@ export function parseAclPolicy(value: unknown): AclPolicyDraft {
           }),
         )
       : [];
+  const hostsValue = source.hosts;
+  const hosts =
+    hostsValue && typeof hostsValue === "object" && !Array.isArray(hostsValue)
+      ? Object.entries(hostsValue as Record<string, unknown>).map(([name, target]) => ({
+          name,
+          target: typeof target === "string" ? target : "",
+        }))
+      : [];
   const tests = Array.isArray(source.tests) ? source.tests : [];
   const version = source.version === 1 || source.version === undefined ? 1 : Number(source.version);
-  return { version: Number.isFinite(version) ? version : 1, groups, tag_owners, rules, tests };
+  return { version: Number.isFinite(version) ? version : 1, groups, hosts, tag_owners, rules, tests };
 }
 
 export function validGroupName(name: string): boolean {
@@ -163,10 +186,16 @@ export function serializeAclPolicy(policy: AclPolicyDraft): Record<string, unkno
       ])
       .filter(([tag, owners]) => tag && (owners as string[]).length > 0),
   );
+  const hosts = Object.fromEntries(
+    policy.hosts
+      .map((entry) => [entry.name.trim(), entry.target.trim()])
+      .filter(([name, target]) => name && target),
+  );
   return {
     version: policy.version || 1,
     groups,
     ...(Object.keys(tag_owners).length > 0 ? { tag_owners } : {}),
+    ...(Object.keys(hosts).length > 0 ? { hosts } : {}),
     ...(policy.tests.length > 0 ? { tests: policy.tests } : {}),
     rules: policy.rules.map((rule) => ({
       action: rule.action,
@@ -176,6 +205,9 @@ export function serializeAclPolicy(policy: AclPolicyDraft): Record<string, unkno
       ...compact("dst_roles", rule.dst_roles),
       ...compact("dst_tags", rule.dst_tags),
       ...compact("dst_groups", rule.dst_groups),
+      ...compact("dst_hosts", rule.dst_hosts),
+      ...compact("dst_ports", rule.dst_ports),
+      ...compact("protocols", rule.protocols),
     })),
   };
 }
