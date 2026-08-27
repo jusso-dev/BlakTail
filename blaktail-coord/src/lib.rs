@@ -6965,6 +6965,357 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_api_provider_contract_manages_device_lifecycle() {
+        let store = Store::memory().await.unwrap();
+        let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&r, "provider-contract-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let writer: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({
+                    "name": "terraform-provider",
+                    "scopes": [
+                        "status:read",
+                        "devices:read",
+                        "devices:write",
+                        "keys:write",
+                        "policy:write",
+                        "dns:write",
+                        "audit:read"
+                    ]
+                }),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let reader: crate::admin::ApiClientCreated = body(
+            call(
+                &r,
+                Method::POST,
+                &format!("/v1/orgs/{}/api-clients", org.id),
+                serde_json::json!({
+                    "name": "readonly-provider",
+                    "scopes": ["status:read", "devices:read"]
+                }),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let admin = |method: Method, uri: String, token: String, payload: serde_json::Value| {
+            let router = r.clone();
+            let org_id = org.id;
+            async move {
+                router
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(uri)
+                            .header(AUTHORIZATION, format!("Bearer {token}"))
+                            .header("x-blaktail-organisation", org_id.to_string())
+                            .header("content-type", "application/json")
+                            .body(Body::from(payload.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let status: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/status".into(),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status["api"], "v1");
+        assert_eq!(status["organisation_id"], org.id.to_string());
+
+        let listed: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/devices".into(),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert!(listed["data"].as_array().unwrap().is_empty());
+
+        let minted = admin(
+            Method::POST,
+            "/api/v1/keys".into(),
+            writer.token.clone(),
+            serde_json::json!({"expires_in_seconds": 60}),
+        )
+        .await;
+        assert_eq!(minted.status(), StatusCode::CREATED);
+        let minted: serde_json::Value = body(minted).await;
+        let join_key = minted["data"]["key"].as_str().unwrap().to_owned();
+        assert!(join_key.starts_with("btk_"));
+
+        let registered: RegisterResponse = body(
+            call(
+                &r,
+                Method::POST,
+                "/v1/nodes/register",
+                serde_json::json!({
+                    "join_key": join_key,
+                    "name": "provider-node",
+                    "wg_public_key": "provider-contract-key",
+                    "advertised_routes": []
+                }),
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(registered.org_id, org.id);
+
+        let listed: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/devices".into(),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(listed["data"][0]["id"], registered.id.to_string());
+        assert_eq!(listed["data"][0]["name"], "provider-node");
+        assert_eq!(listed["data"][0]["wg_public_key"], "provider-contract-key");
+
+        let got: serde_json::Value = body(
+            admin(
+                Method::GET,
+                format!("/api/v1/devices/{}", registered.id),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(got["data"]["dns_name"], registered.dns_name);
+
+        let renamed = admin(
+            Method::PUT,
+            format!("/api/v1/devices/{}/friendly-name", registered.id),
+            writer.token.clone(),
+            serde_json::json!({"friendly_name": "Ranger tablet"}),
+        )
+        .await;
+        assert_eq!(renamed.status(), StatusCode::NO_CONTENT);
+        let got: serde_json::Value = body(
+            admin(
+                Method::GET,
+                format!("/api/v1/devices/{}", registered.id),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(got["data"]["display_name"], "Ranger tablet");
+        assert_eq!(got["data"]["name"], "provider-node");
+        assert_eq!(got["data"]["wg_public_key"], "provider-contract-key");
+
+        let policy: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/policy".into(),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        let policy_etag = policy["data"]["etag"].as_str().unwrap();
+        let published_policy = admin(
+            Method::PUT,
+            "/api/v1/policy".into(),
+            writer.token.clone(),
+            serde_json::json!({
+                "etag": policy_etag,
+                "acl": {
+                    "version": 1,
+                    "groups": {"rangers": ["alice-user"]},
+                    "tag_owners": {},
+                    "rules": [{
+                        "action": "allow",
+                        "src_groups": ["rangers"],
+                        "dst_tags": ["store"]
+                    }],
+                    "tests": []
+                }
+            }),
+        )
+        .await;
+        assert_eq!(published_policy.status(), StatusCode::NO_CONTENT);
+        let stale_policy = admin(
+            Method::PUT,
+            "/api/v1/policy".into(),
+            writer.token.clone(),
+            serde_json::json!({"etag": policy_etag, "acl": {"rules": []}}),
+        )
+        .await;
+        assert_eq!(stale_policy.status(), StatusCode::PRECONDITION_FAILED);
+
+        let dns: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/dns".into(),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(dns["data"]["revision"], 0);
+        let published_dns = admin(
+            Method::PUT,
+            "/api/v1/dns".into(),
+            writer.token.clone(),
+            serde_json::json!({
+                "etag": dns["data"]["etag"],
+                "dns": {
+                    "managed": true,
+                    "split": [{"suffix": "internal.example", "resolvers": ["10.0.0.53"]}],
+                    "records": [{"name": "wiki.internal.example", "type": "A", "value": "10.0.0.10"}]
+                }
+            }),
+        )
+        .await;
+        assert_eq!(published_dns.status(), StatusCode::OK);
+        let published_dns: serde_json::Value = body(published_dns).await;
+        assert_eq!(published_dns["data"]["revision"], 1);
+
+        assert_eq!(
+            admin(
+                Method::PUT,
+                "/api/v1/policy".into(),
+                reader.token.clone(),
+                serde_json::json!({"acl": {"rules": []}}),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            admin(
+                Method::PUT,
+                "/api/v1/dns".into(),
+                reader.token.clone(),
+                serde_json::json!({"rollback": true}),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            admin(
+                Method::PUT,
+                format!("/api/v1/devices/{}/friendly-name", registered.id),
+                reader.token.clone(),
+                serde_json::json!({"friendly_name": "should-fail"}),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            admin(
+                Method::POST,
+                format!("/api/v1/devices/{}/tombstone", registered.id),
+                reader.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let tombstoned = admin(
+            Method::POST,
+            format!("/api/v1/devices/{}/tombstone", registered.id),
+            writer.token.clone(),
+            serde_json::Value::Null,
+        )
+        .await;
+        assert_eq!(tombstoned.status(), StatusCode::NO_CONTENT);
+        let listed: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/devices".into(),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert!(listed["data"].as_array().unwrap().is_empty());
+        let tombstone: serde_json::Value = body(
+            admin(
+                Method::GET,
+                format!("/api/v1/devices/{}", registered.id),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(tombstone["data"]["deleted"], true);
+        assert_ne!(tombstone["data"]["name"], "provider-node");
+        assert_ne!(tombstone["data"]["wg_public_key"], "provider-contract-key");
+
+        let audit: serde_json::Value = body(
+            admin(
+                Method::GET,
+                "/api/v1/audit".into(),
+                writer.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await,
+        )
+        .await;
+        let actions: Vec<&str> = audit["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["action"].as_str())
+            .collect();
+        for action in [
+            "join_key.minted",
+            "node.friendly_name_updated",
+            "acl.updated",
+            "dns.updated",
+            "node.tombstoned",
+        ] {
+            assert!(actions.contains(&action), "missing audit action {action}");
+        }
+        assert_eq!(
+            admin(
+                Method::GET,
+                "/api/v1/audit".into(),
+                reader.token.clone(),
+                serde_json::Value::Null,
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
     async fn org_dns_settings_publish_rollback_and_reject_leaks() {
         let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);

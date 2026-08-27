@@ -36,3 +36,10 @@ A disposable smoke against a running coordinator:
 ```sh
 scripts/admin-api-smoke.sh https://coord.example ORG_UUID bta_token
 ```
+
+CI also runs an in-process Terraform/provider-style contract
+(`admin_api_provider_contract_manages_device_lifecycle`) that mints a `bta_`
+client, enrols a device from a minted key, renames it without changing the
+WireGuard identity, publishes policy and DNS with etags, tombstones the device,
+and proves a read-only token cannot write. OAuth client-credentials remain on
+#37.
