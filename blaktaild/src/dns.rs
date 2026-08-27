@@ -831,6 +831,7 @@ mod tests {
             relay_endpoint_reported_at: 0,
             dns_mode: None,
             org_dns: None,
+            control_revision: 0,
         }
     }
 
