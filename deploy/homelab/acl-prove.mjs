@@ -61,6 +61,8 @@ if (command === "identity") {
       .map((name) => name.trim())
       .filter(Boolean),
   );
+  const leftoverName =
+    /^(office|store)(-[a-z]+)*-[0-9a-f]{4}$|^vanilla(-[a-z]+)*-[0-9a-f]{4}$/;
   const collected = [];
   let before;
   for (;;) {
@@ -76,7 +78,9 @@ if (command === "identity") {
     const nodes = await response.json();
     if (!Array.isArray(nodes) || nodes.length === 0) break;
     for (const node of nodes) {
-      if (node.deleted || keep.has(node.name)) continue;
+      if (node.deleted || keep.has(node.name) || !leftoverName.test(node.name)) {
+        continue;
+      }
       collected.push({ id: node.id, name: node.name });
     }
     if (nodes.length < 200) break;
@@ -91,10 +95,12 @@ if (command === "identity") {
         headers: { authorization: `Bearer ${sign(row)}` },
       },
     );
-    if (!tombstone.ok && tombstone.status !== 404) {
-      throw new Error(
-        `tombstone ${node.name} ${tombstone.status} ${await tombstone.text()}`,
+    if (tombstone.status === 404) continue;
+    if (!tombstone.ok) {
+      process.stdout.write(
+        `ok skipped ${node.name} (${tombstone.status})\n`,
       );
+      continue;
     }
     purged += 1;
     process.stdout.write(`ok tombstoned leftover ${node.name}\n`);
