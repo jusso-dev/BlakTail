@@ -2,7 +2,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -146,6 +146,53 @@ pub fn peer_diff(current: &[Peer], desired: &[Peer]) -> Vec<PeerChange> {
         }
     }
     changes
+}
+
+/// Kernel WireGuard routes each AllowedIP to exactly one peer. When the
+/// coordinator exports a rotated key beside its predecessor, keep the key
+/// already on the interface until the overlap row disappears.
+pub fn installable_wireguard_peers(current: &[Peer], desired: &[Peer]) -> Vec<Peer> {
+    let desired_keys: BTreeSet<&str> = desired
+        .iter()
+        .map(|peer| peer.wg_public_key.as_str())
+        .collect();
+    let mut claimed = BTreeSet::new();
+    let mut installed = Vec::new();
+    let mut seen = BTreeSet::new();
+    for peer in current {
+        if !desired_keys.contains(peer.wg_public_key.as_str()) {
+            continue;
+        }
+        if peer
+            .allowed_ips
+            .iter()
+            .any(|route| claimed.contains(route.as_str()))
+        {
+            continue;
+        }
+        for route in &peer.allowed_ips {
+            claimed.insert(route.clone());
+        }
+        seen.insert(peer.wg_public_key.as_str());
+        installed.push(peer.clone());
+    }
+    for peer in desired {
+        if !seen.insert(peer.wg_public_key.as_str()) {
+            continue;
+        }
+        if peer
+            .allowed_ips
+            .iter()
+            .any(|route| claimed.contains(route.as_str()))
+        {
+            continue;
+        }
+        for route in &peer.allowed_ips {
+            claimed.insert(route.clone());
+        }
+        installed.push(peer.clone());
+    }
+    installed
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1735,10 +1782,11 @@ pub fn apply_peer_map(
             return Err(error);
         }
     }
-    let changes = peer_diff(&state.peers, &desired);
+    let installed = installable_wireguard_peers(&state.peers, &desired);
+    let changes = peer_diff(&state.peers, &installed);
     network.apply(&state.interface, &changes)?;
-    apply_peer_filter(network, dir, &state.interface, &desired)?;
-    state.peers = desired;
+    apply_peer_filter(network, dir, &state.interface, &installed)?;
+    state.peers = installed;
     write_state(dir, state)?;
     Ok(changes.len())
 }
@@ -1970,6 +2018,30 @@ mod tests {
             ingress: None,
         }
     }
+    #[test]
+    fn overlapping_allowed_ips_keep_the_installed_key() {
+        let mut old = peer("old", Some("192.0.2.10:51820"));
+        old.allowed_ips = vec!["10.8.0.2/32".into()];
+        let mut new = peer("new", Some("192.0.2.10:51820"));
+        new.allowed_ips = vec!["10.8.0.2/32".into()];
+        let installed = installable_wireguard_peers(&[old.clone()], &[new.clone(), old.clone()]);
+        assert_eq!(
+            installed
+                .iter()
+                .map(|peer| peer.wg_public_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old"]
+        );
+        let after = installable_wireguard_peers(&[old.clone()], &[new.clone()]);
+        assert_eq!(
+            after
+                .iter()
+                .map(|peer| peer.wg_public_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new"]
+        );
+    }
+
     #[test]
     fn diff_removes_adds_and_updates() {
         assert_eq!(

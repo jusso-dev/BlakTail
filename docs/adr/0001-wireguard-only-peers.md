@@ -49,5 +49,7 @@ creates them with stored kind `wireguard_only`. Homelab
 `wg` container (no `blaktaild`) and proves overlay ping both ways, then
 revokes the peer. `deploy/homelab/prove-wg-rotate.sh` rotates the public key
 with a bounded overlap so both keys stay exported until the window ends.
+Kernel WireGuard can only route each AllowedIP to one peer, so the agent
+keeps the already-installed key on the interface until overlap expires.
 This record only locks the first topology so later slices do not silently
 grow into a gateway product.

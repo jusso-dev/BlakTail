@@ -105,6 +105,33 @@ if (command === "identity") {
     purged += 1;
     process.stdout.write(`ok tombstoned leftover ${node.name}\n`);
   }
+  const listed = await fetch(
+    `${base}/v1/orgs/${row.coord_org_id}/wireguard-only-peers`,
+    { headers: { authorization: `Bearer ${sign(row)}` } },
+  );
+  if (!listed.ok) {
+    throw new Error(`list wg-only ${listed.status} ${await listed.text()}`);
+  }
+  const unmanaged = await listed.json();
+  for (const peer of Array.isArray(unmanaged) ? unmanaged : []) {
+    if (peer.revoked_at || keep.has(peer.name) || !leftoverName.test(peer.name)) {
+      continue;
+    }
+    const revoked = await fetch(
+      `${base}/v1/orgs/${row.coord_org_id}/wireguard-only-peers/${peer.id}`,
+      {
+        method: "DELETE",
+        headers: { authorization: `Bearer ${sign(row)}` },
+      },
+    );
+    if (revoked.status === 404) continue;
+    if (!revoked.ok) {
+      process.stdout.write(`ok skipped ${peer.name} (${revoked.status})\n`);
+      continue;
+    }
+    purged += 1;
+    process.stdout.write(`ok revoked leftover ${peer.name}\n`);
+  }
   if (purged === 0) process.stdout.write("ok no leftover prove nodes\n");
   else process.stdout.write(`ok purged ${purged} leftover nodes\n`);
 } else if (command === "put-dns") {

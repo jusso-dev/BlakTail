@@ -2711,6 +2711,7 @@ async fn list_peers(
         .execute(&s.store.pool)
         .await?;
     expire_ephemeral_nodes(&s.store, &org).await?;
+    wg_only::expire_overlaps(&s.store.pool, &org).await?;
     let source = Subject::new(
         source_role.parse().map_err(|_| ApiError::CorruptData)?,
         serde_json::from_str(&source_tags).unwrap_or_default(),
@@ -2867,12 +2868,13 @@ async fn list_updates(
     let wait = selection.wait.min(MAX_CONTROL_UPDATE_WAIT_SECS);
     let started = Instant::now();
     loop {
+        let expired = wg_only::expire_overlaps(&s.store.pool, &org).await?;
         let revision: i64 = sqlx::query_scalar("SELECT control_revision FROM orgs WHERE id=$1")
             .bind(&org)
             .fetch_optional(&s.store.pool)
             .await?
             .ok_or(ApiError::CorruptData)?;
-        let changed = selection.since == 0 || revision > selection.since;
+        let changed = selection.since == 0 || revision > selection.since || expired;
         if changed || started.elapsed() >= Duration::from_secs(wait) {
             if !changed {
                 return Ok(StatusCode::NO_CONTENT.into_response());
@@ -2894,6 +2896,7 @@ async fn list_updates(
                 snapshot,
                 selection.since,
                 selection.version,
+                expired,
             );
             return Ok(Json(update).into_response());
         }
@@ -2908,6 +2911,7 @@ fn control_update_from_snapshot(
     snapshot: PeersResponse,
     since: i64,
     version: Option<u32>,
+    force_snapshot: bool,
 ) -> ControlUpdate {
     let current_ids = snapshot
         .peers
@@ -2915,7 +2919,7 @@ fn control_update_from_snapshot(
         .map(|peer| peer.id)
         .collect::<BTreeSet<_>>();
     let baseline = remember_and_baseline(&state.control_views, node_id, revision, &current_ids);
-    if version == Some(2) {
+    if version == Some(2) && !force_snapshot {
         if let Some((baseline_revision, previous_ids)) = baseline {
             if since > 0 && baseline_revision == since {
                 let added = snapshot
@@ -10153,12 +10157,43 @@ mod tests {
             .collect();
         assert!(keys.contains(&"newRouterPublicKeyExample+/="));
         assert!(keys.contains(&"oldRouterPublicKeyExample+/="));
+        let during: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/updates?since=0&wait=0", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        let seen_revision = during["revision"].as_i64().expect("control revision");
         sqlx::query("UPDATE wireguard_only_peers SET overlap_until=$1 WHERE id=$2")
             .bind(now() - 1)
             .bind(created.id.to_string())
             .execute(&store.pool)
             .await
             .unwrap();
+        let after_wait = call(
+            &router,
+            Method::GET,
+            &format!("/v1/nodes/{}/updates?since={seen_revision}&wait=0", node.id),
+            serde_json::Value::Null,
+            Some(&node.node_token),
+        )
+        .await;
+        assert_eq!(after_wait.status(), StatusCode::OK);
+        let after_update: serde_json::Value = body(after_wait).await;
+        assert_eq!(after_update["kind"], "snapshot");
+        let update_keys: Vec<&str> = after_update["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|peer| peer["kind"] == "wireguard_only")
+            .filter_map(|peer| peer["wg_public_key"].as_str())
+            .collect();
+        assert_eq!(update_keys, vec!["newRouterPublicKeyExample+/="]);
         let after_overlap: PeersResponse = body(
             call(
                 &router,
