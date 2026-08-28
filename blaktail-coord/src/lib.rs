@@ -2711,6 +2711,7 @@ async fn list_peers(
         .execute(&s.store.pool)
         .await?;
     expire_ephemeral_nodes(&s.store, &org).await?;
+    wg_only::expire_overlaps(&s.store.pool, &org).await?;
     let source = Subject::new(
         source_role.parse().map_err(|_| ApiError::CorruptData)?,
         serde_json::from_str(&source_tags).unwrap_or_default(),
@@ -2867,6 +2868,7 @@ async fn list_updates(
     let wait = selection.wait.min(MAX_CONTROL_UPDATE_WAIT_SECS);
     let started = Instant::now();
     loop {
+        wg_only::expire_overlaps(&s.store.pool, &org).await?;
         let revision: i64 = sqlx::query_scalar("SELECT control_revision FROM orgs WHERE id=$1")
             .bind(&org)
             .fetch_optional(&s.store.pool)
@@ -10153,12 +10155,33 @@ mod tests {
             .collect();
         assert!(keys.contains(&"newRouterPublicKeyExample+/="));
         assert!(keys.contains(&"oldRouterPublicKeyExample+/="));
+        let during: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/updates?since=0&wait=0", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        let seen_revision = during["revision"].as_i64().expect("control revision");
         sqlx::query("UPDATE wireguard_only_peers SET overlap_until=$1 WHERE id=$2")
             .bind(now() - 1)
             .bind(created.id.to_string())
             .execute(&store.pool)
             .await
             .unwrap();
+        let after_wait = call(
+            &router,
+            Method::GET,
+            &format!("/v1/nodes/{}/updates?since={seen_revision}&wait=0", node.id),
+            serde_json::Value::Null,
+            Some(&node.node_token),
+        )
+        .await;
+        assert_eq!(after_wait.status(), StatusCode::OK);
         let after_overlap: PeersResponse = body(
             call(
                 &router,

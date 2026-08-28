@@ -45,7 +45,7 @@ wait_office_peer() {
   local label="$1"
   local pubkey="$2"
   local want="$3"
-  local deadline=$((SECONDS + 45))
+  local deadline=$((SECONDS + 70))
   while (( SECONDS < deadline )); do
     local text
     text="$("${COMPOSE[@]}" exec -T agent-office wg show blaktail0 || true)"

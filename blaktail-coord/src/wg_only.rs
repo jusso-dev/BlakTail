@@ -646,6 +646,27 @@ fn ipv6_mask(prefix: u8) -> u128 {
     }
 }
 
+pub(crate) async fn expire_overlaps(pool: &sqlx::AnyPool, org_id: &str) -> Result<bool, ApiError> {
+    let expired = sqlx::query(
+        "UPDATE wireguard_only_peers
+         SET previous_wg_public_key=NULL, overlap_until=NULL, overlap_peer_id=NULL, revision=revision+1
+         WHERE org_id=$1 AND overlap_until IS NOT NULL AND overlap_until<=$2",
+    )
+    .bind(org_id)
+    .bind(now())
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if expired == 0 {
+        return Ok(false);
+    }
+    sqlx::query("UPDATE orgs SET control_revision=control_revision+1 WHERE id=$1")
+        .bind(org_id)
+        .execute(pool)
+        .await?;
+    Ok(true)
+}
+
 pub(crate) async fn active_export_rows(
     pool: &sqlx::AnyPool,
     org_id: &str,
