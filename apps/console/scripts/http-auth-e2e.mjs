@@ -205,6 +205,27 @@ const coordinator = createServer(async (request, response) => {
     response.end(JSON.stringify(peer));
     return;
   }
+  const wgOnlyRotate = request.url?.match(
+    /^\/v1\/orgs\/([^/]+)\/wireguard-only-peers\/([^/]+)\/rotate$/u,
+  );
+  if (wgOnlyRotate && request.method === "POST") {
+    const body = JSON.parse(raw);
+    const peers = coordinatorWgOnlyPeers.get(wgOnlyRotate[1]) ?? [];
+    const peer = peers.find((candidate) => candidate.id === wgOnlyRotate[2]);
+    if (!peer) {
+      response.writeHead(404, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: "Unmanaged peer not found." }));
+      return;
+    }
+    peer.previous_wg_public_key = peer.wg_public_key;
+    peer.wg_public_key = body.wg_public_key;
+    peer.overlap_until =
+      Math.floor(Date.now() / 1000) + Number(body.overlap_seconds ?? 300);
+    peer.revision += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(peer));
+    return;
+  }
   const wgOnlyPeer = request.url?.match(
     /^\/v1\/orgs\/([^/]+)\/wireguard-only-peers\/([^/]+)$/u,
   );
@@ -616,6 +637,30 @@ try {
   assert.equal(unmanagedPage.status, 200);
   assert.match(unmanagedHTML, /site-printer/u);
   assert.match(unmanagedHTML, /Unmanaged/u);
+  assert.match(unmanagedHTML, /Rotate/u);
+  const rotatedUnmanaged = await jsonRequest(baseUrl, "/api/wg-only-peers", {
+    cookie: ownerCookie,
+    method: "PATCH",
+    body: {
+      organisationId: ownerOrganisation.id,
+      peerId: createdUnmanaged.body.id,
+      wgPublicKey: "rotatedRouterPublicKeyExample+/=",
+      overlapSeconds: 300,
+    },
+  });
+  assert.equal(
+    rotatedUnmanaged.response.status,
+    200,
+    JSON.stringify(rotatedUnmanaged.body),
+  );
+  assert.equal(
+    rotatedUnmanaged.body.wg_public_key,
+    "rotatedRouterPublicKeyExample+/=",
+  );
+  assert.equal(
+    rotatedUnmanaged.body.previous_wg_public_key,
+    "siteRouterPublicKeyExample+/=",
+  );
 
   const blueSettings = await fetch(`${baseUrl}/settings`, {
     headers: {
@@ -999,6 +1044,7 @@ try {
   assert.match(allNetworksHtml, /Unmanaged WireGuard peers/u);
   assert.match(allNetworksHtml, /site-printer/u);
   assert.equal(allNetworksHtml.includes("Add unmanaged peer"), false);
+  assert.equal(allNetworksHtml.includes("new public key"), false);
   const memberCreateUnmanaged = await jsonRequest(
     baseUrl,
     "/api/wg-only-peers",

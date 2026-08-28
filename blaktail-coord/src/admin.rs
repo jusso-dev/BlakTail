@@ -138,6 +138,10 @@ pub(crate) fn api_routes() -> Router<AppState> {
             "/api/v1/wireguard-only-peers/:peer_id",
             get(api_get_wg_only).delete(api_revoke_wg_only),
         )
+        .route(
+            "/api/v1/wireguard-only-peers/:peer_id/rotate",
+            post(api_rotate_wg_only),
+        )
         .route("/api/v1/audit", get(api_list_audit))
         .route(
             "/api/v1/webhooks",
@@ -1384,4 +1388,17 @@ async fn api_revoke_wg_only(
     require_scope(&caller, Scope::DevicesWrite)?;
     crate::wg_only::revoke_for_org(&s, org_id, peer_id, &caller.session).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn api_rotate_wg_only(
+    State(s): State<AppState>,
+    UrlPath(peer_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<crate::wg_only::RotateWireGuardOnlyPeer>,
+) -> Result<Json<crate::wg_only::WireGuardOnlyPeer>, ApiError> {
+    let (org_id, caller) = authenticate_org_header(&s, &headers).await?;
+    require_scope(&caller, Scope::DevicesWrite)?;
+    Ok(Json(
+        crate::wg_only::rotate_for_org(&s, org_id, peer_id, &caller.session, input).await?,
+    ))
 }

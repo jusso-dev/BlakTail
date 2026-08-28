@@ -55,17 +55,39 @@ if (command === "identity") {
   }
   process.stdout.write(`ok ACL PUT ${response.status}\n`);
 } else if (command === "purge-nodes") {
-  const wanted = new Set(["office-box", "store-box"]);
-  const response = await fetch(`${base}/v1/orgs/${row.coord_org_id}/nodes`, {
-    headers: { authorization: `Bearer ${sign(row)}` },
-  });
-  if (!response.ok) {
-    throw new Error(`list nodes ${response.status} ${await response.text()}`);
+  const keep = new Set(
+    (process.env.BLAKTAIL_KEEP_NODES ?? "")
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean),
+  );
+  const leftoverName =
+    /^(office|store)(-[a-z]+)*-[0-9a-f]{4}$|^vanilla(-[a-z]+)*-[0-9a-f]{4}$/;
+  const collected = [];
+  let before;
+  for (;;) {
+    const url = new URL(`${base}/v1/orgs/${row.coord_org_id}/nodes`);
+    url.searchParams.set("limit", "200");
+    if (before) url.searchParams.set("before", before);
+    const response = await fetch(url, {
+      headers: { authorization: `Bearer ${sign(row)}` },
+    });
+    if (!response.ok) {
+      throw new Error(`list nodes ${response.status} ${await response.text()}`);
+    }
+    const nodes = await response.json();
+    if (!Array.isArray(nodes) || nodes.length === 0) break;
+    for (const node of nodes) {
+      if (node.deleted || keep.has(node.name) || !leftoverName.test(node.name)) {
+        continue;
+      }
+      collected.push({ id: node.id, name: node.name });
+    }
+    if (nodes.length < 200) break;
+    before = nodes[nodes.length - 1].id;
   }
-  const nodes = await response.json();
   let purged = 0;
-  for (const node of nodes) {
-    if (node.deleted || !wanted.has(node.name)) continue;
+  for (const node of collected) {
     const tombstone = await fetch(
       `${base}/v1/orgs/${row.coord_org_id}/nodes/${node.id}/tombstone`,
       {
@@ -73,15 +95,18 @@ if (command === "identity") {
         headers: { authorization: `Bearer ${sign(row)}` },
       },
     );
-    if (!tombstone.ok && tombstone.status !== 404) {
-      throw new Error(
-        `tombstone ${node.name} ${tombstone.status} ${await tombstone.text()}`,
+    if (tombstone.status === 404) continue;
+    if (!tombstone.ok) {
+      process.stdout.write(
+        `ok skipped ${node.name} (${tombstone.status})\n`,
       );
+      continue;
     }
     purged += 1;
     process.stdout.write(`ok tombstoned leftover ${node.name}\n`);
   }
   if (purged === 0) process.stdout.write("ok no leftover prove nodes\n");
+  else process.stdout.write(`ok purged ${purged} leftover nodes\n`);
 } else if (command === "put-dns") {
   const body = JSON.parse(process.argv[3] ?? "{}");
   const response = await fetch(`${base}/v1/orgs/${row.coord_org_id}/dns`, {
@@ -174,9 +199,39 @@ if (command === "identity") {
     );
   }
   process.stdout.write(`ok revoked ${peerId}\n`);
+} else if (command === "rotate-wg-only") {
+  const peerId = process.argv[3];
+  const pubkey = process.argv[4];
+  const overlapSeconds = Number(process.argv[5] ?? "30");
+  if (!peerId || !pubkey) {
+    throw new Error(
+      "usage: acl-prove.mjs rotate-wg-only PEER_ID PUBKEY [overlap_seconds]",
+    );
+  }
+  const response = await fetch(
+    `${base}/v1/orgs/${row.coord_org_id}/wireguard-only-peers/${peerId}/rotate`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${sign(row)}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        wg_public_key: pubkey,
+        overlap_seconds: overlapSeconds,
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `rotate wg-only ${response.status} ${await response.text()}`,
+    );
+  }
+  const rotated = await response.json();
+  process.stdout.write(`${JSON.stringify(rotated)}\n`);
 } else {
   throw new Error(
-    "usage: acl-prove.mjs identity|mint|put-acl|put-dns|purge-nodes|create-wg-only|revoke-wg-only",
+    "usage: acl-prove.mjs identity|mint|put-acl|put-dns|purge-nodes|create-wg-only|revoke-wg-only|rotate-wg-only",
   );
 }
 

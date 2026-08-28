@@ -599,6 +599,8 @@ export type WireGuardOnlyPeer = {
   expires_at: number | null;
   revoked_at: number | null;
   revision: number;
+  previous_wg_public_key?: string | null;
+  overlap_until?: number | null;
 };
 
 export type NetworkWgOnlyPeer = WireGuardOnlyPeer & {
@@ -683,6 +685,28 @@ export async function createWgOnlyPeer(
         kind: "wireguard_only",
         ...input,
       }),
+    },
+  );
+  if (!res.ok) {
+    throw new Error(await readError(res));
+  }
+  return res.json() as Promise<WireGuardOnlyPeer>;
+}
+
+export async function rotateWgOnlyPeer(
+  ctx: ConsoleContext,
+  peerId: string,
+  input: { wg_public_key: string; overlap_seconds?: number },
+): Promise<WireGuardOnlyPeer> {
+  if (ctx.role === "member") {
+    throw new Error("Members cannot rotate unmanaged WireGuard peers.");
+  }
+  const res = await coordFetch(
+    `/v1/orgs/${ctx.coordOrgId}/wireguard-only-peers/${peerId}/rotate`,
+    {
+      method: "POST",
+      ctx,
+      body: JSON.stringify(input),
     },
   );
   if (!res.ok) {

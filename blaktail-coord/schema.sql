@@ -133,7 +133,10 @@ CREATE TABLE IF NOT EXISTS wireguard_only_peers (
  created_at INTEGER NOT NULL,
  expires_at INTEGER,
  revoked_at INTEGER,
- revision INTEGER NOT NULL DEFAULT 1
+ revision INTEGER NOT NULL DEFAULT 1,
+ previous_wg_public_key TEXT,
+ overlap_until INTEGER,
+ overlap_peer_id TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS wireguard_only_peers_org_name_idx
  ON wireguard_only_peers(org_id, name) WHERE revoked_at IS NULL;

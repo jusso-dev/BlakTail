@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+export COMPOSE_HTTP_TIMEOUT="${COMPOSE_HTTP_TIMEOUT:-300}"
+export DOCKER_CLIENT_TIMEOUT="${DOCKER_CLIENT_TIMEOUT:-300}"
 COMPOSE=(docker compose -p blaktail -f compose.yaml -f compose.homelab.yml --profile acl-prove)
 WORKDIR="/tmp/blaktail-dns-noleak-prove"
 COORD="https://coord:8443"
@@ -21,7 +23,9 @@ status_of() {
 }
 
 magic_dns_ip() {
-  status_of | awk '/^ipv6 address:/ { sub("/128","",$3); print $3; exit }'
+  local text
+  text="$(status_of)" || return 1
+  awk '/^ipv6 address:/ { sub("/128","",$3); print $3; exit }' <<<"$text"
 }
 
 container_ip() {
@@ -68,6 +72,9 @@ mkdir -p "$WORKDIR"
 chmod 700 "$WORKDIR"
 cp deploy/homelab/acl-prove.mjs "$WORKDIR/acl-prove.mjs"
 sudo chown -R 999:999 "$WORKDIR"
+
+echo "== purge leftover prove nodes"
+console_bun purge-nodes
 
 echo "== build and start office agent and dns sink"
 "${COMPOSE[@]}" rm -sf agent-office dns-sink >/dev/null 2>&1 || true
@@ -162,7 +169,8 @@ echo "== capture eth0 and lo DNS while querying private and public names"
   echo $! >/tmp/tcpdump-lo.pid
   sleep 1
 '
-magic_domain="$(status_of | awk '$1 == "dns:" { sub(/^[^.]+./, "", $2); print $2; exit }')"
+status_text="$(status_of)" || true
+magic_domain="$(awk '$1 == "dns:" { sub(/^[^.]+./, "", $2); print $2; exit }' <<<"$status_text")"
 dig_at "$office_dns" "$RECORD_NAME" >/dev/null || true
 dig_at "$office_dns" "ghost.${magic_domain:-blaktail}" >/dev/null || true
 dig_at "$office_dns" "${office_name}.invalid.blaktail" >/dev/null || true

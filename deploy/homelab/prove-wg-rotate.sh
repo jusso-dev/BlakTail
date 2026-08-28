@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enrol one Linux agent and prove a vanilla `wg` peer can reach it.
+# Enrol one Linux agent and prove WireGuard-only key rotation keeps traffic during overlap.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -7,13 +7,14 @@ cd "$ROOT"
 export COMPOSE_HTTP_TIMEOUT="${COMPOSE_HTTP_TIMEOUT:-300}"
 export DOCKER_CLIENT_TIMEOUT="${DOCKER_CLIENT_TIMEOUT:-300}"
 COMPOSE=(docker compose -p blaktail -f compose.yaml -f compose.homelab.yml --profile acl-prove)
-WORKDIR="/tmp/blaktail-wg-only-prove"
+WORKDIR="/tmp/blaktail-wg-rotate-prove"
 COORD="https://coord:8443"
 LISTEN_PORT=51820
 VANILLA_OVERLAY="10.8.0.2"
 suffix="$(openssl rand -hex 2)"
-office_name="office-wg-${suffix}"
-vanilla_name="vanilla-${suffix}"
+office_name="office-rot-${suffix}"
+vanilla_name="vanilla-rot-${suffix}"
+OVERLAP_SECONDS=20
 
 status_of() {
   "${COMPOSE[@]}" exec -T agent-office blaktaild --coord-ca /certs/ca.crt status
@@ -170,7 +171,6 @@ vanilla_pub="$("${COMPOSE[@]}" exec -T vanilla-wg sh -ceu '
   ip address add '"${VANILLA_OVERLAY}"'/32 dev wg0
   wg set wg0 private-key /etc/wireguard/vanilla.key listen-port '"${LISTEN_PORT}"'
   ip link set up dev wg0
-  shred -u /etc/wireguard/vanilla.key || rm -f /etc/wireguard/vanilla.key
   printf "%s\n" "$pubkey"
 ')"
 vanilla_pub="$(printf '%s' "$vanilla_pub" | tr -d '\r\n ')"
@@ -212,14 +212,38 @@ fi
 wait_ping "vanilla wg pings office overlay" vanilla-wg "$office_overlay_ip"
 wait_ping "office agent pings vanilla AllowedIP" agent-office "$VANILLA_OVERLAY"
 
-echo "== revoke vanilla peer"
-console_bun revoke-wg-only "$peer_id"
-wait_office_peer "office agent dropped revoked peer" "$vanilla_pub" absent
-if "${COMPOSE[@]}" exec -T vanilla-wg ping -c 2 -W 2 "$office_overlay_ip" >/tmp/blaktail-wg-only-deny.log 2>&1; then
-  echo "FAIL ping succeeded after revoke" >&2
-  cat /tmp/blaktail-wg-only-deny.log >&2 || true
+echo "== rotate vanilla public key with ${OVERLAP_SECONDS}s overlap"
+next_pub="$("${COMPOSE[@]}" exec -T vanilla-wg sh -ceu '
+  umask 077
+  wg genkey > /etc/wireguard/vanilla-next.key
+  wg pubkey < /etc/wireguard/vanilla-next.key
+')"
+next_pub="$(printf '%s' "$next_pub" | tr -d '\r\n ')"
+if [[ -z "$next_pub" || "$next_pub" == "$vanilla_pub" ]]; then
+  echo "FAIL rotated public key missing" >&2
   exit 1
 fi
-echo "ok vanilla ping denied after revoke"
+rotated="$(console_bun rotate-wg-only "$peer_id" "$next_pub" "$OVERLAP_SECONDS" | grep '^{')"
+rotated_key="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["wg_public_key"])' "$rotated")"
+previous_key="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("previous_wg_public_key") or "")' "$rotated")"
+if [[ "$rotated_key" != "$next_pub" || "$previous_key" != "$vanilla_pub" ]]; then
+  echo "FAIL rotate response keys were ${rotated_key} / ${previous_key}" >&2
+  exit 1
+fi
+echo "ok stored overlap ${previous_key} -> ${rotated_key}"
 
-echo "wg_only_vanilla_reachability passed"
+wait_office_peer "office exported new key during overlap" "$next_pub" present
+wait_office_peer "office kept old key during overlap" "$vanilla_pub" present
+wait_ping "old vanilla key still reaches office during overlap" vanilla-wg "$office_overlay_ip"
+
+echo "== switch vanilla wg0 to the new private key"
+"${COMPOSE[@]}" exec -T vanilla-wg sh -ceu '
+  wg set wg0 private-key /etc/wireguard/vanilla-next.key
+  shred -u /etc/wireguard/vanilla.key /etc/wireguard/vanilla-next.key || rm -f /etc/wireguard/vanilla.key /etc/wireguard/vanilla-next.key
+'
+wait_ping "new vanilla key reaches office during overlap" vanilla-wg "$office_overlay_ip"
+wait_office_peer "office dropped old key after overlap" "$vanilla_pub" absent
+wait_office_peer "office kept new key after overlap" "$next_pub" present
+wait_ping "new vanilla key still reaches office after overlap" vanilla-wg "$office_overlay_ip"
+
+echo "wg_only_overlap_rotation passed"

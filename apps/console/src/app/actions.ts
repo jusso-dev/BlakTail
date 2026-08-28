@@ -14,6 +14,7 @@ import {
   createApiClient,
   createWebhook,
   createWgOnlyPeer,
+  rotateWgOnlyPeer,
   disableWebhook,
   listWebhookDeliveries,
   replayWebhookDelivery,
@@ -387,6 +388,42 @@ export async function createWgOnlyPeerAction(
         error instanceof Error
           ? error.message
           : "Could not add unmanaged WireGuard peer.",
+    };
+  }
+}
+
+export async function rotateWgOnlyPeerAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  try {
+    const ctx = await requireOrganisationContext(
+      owningOrganisation(formData),
+    );
+    if (!canMutateTailnet(ctx.role)) {
+      return {
+        ok: false,
+        error: "Only owners and admins can rotate unmanaged WireGuard peers.",
+      };
+    }
+    const peerId = String(formData.get("peerId") ?? "").trim();
+    const wgPublicKey = String(formData.get("wgPublicKey") ?? "").trim();
+    const overlapSeconds = Number(formData.get("overlapSeconds") ?? "300");
+    if (!peerId || !wgPublicKey) {
+      return { ok: false, error: "Peer and new public key are required." };
+    }
+    await rotateWgOnlyPeer(ctx, peerId, {
+      wg_public_key: wgPublicKey,
+      overlap_seconds: overlapSeconds,
+    });
+    revalidatePath("/devices");
+    return { ok: true, data: undefined };
+  } catch (error) {
+    return {
+      ok: false,
+      error:
+        error instanceof Error
+          ? error.message
+          : "Could not rotate unmanaged WireGuard peer.",
     };
   }
 }

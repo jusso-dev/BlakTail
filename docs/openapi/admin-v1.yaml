@@ -197,6 +197,27 @@ paths:
         - $ref: "#/components/parameters/PeerId"
       responses:
         "204": { description: Revoked }
+  /api/v1/wireguard-only-peers/{peer_id}/rotate:
+    post:
+      summary: Rotate a WireGuard-only public key with a bounded overlap window
+      parameters:
+        - $ref: "#/components/parameters/Organisation"
+        - $ref: "#/components/parameters/PeerId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [wg_public_key]
+              properties:
+                wg_public_key: { type: string }
+                overlap_seconds: { type: integer, minimum: 15, maximum: 86400 }
+      responses:
+        "200": { description: Current key plus previous key until overlap_until }
+        "400": { description: Same key or invalid overlap window }
+        "403": { description: Missing devices:write }
+        "409": { description: Public key already exists }
         "403": { description: Missing devices:write }
         "409": { description: Already revoked }
   /api/v1/webhooks:
