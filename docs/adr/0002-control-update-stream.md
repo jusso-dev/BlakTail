@@ -81,5 +81,6 @@ has the node's last sent peer set; gapped, missing, or `version=1` history
 falls back to one snapshot. `--poll-seconds` remains the recovery path.
 In-memory views are capped at 10k nodes so a storm resynchronises with
 snapshots rather than growing unbounded. 1k/10k CPU/latency baselines live
-in a later #43 slice. Keep the 25-second wait cap unless the AWS lab path
-is changed and re-proven.
+in [control-update-baselines.md](../control-update-baselines.md) and
+`scripts/control-update-baseline.sh`. Keep the 25-second wait cap unless the
+AWS lab path is changed and re-proven.
