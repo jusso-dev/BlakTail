@@ -232,18 +232,19 @@ if [[ "$rotated_key" != "$next_pub" || "$previous_key" != "$vanilla_pub" ]]; the
 fi
 echo "ok stored overlap ${previous_key} -> ${rotated_key}"
 
-wait_office_peer "office exported new key during overlap" "$next_pub" present
+# Kernel WireGuard routes each AllowedIP to one peer, so the agent keeps the
+# on-interface key until overlap_until and only then installs the successor.
 wait_office_peer "office kept old key during overlap" "$vanilla_pub" present
 wait_ping "old vanilla key still reaches office during overlap" vanilla-wg "$office_overlay_ip"
+
+wait_office_peer "office dropped old key after overlap" "$vanilla_pub" absent
+wait_office_peer "office installed new key after overlap" "$next_pub" present
 
 echo "== switch vanilla wg0 to the new private key"
 "${COMPOSE[@]}" exec -T vanilla-wg sh -ceu '
   wg set wg0 private-key /etc/wireguard/vanilla-next.key
   shred -u /etc/wireguard/vanilla.key /etc/wireguard/vanilla-next.key || rm -f /etc/wireguard/vanilla.key /etc/wireguard/vanilla-next.key
 '
-wait_ping "new vanilla key reaches office during overlap" vanilla-wg "$office_overlay_ip"
-wait_office_peer "office dropped old key after overlap" "$vanilla_pub" absent
-wait_office_peer "office kept new key after overlap" "$next_pub" present
-wait_ping "new vanilla key still reaches office after overlap" vanilla-wg "$office_overlay_ip"
+wait_ping "new vanilla key reaches office after overlap" vanilla-wg "$office_overlay_ip"
 
 echo "wg_only_overlap_rotation passed"
