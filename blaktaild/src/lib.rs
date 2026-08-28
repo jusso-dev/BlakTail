@@ -151,31 +151,32 @@ pub fn peer_diff(current: &[Peer], desired: &[Peer]) -> Vec<PeerChange> {
 
 /// Kernel WireGuard routes each AllowedIP to exactly one peer. When the
 /// coordinator exports a rotated key beside its predecessor, keep the key
-/// already on the interface until the overlap row disappears.
+/// already on the interface until the overlap row disappears. Policy fields
+/// such as ingress still come from the desired row for that key.
 pub fn installable_wireguard_peers(current: &[Peer], desired: &[Peer]) -> Vec<Peer> {
-    let desired_keys: BTreeSet<&str> = desired
+    let desired_by_key = desired
         .iter()
-        .map(|peer| peer.wg_public_key.as_str())
-        .collect();
+        .map(|peer| (peer.wg_public_key.as_str(), peer))
+        .collect::<BTreeMap<_, _>>();
     let mut claimed = BTreeSet::new();
     let mut installed = Vec::new();
     let mut seen = BTreeSet::new();
     for peer in current {
-        if !desired_keys.contains(peer.wg_public_key.as_str()) {
+        let Some(fresh) = desired_by_key.get(peer.wg_public_key.as_str()) else {
             continue;
-        }
-        if peer
+        };
+        if fresh
             .allowed_ips
             .iter()
             .any(|route| claimed.contains(route.as_str()))
         {
             continue;
         }
-        for route in &peer.allowed_ips {
+        for route in &fresh.allowed_ips {
             claimed.insert(route.clone());
         }
-        seen.insert(peer.wg_public_key.as_str());
-        installed.push(peer.clone());
+        seen.insert(fresh.wg_public_key.as_str());
+        installed.push((*fresh).clone());
     }
     for peer in desired {
         if !seen.insert(peer.wg_public_key.as_str()) {
@@ -2044,6 +2045,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["new"]
         );
+    }
+
+    #[test]
+    fn same_key_adopts_desired_ingress() {
+        let mut current = peer("vanilla", Some("192.0.2.10:51820"));
+        current.allowed_ips = vec!["10.8.0.2/32".into()];
+        current.ingress = Some(PeerIngress {
+            all: true,
+            ..PeerIngress::default()
+        });
+        let mut desired = current.clone();
+        desired.ingress = Some(PeerIngress {
+            tcp: vec!["8080".into()],
+            ..PeerIngress::default()
+        });
+        let installed = installable_wireguard_peers(&[current], &[desired.clone()]);
+        assert_eq!(installed.len(), 1);
+        assert_eq!(installed[0].wg_public_key, "vanilla");
+        assert_eq!(installed[0].ingress, desired.ingress);
     }
 
     #[test]
