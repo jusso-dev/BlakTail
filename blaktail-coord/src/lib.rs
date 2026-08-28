@@ -2932,16 +2932,18 @@ fn control_update_from_snapshot(
                     .difference(&current_ids)
                     .copied()
                     .collect::<Vec<_>>();
-                return ControlUpdate {
-                    kind: "delta",
-                    revision,
-                    added,
-                    removed,
-                    snapshot: PeersResponse {
-                        peers: Vec::new(),
-                        ..snapshot
-                    },
-                };
+                if !added.is_empty() || !removed.is_empty() {
+                    return ControlUpdate {
+                        kind: "delta",
+                        revision,
+                        added,
+                        removed,
+                        snapshot: PeersResponse {
+                            peers: Vec::new(),
+                            ..snapshot
+                        },
+                    };
+                }
             }
         }
     }
@@ -7239,6 +7241,105 @@ mod tests {
         assert_eq!(ingress.tcp, vec!["8080"]);
         assert!(acl.allows_flow(&unmanaged, &agent, Some(8080), Some(AclProtocol::Tcp), None));
         assert!(!acl.allows_flow(&unmanaged, &agent, Some(8081), Some(AclProtocol::Tcp), None));
+    }
+
+    #[tokio::test]
+    async fn policy_only_revision_sends_snapshot_so_ingress_updates() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "wg-only-ingress-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let office = register_test_node(&router, org.id, &owner, "office", "office-key", &[]).await;
+        sqlx::query("UPDATE nodes SET tags_json=$1 WHERE id=$2")
+            .bind(r#"["office"]"#)
+            .bind(office.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let created: crate::wg_only::WireGuardOnlyPeer = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/wireguard-only-peers", org.id),
+                serde_json::json!({
+                    "name": "vanilla",
+                    "kind": "wireguard_only",
+                    "wg_public_key": "vanillaPublicKeyExample+/=",
+                    "endpoint": "203.0.113.20:51820",
+                    "allowed_ips": ["10.8.0.2/32"],
+                    "tags": ["office"]
+                }),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let first: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/updates?since=0&wait=0&version=2", office.id),
+                serde_json::Value::Null,
+                Some(&office.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(first["kind"], "snapshot");
+        let revision = first["revision"].as_i64().unwrap();
+        let first_peer = first["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["id"] == created.id.to_string())
+            .unwrap();
+        assert_eq!(first_peer["ingress"]["all"], true);
+
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/acl", org.id),
+                serde_json::json!({
+                    "defaults": "deny",
+                    "rules": [{
+                        "action": "allow",
+                        "src_tags": ["office"],
+                        "dst_tags": ["office"],
+                        "dst_ports": ["8080"],
+                        "protocols": ["tcp"]
+                    }]
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let second: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!(
+                    "/v1/nodes/{}/updates?since={revision}&wait=0&version=2",
+                    office.id
+                ),
+                serde_json::Value::Null,
+                Some(&office.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second["kind"], "snapshot");
+        let second_peer = second["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["id"] == created.id.to_string())
+            .unwrap();
+        assert_ne!(second_peer["ingress"]["all"], true);
+        assert_eq!(second_peer["ingress"]["tcp"], serde_json::json!(["8080"]));
     }
 
     #[tokio::test]
