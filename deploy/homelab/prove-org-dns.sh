@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enrol two Linux agents and prove both answer a published extra A record.
+# Enrol two Linux agents and prove both answer published extra A and AAAA records.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -15,6 +15,7 @@ office_name="office-dns-${suffix}"
 store_name="store-dns-${suffix}"
 RECORD_NAME="wiki.internal.example"
 RECORD_IP="10.0.0.10"
+RECORD_IP6="fd12:3456:789a:bcde::10"
 
 status_of() {
   "${COMPOSE[@]}" exec -T "$1" blaktaild --coord-ca /certs/ca.crt status
@@ -48,18 +49,21 @@ dig_at() {
   local agent="$1"
   local nameserver="$2"
   local name="$3"
-  "${COMPOSE[@]}" exec -T "$agent" dig +time=1 +tries=1 +short "@${nameserver}" "$name" A
+  local qtype="${4:-A}"
+  "${COMPOSE[@]}" exec -T "$agent" dig +time=1 +tries=1 +short "@${nameserver}" "$name" "$qtype"
 }
 
 wait_record() {
   local agent="$1"
   local nameserver="$2"
-  local label="$3"
+  local qtype="$3"
+  local expect="$4"
+  local label="$5"
   local deadline=$((SECONDS + 45))
   while (( SECONDS < deadline )); do
     local answer
-    answer="$(dig_at "$agent" "$nameserver" "$RECORD_NAME" || true)"
-    if [[ "$answer" == *"${RECORD_IP}"* ]]; then
+    answer="$(dig_at "$agent" "$nameserver" "$RECORD_NAME" "$qtype" || true)"
+    if [[ "$answer" == *"${expect}"* ]]; then
       echo "ok ${label}"
       return 0
     fi
@@ -67,7 +71,7 @@ wait_record() {
   done
   echo "FAIL ${label}" >&2
   status_of "$agent" >&2 || true
-  "${COMPOSE[@]}" exec -T "$agent" dig +time=1 +tries=1 "@${nameserver}" "$RECORD_NAME" A >&2 || true
+  "${COMPOSE[@]}" exec -T "$agent" dig +time=1 +tries=1 "@${nameserver}" "$RECORD_NAME" "$qtype" >&2 || true
   return 1
 }
 
@@ -131,15 +135,20 @@ office_dns="$(magic_dns_ip agent-office)"
 store_dns="$(magic_dns_ip agent-store)"
 [[ -n "$office_dns" && -n "$store_dns" ]]
 
-echo "== publish extra A ${RECORD_NAME} -> ${RECORD_IP}"
+echo "== publish extra A/AAAA ${RECORD_NAME} -> ${RECORD_IP} / ${RECORD_IP6}"
 console_bun put-dns "$(python3 -c "import json; print(json.dumps({
   'managed': True,
   'search_domains': ['internal.example'],
-  'records': [{'name': '''$RECORD_NAME''', 'type': 'A', 'value': '''$RECORD_IP'''}]
+  'records': [
+    {'name': '''$RECORD_NAME''', 'type': 'A', 'value': '''$RECORD_IP'''},
+    {'name': '''$RECORD_NAME''', 'type': 'AAAA', 'value': '''$RECORD_IP6'''}
+  ]
 }))")"
 
-wait_record agent-office "$office_dns" "office MagicDNS answers ${RECORD_NAME}"
-wait_record agent-store "$store_dns" "store MagicDNS answers ${RECORD_NAME}"
+wait_record agent-office "$office_dns" A "$RECORD_IP" "office MagicDNS answers ${RECORD_NAME} A"
+wait_record agent-store "$store_dns" A "$RECORD_IP" "store MagicDNS answers ${RECORD_NAME} A"
+wait_record agent-office "$office_dns" AAAA "$RECORD_IP6" "office MagicDNS answers ${RECORD_NAME} AAAA"
+wait_record agent-store "$store_dns" AAAA "$RECORD_IP6" "store MagicDNS answers ${RECORD_NAME} AAAA"
 
 echo "== public names stay refused"
 office_public="$("${COMPOSE[@]}" exec -T agent-office dig +time=1 +tries=1 "@${office_dns}" example.com A)"

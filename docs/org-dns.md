@@ -64,7 +64,7 @@ files BlakTail wrote (`resolvectl`, `resolvconf`, `/etc/resolv.conf`, or
 `/etc/resolver`) are restored to the pre-BlakTail copy. `blaktaild status`
 reports `dns managed: no`. `blaktaild down` still restores the same files.
 
-A two-agent extra-record proof is `deploy/homelab/prove-org-dns.sh`.
+A two-agent extra A and AAAA proof is `deploy/homelab/prove-org-dns.sh`.
 Homelab `deploy/homelab/prove-dns-noleak.sh` captures eth0/lo while querying an
 extra record, an unknown `*.blaktail` name, a public name, and a split suffix:
 only the published sink sees the split query.
