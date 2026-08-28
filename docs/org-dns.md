@@ -50,4 +50,6 @@ suffix's resolvers. MagicDNS peer names stay coordinator-authoritative:
 public names without an extra record or split match stay REFUSED.
 
 A two-agent extra-record proof is `deploy/homelab/prove-org-dns.sh`.
-Packet-capture leak proofs remain on #40.
+Homelab `deploy/homelab/prove-dns-noleak.sh` captures eth0/lo while querying an
+extra record, an unknown `*.blaktail` name, a public name, and a split suffix:
+only the published sink sees the split query.
