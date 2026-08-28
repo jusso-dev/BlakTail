@@ -7215,6 +7215,32 @@ mod tests {
         assert!(!restricted.allows_ssh(&ranger, &store, "intruder"));
     }
 
+    #[test]
+    fn wireguard_only_adjacent_service_is_decided_on_the_managed_side() {
+        let acl: Acl = serde_json::from_value(serde_json::json!({
+            "defaults": "deny",
+            "rules":[{
+                "action":"allow",
+                "src_tags":["office"],
+                "dst_tags":["office"],
+                "dst_ports":["8080"],
+                "protocols":["tcp"]
+            }]
+        }))
+        .unwrap();
+        let agent = Subject::new(Role::Owner, vec![DeviceTag::Office]);
+        let unmanaged = Subject::new(Role::Member, vec![DeviceTag::Office]);
+        assert!(
+            acl.allows(&agent, &unmanaged),
+            "managed agent must still receive the exported peer"
+        );
+        let ingress = acl.peer_ingress(&unmanaged, &agent);
+        assert!(!ingress.all);
+        assert_eq!(ingress.tcp, vec!["8080"]);
+        assert!(acl.allows_flow(&unmanaged, &agent, Some(8080), Some(AclProtocol::Tcp), None));
+        assert!(!acl.allows_flow(&unmanaged, &agent, Some(8081), Some(AclProtocol::Tcp), None));
+    }
+
     #[tokio::test]
     async fn tag_owners_reject_admin_assignment_unless_listed() {
         let store = Store::memory().await.unwrap();
