@@ -10517,4 +10517,129 @@ mod tests {
         .unwrap();
         assert_eq!(audit, 2);
     }
+
+    async fn insert_synthetic_peers(store: &Store, org_id: Uuid, count: usize) {
+        let created_at = now();
+        let expires = created_at + 86_400;
+        let mut tx = store.pool.begin().await.unwrap();
+        for index in 0..count {
+            let octet_hi = 1 + index / 254;
+            let octet_lo = 1 + index % 254;
+            let name = format!("bench-{index:05}");
+            sqlx::query(
+                "INSERT INTO nodes(id,org_id,name,display_name,wg_public_key,allowed_ips_json,token_hash,created_at,user_id,user_role,tags_json,dns_name,advertised_routes_json,approved_routes_json,credential_expires_at,capabilities_json,ephemeral) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'[]',$11,'[]','[]',$12,'[]',0)",
+            )
+            .bind(Uuid::from_u128(index as u128 + 1).to_string())
+            .bind(org_id.to_string())
+            .bind(&name)
+            .bind(&name)
+            .bind(format!("bench-key-{index:05}"))
+            .bind(format!(r#"["100.64.{octet_hi}.{octet_lo}/32"]"#))
+            .bind(format!("bench-hash-{index:05}"))
+            .bind(created_at)
+            .bind("owner-1")
+            .bind("owner")
+            .bind(magic_dns_name(&name, &org_id.to_string()))
+            .bind(expires)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    async fn measure_control_update_baseline(
+        label: &str,
+        peer_count: usize,
+        snapshot_ms_limit: u128,
+        delta_ms_limit: u128,
+    ) {
+        let store = Store::memory().await.unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, &format!("control-bench-{label}")).await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let observer =
+            register_test_node(&router, org.id, &owner, "observer", "observer-key", &[]).await;
+        insert_synthetic_peers(&store, org.id, peer_count).await;
+
+        let started = Instant::now();
+        let snapshot_response = call(
+            &router,
+            Method::GET,
+            &format!("/v1/nodes/{}/updates?since=0&wait=0&version=2", observer.id),
+            serde_json::Value::Null,
+            Some(&observer.node_token),
+        )
+        .await;
+        let snapshot_ms = started.elapsed().as_millis();
+        assert_eq!(snapshot_response.status(), StatusCode::OK);
+        let snapshot_bytes = to_bytes(snapshot_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_slice(&snapshot_bytes).unwrap();
+        assert_eq!(snapshot["kind"], "snapshot");
+        let peers = snapshot["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), peer_count);
+        let revision = snapshot["revision"].as_i64().unwrap();
+        register_test_node(
+            &router,
+            org.id,
+            &owner,
+            &format!("bench-extra-{label}"),
+            &format!("bench-extra-key-{label}"),
+            &[],
+        )
+        .await;
+
+        let started = Instant::now();
+        let delta_response = call(
+            &router,
+            Method::GET,
+            &format!(
+                "/v1/nodes/{}/updates?since={revision}&wait=0&version=2",
+                observer.id
+            ),
+            serde_json::Value::Null,
+            Some(&observer.node_token),
+        )
+        .await;
+        let delta_ms = started.elapsed().as_millis();
+        assert_eq!(delta_response.status(), StatusCode::OK);
+        let delta_bytes = to_bytes(delta_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let delta: serde_json::Value = serde_json::from_slice(&delta_bytes).unwrap();
+        assert!(
+            delta["kind"] == "delta" || delta["kind"] == "snapshot",
+            "unexpected control update {delta}"
+        );
+
+        println!(
+            "control_update_baseline nodes={} snapshot_ms={} snapshot_bytes={} peers={} delta_ms={} delta_bytes={} connections=1",
+            peer_count + 1,
+            snapshot_ms,
+            snapshot_bytes.len(),
+            peers.len(),
+            delta_ms,
+            delta_bytes.len()
+        );
+        assert!(
+            snapshot_ms < snapshot_ms_limit,
+            "snapshot {snapshot_ms}ms exceeded {snapshot_ms_limit}ms"
+        );
+        assert!(
+            delta_ms < delta_ms_limit,
+            "delta {delta_ms}ms exceeded {delta_ms_limit}ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_update_baseline_one_thousand() {
+        measure_control_update_baseline("1k", 1_000, 20_000, 10_000).await;
+    }
+
+    #[tokio::test]
+    async fn control_update_baseline_ten_thousand() {
+        measure_control_update_baseline("10k", 10_000, 60_000, 15_000).await;
+    }
 }
