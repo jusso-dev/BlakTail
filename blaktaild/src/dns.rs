@@ -161,7 +161,18 @@ fn labels_are_safe(name: &str) -> bool {
     })
 }
 
+pub fn organisation_dns_managed(state: &NodeState) -> bool {
+    state.org_dns.as_ref().is_none_or(|dns| dns.managed)
+}
+
 pub fn published_resolver_suffixes(state: &NodeState) -> Vec<String> {
+    if !organisation_dns_managed(state) {
+        return Vec::new();
+    }
+    organisation_resolver_suffixes(state)
+}
+
+pub fn organisation_resolver_suffixes(state: &NodeState) -> Vec<String> {
     let Some(snapshot) = &state.org_dns else {
         return Vec::new();
     };
@@ -208,10 +219,12 @@ fn records_from_state(state: &NodeState, domain: &str) -> Records {
     }
     let mut split = Vec::new();
     if let Some(snapshot) = &state.org_dns {
-        for record in &snapshot.records {
-            insert_extra_record(&mut addresses, record);
+        if snapshot.managed {
+            for record in &snapshot.records {
+                insert_extra_record(&mut addresses, record);
+            }
+            split = split_from_snapshot(snapshot);
         }
-        split = split_from_snapshot(snapshot);
     }
     Records {
         domain: domain.into(),
@@ -273,6 +286,11 @@ pub fn decide_org_dns(
     if current.is_some_and(|value| value == next) {
         return DnsAdopt::Take {
             clear_degraded: false,
+        };
+    }
+    if !next.managed {
+        return DnsAdopt::Take {
+            clear_degraded: true,
         };
     }
     let added = added_resolvers(current, next);
@@ -1377,5 +1395,49 @@ mod tests {
             .dns_degraded
             .as_deref()
             .is_some_and(|reason| reason.contains("revision 4")));
+    }
+
+    #[test]
+    fn decide_takes_unmanaged_snapshot_without_probing() {
+        let current = snapshot(4, &["10.0.0.53"]);
+        let mut next = snapshot(5, &["203.0.113.1"]);
+        next.managed = false;
+        assert_eq!(
+            decide_org_dns(Some(&current), &next, || panic!("must not probe")),
+            DnsAdopt::Take {
+                clear_degraded: true
+            }
+        );
+    }
+
+    #[test]
+    fn unmanaged_snapshot_drops_extras_and_keeps_peer_names() {
+        let mut state = state();
+        state.org_dns = Some(crate::OrgDnsSnapshot {
+            revision: 6,
+            managed: false,
+            records: vec![crate::OrgDnsRecord {
+                name: "wiki.internal.example".into(),
+                record_type: "A".into(),
+                value: "10.0.0.10".into(),
+            }],
+            search_domains: vec!["internal.example".into()],
+            split: vec![crate::OrgDnsSplit {
+                suffix: "internal.example".into(),
+                resolvers: vec!["10.0.0.53".into()],
+            }],
+            global_resolvers: vec![],
+        });
+        let records = records_from_state(&state, "12345678.blaktail");
+        let extra = answer(&query("wiki.internal.example", 1), &records).unwrap();
+        assert_eq!(extra[3] & 0x0f, 5);
+        let peer = answer(&query("peer.12345678.blaktail", 1), &records).unwrap();
+        assert_eq!(&peer[peer.len() - 4..], &[100, 64, 0, 2]);
+        assert!(published_resolver_suffixes(&state).is_empty());
+        assert_eq!(
+            organisation_resolver_suffixes(&state),
+            vec!["internal.example".to_string()]
+        );
+        assert!(!organisation_dns_managed(&state));
     }
 }

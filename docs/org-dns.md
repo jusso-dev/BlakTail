@@ -57,6 +57,13 @@ reports `dns health: degraded` from `blaktaild status`. A first snapshot is
 still adopted even if its resolvers are unreachable so local extra records can
 answer. Record-only or search-only updates do not probe.
 
+Publishing `managed: false` is adopted without probing. Extra records, search
+domains, and split forwards stop answering immediately. The MagicDNS stub keeps
+serving `*.blaktail` peer names on the overlay address, and any host resolver
+files BlakTail wrote (`resolvectl`, `resolvconf`, `/etc/resolv.conf`, or
+`/etc/resolver`) are restored to the pre-BlakTail copy. `blaktaild status`
+reports `dns managed: no`. `blaktaild down` still restores the same files.
+
 A two-agent extra-record proof is `deploy/homelab/prove-org-dns.sh`.
 Homelab `deploy/homelab/prove-dns-noleak.sh` captures eth0/lo while querying an
 extra record, an unknown `*.blaktail` name, a public name, and a split suffix:
@@ -64,3 +71,5 @@ only the published sink sees the split query.
 Homelab `deploy/homelab/prove-dns-lastgood.sh` publishes a working extra A,
 then a rewritten extra A plus an unreachable split resolver, and checks the
 agent keeps the first revision and answers the original address.
+Homelab `deploy/homelab/prove-dns-restore.sh` then publishes `managed: false`
+and checks the extra A is refused while the node MagicDNS name still answers.
