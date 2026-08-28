@@ -8565,7 +8565,8 @@ mod tests {
             Uuid::new_v4()
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
-        sqlx::raw_sql("PRAGMA user_version=12")
+        // Must stay one past CURRENT_SCHEMA_VERSION so open() rejects a future database.
+        sqlx::raw_sql("PRAGMA user_version=13")
             .execute(&pool)
             .await
             .unwrap();

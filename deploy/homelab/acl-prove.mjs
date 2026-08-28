@@ -55,17 +55,35 @@ if (command === "identity") {
   }
   process.stdout.write(`ok ACL PUT ${response.status}\n`);
 } else if (command === "purge-nodes") {
-  const wanted = new Set(["office-box", "store-box"]);
-  const response = await fetch(`${base}/v1/orgs/${row.coord_org_id}/nodes`, {
-    headers: { authorization: `Bearer ${sign(row)}` },
-  });
-  if (!response.ok) {
-    throw new Error(`list nodes ${response.status} ${await response.text()}`);
+  const keep = new Set(
+    (process.env.BLAKTAIL_KEEP_NODES ?? "")
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean),
+  );
+  const collected = [];
+  let before;
+  for (;;) {
+    const url = new URL(`${base}/v1/orgs/${row.coord_org_id}/nodes`);
+    url.searchParams.set("limit", "200");
+    if (before) url.searchParams.set("before", before);
+    const response = await fetch(url, {
+      headers: { authorization: `Bearer ${sign(row)}` },
+    });
+    if (!response.ok) {
+      throw new Error(`list nodes ${response.status} ${await response.text()}`);
+    }
+    const nodes = await response.json();
+    if (!Array.isArray(nodes) || nodes.length === 0) break;
+    for (const node of nodes) {
+      if (node.deleted || keep.has(node.name)) continue;
+      collected.push({ id: node.id, name: node.name });
+    }
+    if (nodes.length < 200) break;
+    before = nodes[nodes.length - 1].id;
   }
-  const nodes = await response.json();
   let purged = 0;
-  for (const node of nodes) {
-    if (node.deleted || !wanted.has(node.name)) continue;
+  for (const node of collected) {
     const tombstone = await fetch(
       `${base}/v1/orgs/${row.coord_org_id}/nodes/${node.id}/tombstone`,
       {
@@ -82,6 +100,7 @@ if (command === "identity") {
     process.stdout.write(`ok tombstoned leftover ${node.name}\n`);
   }
   if (purged === 0) process.stdout.write("ok no leftover prove nodes\n");
+  else process.stdout.write(`ok purged ${purged} leftover nodes\n`);
 } else if (command === "put-dns") {
   const body = JSON.parse(process.argv[3] ?? "{}");
   const response = await fetch(`${base}/v1/orgs/${row.coord_org_id}/dns`, {

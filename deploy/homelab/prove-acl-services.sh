@@ -5,6 +5,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+export COMPOSE_HTTP_TIMEOUT="${COMPOSE_HTTP_TIMEOUT:-300}"
+export DOCKER_CLIENT_TIMEOUT="${DOCKER_CLIENT_TIMEOUT:-300}"
 COMPOSE=(docker compose -p blaktail -f compose.yaml -f compose.homelab.yml --profile acl-prove)
 WORKDIR="/tmp/blaktail-acl-services-prove"
 COORD="https://coord:8443"
@@ -41,7 +43,9 @@ wait_for() {
 }
 
 store_ip() {
-  status_of agent-store | awk '$1 == "address:" { sub("/32","",$2); print $2; exit }'
+  local text
+  text="$(status_of agent-store)" || return 1
+  awk '$1 == "address:" { sub("/32","",$2); print $2; exit }' <<<"$text"
 }
 
 container_ip() {
@@ -171,6 +175,9 @@ mkdir -p "$WORKDIR"
 chmod 700 "$WORKDIR"
 cp deploy/homelab/acl-prove.mjs "$WORKDIR/acl-prove.mjs"
 sudo chown -R 999:999 "$WORKDIR"
+
+echo "== purge leftover prove nodes"
+console_bun purge-nodes
 
 echo "== build and start agents"
 "${COMPOSE[@]}" rm -sf agent-office agent-store >/dev/null 2>&1 || true

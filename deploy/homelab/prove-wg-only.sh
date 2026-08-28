@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+export COMPOSE_HTTP_TIMEOUT="${COMPOSE_HTTP_TIMEOUT:-300}"
+export DOCKER_CLIENT_TIMEOUT="${DOCKER_CLIENT_TIMEOUT:-300}"
 COMPOSE=(docker compose -p blaktail -f compose.yaml -f compose.homelab.yml --profile acl-prove)
 WORKDIR="/tmp/blaktail-wg-only-prove"
 COORD="https://coord:8443"
@@ -22,7 +24,9 @@ container_ip() {
 }
 
 office_overlay() {
-  status_of | awk '$1 == "address:" { sub("/32","",$2); print $2; exit }'
+  local text
+  text="$(status_of)" || return 1
+  awk '$1 == "address:" { sub("/32","",$2); print $2; exit }' <<<"$text"
 }
 
 office_pub() {
@@ -84,6 +88,9 @@ mkdir -p "$WORKDIR"
 chmod 700 "$WORKDIR"
 cp deploy/homelab/acl-prove.mjs "$WORKDIR/acl-prove.mjs"
 sudo chown -R 999:999 "$WORKDIR"
+
+echo "== purge leftover prove nodes"
+console_bun purge-nodes
 
 echo "== build and start office agent and vanilla wg"
 "${COMPOSE[@]}" rm -sf agent-office vanilla-wg >/dev/null 2>&1 || true
