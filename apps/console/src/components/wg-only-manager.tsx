@@ -140,11 +140,9 @@ export function WgOnlyManager({
                     >
                       {peer.revoked_at ? "Revoked" : "Unmanaged"}
                     </span>
-                    {peer.previous_wg_public_key &&
-                    peer.overlap_until &&
-                    peer.overlap_until * 1000 > Date.now() ? (
+                    {peer.previous_wg_public_key && peer.overlap_until ? (
                       <div className="muted">
-                        Overlap until {new Date(peer.overlap_until * 1000).toISOString()}
+                        Overlap until {peer.overlap_until}
                       </div>
                     ) : null}
                   </td>
