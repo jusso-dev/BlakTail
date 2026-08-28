@@ -1151,6 +1151,13 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                 ),
                 state.peers.len()
             );
+            if let Some(dns) = &state.org_dns {
+                println!("dns revision: {}", dns.revision);
+            }
+            match state.dns_degraded.as_deref() {
+                Some(reason) => println!("dns health: degraded ({reason})"),
+                None => println!("dns health: ok"),
+            }
             for peer in state.peers {
                 println!(
                     "  {} {} {} {}",

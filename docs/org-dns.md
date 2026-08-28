@@ -49,7 +49,18 @@ suffix's resolvers. MagicDNS peer names stay coordinator-authoritative:
 `*.blaktail` is never forwarded, unknown `*.blaktail` names stay NXDOMAIN, and
 public names without an extra record or split match stay REFUSED.
 
+When a newer snapshot adds resolvers, the agent probes those addresses with a
+short UDP query for a published extra-record or split name. If every new
+resolver is silent and a previous snapshot exists, the agent keeps that
+last-known-good copy, leaves extra records and split forwards unchanged, and
+reports `dns health: degraded` from `blaktaild status`. A first snapshot is
+still adopted even if its resolvers are unreachable so local extra records can
+answer. Record-only or search-only updates do not probe.
+
 A two-agent extra-record proof is `deploy/homelab/prove-org-dns.sh`.
 Homelab `deploy/homelab/prove-dns-noleak.sh` captures eth0/lo while querying an
 extra record, an unknown `*.blaktail` name, a public name, and a split suffix:
 only the published sink sees the split query.
+Homelab `deploy/homelab/prove-dns-lastgood.sh` publishes a working extra A,
+then a rewritten extra A plus an unreachable split resolver, and checks the
+agent keeps the first revision and answers the original address.

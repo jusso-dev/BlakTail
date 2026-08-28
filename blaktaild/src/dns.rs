@@ -1,4 +1,4 @@
-use crate::{Error, NodeState};
+use crate::{Error, NodeState, OrgDnsSnapshot};
 #[cfg(test)]
 use std::net::Ipv4Addr;
 #[cfg(not(target_os = "macos"))]
@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     fs::{self, OpenOptions},
     io::Write,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, UdpSocket as StdUdpSocket},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -237,6 +237,138 @@ fn split_from_snapshot(snapshot: &crate::OrgDnsSnapshot) -> Vec<(String, Vec<Soc
             (!resolvers.is_empty()).then_some((suffix, resolvers))
         })
         .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DnsAdopt {
+    Keep { reason: String },
+    Take { clear_degraded: bool },
+}
+
+pub fn adopt_org_dns_snapshot(state: &mut NodeState, incoming: Option<OrgDnsSnapshot>) {
+    let Some(next) = incoming else {
+        return;
+    };
+    match decide_org_dns(state.org_dns.as_ref(), &next, || {
+        probe_new_resolvers(state.org_dns.as_ref(), &next)
+    }) {
+        DnsAdopt::Keep { reason } => {
+            tracing::warn!(%reason, "keeping last-known-good organisation DNS");
+            state.dns_degraded = Some(reason);
+        }
+        DnsAdopt::Take { clear_degraded } => {
+            state.org_dns = Some(next);
+            if clear_degraded {
+                state.dns_degraded = None;
+            }
+        }
+    }
+}
+
+pub fn decide_org_dns(
+    current: Option<&OrgDnsSnapshot>,
+    next: &OrgDnsSnapshot,
+    new_resolvers_ok: impl FnOnce() -> bool,
+) -> DnsAdopt {
+    if current.is_some_and(|value| value == next) {
+        return DnsAdopt::Take {
+            clear_degraded: false,
+        };
+    }
+    let added = added_resolvers(current, next);
+    if added.is_empty() || new_resolvers_ok() {
+        return DnsAdopt::Take {
+            clear_degraded: true,
+        };
+    }
+    if let Some(previous) = current {
+        return DnsAdopt::Keep {
+            reason: format!(
+                "kept DNS revision {} because new resolvers did not answer",
+                previous.revision
+            ),
+        };
+    }
+    DnsAdopt::Take {
+        clear_degraded: false,
+    }
+}
+
+fn snapshot_resolvers(snapshot: &OrgDnsSnapshot) -> Vec<SocketAddr> {
+    snapshot
+        .split
+        .iter()
+        .flat_map(|route| route.resolvers.iter())
+        .chain(snapshot.global_resolvers.iter())
+        .filter_map(|value| parse_resolver(value))
+        .collect()
+}
+
+fn added_resolvers(current: Option<&OrgDnsSnapshot>, next: &OrgDnsSnapshot) -> Vec<SocketAddr> {
+    let previous = current
+        .map(snapshot_resolvers)
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    snapshot_resolvers(next)
+        .into_iter()
+        .filter(|resolver| !previous.contains(resolver))
+        .collect()
+}
+
+fn probe_new_resolvers(current: Option<&OrgDnsSnapshot>, next: &OrgDnsSnapshot) -> bool {
+    let added = added_resolvers(current, next);
+    if added.is_empty() {
+        return true;
+    }
+    let qname = next
+        .records
+        .first()
+        .map(|record| record.name.as_str())
+        .or_else(|| next.split.first().map(|route| route.suffix.as_str()))
+        .unwrap_or(".");
+    added
+        .iter()
+        .any(|resolver| probe_resolver(*resolver, qname))
+}
+
+fn probe_resolver(resolver: SocketAddr, name: &str) -> bool {
+    let bind = if resolver.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let Ok(socket) = StdUdpSocket::bind(bind) else {
+        return false;
+    };
+    if socket
+        .set_read_timeout(Some(Duration::from_millis(800)))
+        .is_err()
+        || socket.connect(resolver).is_err()
+    {
+        return false;
+    }
+    let query = encode_probe_query(name);
+    if socket.send(&query).is_err() {
+        return false;
+    }
+    let mut buffer = [0u8; 512];
+    socket.recv(&mut buffer).is_ok()
+}
+
+fn encode_probe_query(name: &str) -> Vec<u8> {
+    let mut query = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        query.push(u8::try_from(label.len()).unwrap_or(0));
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query
 }
 
 fn parse_resolver(value: &str) -> Option<SocketAddr> {
@@ -832,6 +964,7 @@ mod tests {
             relay_endpoint_reported_at: 0,
             dns_mode: None,
             org_dns: None,
+            dns_degraded: None,
             control_revision: 0,
         }
     }
@@ -990,6 +1123,7 @@ mod tests {
             ],
             search_domains: vec!["internal.example".into()],
             split: vec![],
+            global_resolvers: vec![],
         });
         let records = records_from_state(&state, "12345678.blaktail");
         let a = answer(&query("wiki.internal.example", 1), &records).unwrap();
@@ -1070,6 +1204,7 @@ mod tests {
                 suffix: "internal.example".into(),
                 resolvers: vec!["127.0.0.1:53535".into()],
             }],
+            global_resolvers: vec![],
         }
     }
 
@@ -1132,6 +1267,7 @@ mod tests {
                 suffix: "internal.example".into(),
                 resolvers: vec![upstream_addr.to_string()],
             }],
+            global_resolvers: vec![],
         });
         let dns = MagicDns::spawn_at(
             "127.0.0.1:0".parse().unwrap(),
@@ -1162,5 +1298,84 @@ mod tests {
         assert_eq!(response[3] & 0x0f, 5);
         assert_eq!(length, query("example.com", 1).len());
         dns.stop();
+    }
+
+    fn snapshot(revision: i64, resolvers: &[&str]) -> crate::OrgDnsSnapshot {
+        crate::OrgDnsSnapshot {
+            revision,
+            managed: true,
+            records: vec![crate::OrgDnsRecord {
+                name: "wiki.internal.example".into(),
+                record_type: "A".into(),
+                value: "10.0.0.10".into(),
+            }],
+            search_domains: vec!["internal.example".into()],
+            split: vec![crate::OrgDnsSplit {
+                suffix: "internal.example".into(),
+                resolvers: resolvers.iter().map(|value| (*value).to_string()).collect(),
+            }],
+            global_resolvers: vec![],
+        }
+    }
+
+    #[test]
+    fn decide_keeps_last_known_good_when_new_resolvers_fail() {
+        let current = snapshot(4, &["10.0.0.53"]);
+        let next = snapshot(5, &["203.0.113.1"]);
+        assert_eq!(
+            decide_org_dns(Some(&current), &next, || false),
+            DnsAdopt::Keep {
+                reason: "kept DNS revision 4 because new resolvers did not answer".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn decide_takes_when_new_resolvers_answer() {
+        let current = snapshot(4, &["10.0.0.53"]);
+        let next = snapshot(5, &["10.0.0.54"]);
+        assert_eq!(
+            decide_org_dns(Some(&current), &next, || true),
+            DnsAdopt::Take {
+                clear_degraded: true
+            }
+        );
+    }
+
+    #[test]
+    fn decide_takes_record_only_updates_without_probing() {
+        let current = snapshot(4, &["10.0.0.53"]);
+        let mut next = current.clone();
+        next.revision = 5;
+        next.records[0].value = "10.0.0.11".into();
+        assert_eq!(
+            decide_org_dns(Some(&current), &next, || panic!("must not probe")),
+            DnsAdopt::Take {
+                clear_degraded: true
+            }
+        );
+    }
+
+    #[test]
+    fn decide_adopts_first_snapshot_even_when_resolvers_are_dead() {
+        let next = snapshot(1, &["203.0.113.1"]);
+        assert_eq!(
+            decide_org_dns(None, &next, || false),
+            DnsAdopt::Take {
+                clear_degraded: false
+            }
+        );
+    }
+
+    #[test]
+    fn adopt_keeps_previous_snapshot_and_sets_degraded() {
+        let mut state = state();
+        state.org_dns = Some(snapshot(4, &["10.0.0.53"]));
+        adopt_org_dns_snapshot(&mut state, Some(snapshot(5, &["203.0.113.1"])));
+        assert_eq!(state.org_dns.as_ref().map(|dns| dns.revision), Some(4));
+        assert!(state
+            .dns_degraded
+            .as_deref()
+            .is_some_and(|reason| reason.contains("revision 4")));
     }
 }
