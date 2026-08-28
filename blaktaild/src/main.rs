@@ -1,9 +1,10 @@
 use blaktail_config::{AgentConfig, ConfigHandle, LoadedConfig, ReloadPlan, Service};
 use blaktaild::{
-    apply_peer_map, configure_system_dns, dns_domain, ensure_private_key, peer_key_hex,
-    published_resolver_suffixes, read_state, remove_system_dns, restore_peers, sync_once,
-    validate_advertised_routes, validate_interface, write_state, Coordinator, MagicDns, Network,
-    Registration, RelayMesh, DIRECT_GRACE_SECS, DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
+    apply_peer_map, configure_system_dns, dns_domain, ensure_private_key, organisation_dns_managed,
+    organisation_resolver_suffixes, peer_key_hex, published_resolver_suffixes, read_state,
+    remove_system_dns, restore_peers, sync_once, validate_advertised_routes, validate_interface,
+    write_state, Coordinator, MagicDns, Network, Registration, RelayMesh, DIRECT_GRACE_SECS,
+    DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
 };
 use clap::{Parser, Subcommand};
 use std::{
@@ -439,7 +440,7 @@ async fn manage_magic_dns(
             state_dir,
             &state.interface,
             &old_domain,
-            &published_resolver_suffixes(state),
+            &organisation_resolver_suffixes(state),
             state.dns_mode.as_deref(),
         ) {
             warn!(%error, "could not remove stale MagicDNS configuration");
@@ -458,19 +459,23 @@ async fn manage_magic_dns(
                 return;
             }
         };
-        let extras = published_resolver_suffixes(state);
-        let mode = match configure_system_dns(
-            state_dir,
-            &state.interface,
-            created.bind_ip(),
-            &domain,
-            &extras,
-        ) {
-            Ok(mode) => mode,
-            Err(error) => {
-                warn!(%error, "could not configure system MagicDNS routing; resolver stays on the overlay address");
-                "listener-only".into()
+        let mode = if organisation_dns_managed(state) {
+            let extras = published_resolver_suffixes(state);
+            match configure_system_dns(
+                state_dir,
+                &state.interface,
+                created.bind_ip(),
+                &domain,
+                &extras,
+            ) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    warn!(%error, "could not configure system MagicDNS routing; resolver stays on the overlay address");
+                    "listener-only".into()
+                }
             }
+        } else {
+            "listener-only".into()
         };
         info!(%domain, mode, "MagicDNS resolver active");
         state.dns_mode = Some(mode);
@@ -481,15 +486,37 @@ async fn manage_magic_dns(
     }
     if let Some(active) = dns.as_ref() {
         active.update(state);
-        let extras = published_resolver_suffixes(state);
-        if let Err(error) = configure_system_dns(
-            state_dir,
-            &state.interface,
-            active.bind_ip(),
-            &domain,
-            &extras,
-        ) {
-            warn!(%error, "could not refresh published DNS search and split routing");
+        if organisation_dns_managed(state) {
+            let extras = published_resolver_suffixes(state);
+            if let Err(error) = configure_system_dns(
+                state_dir,
+                &state.interface,
+                active.bind_ip(),
+                &domain,
+                &extras,
+            ) {
+                warn!(%error, "could not refresh published DNS search and split routing");
+            }
+        } else if state
+            .dns_mode
+            .as_deref()
+            .is_some_and(|mode| mode != "listener-only")
+        {
+            if let Err(error) = remove_system_dns(
+                state_dir,
+                &state.interface,
+                &domain,
+                &organisation_resolver_suffixes(state),
+                state.dns_mode.as_deref(),
+            ) {
+                warn!(%error, "could not restore the previous system resolver after managed DNS was disabled");
+                return;
+            }
+            info!("organisation DNS unmanaged; previous system resolver restored");
+            state.dns_mode = Some("listener-only".into());
+            if let Err(error) = write_state(state_dir, state) {
+                warn!(%error, "could not persist MagicDNS restore state");
+            }
         }
     }
 }
@@ -508,7 +535,7 @@ fn shutdown_magic_dns(
         state_dir,
         &state.interface,
         &domain,
-        &published_resolver_suffixes(state),
+        &organisation_resolver_suffixes(state),
         state.dns_mode.as_deref(),
     ) {
         Ok(()) => {
@@ -1153,6 +1180,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
             );
             if let Some(dns) = &state.org_dns {
                 println!("dns revision: {}", dns.revision);
+                println!("dns managed: {}", if dns.managed { "yes" } else { "no" });
             }
             match state.dns_degraded.as_deref() {
                 Some(reason) => println!("dns health: degraded ({reason})"),
@@ -1175,7 +1203,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                     state_dir,
                     &state.interface,
                     &domain,
-                    &published_resolver_suffixes(&state),
+                    &organisation_resolver_suffixes(&state),
                     state.dns_mode.as_deref(),
                 )?;
             }
@@ -1199,7 +1227,7 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                     state_dir,
                     &state.interface,
                     &domain,
-                    &published_resolver_suffixes(&state),
+                    &organisation_resolver_suffixes(&state),
                     state.dns_mode.as_deref(),
                 )?;
             }

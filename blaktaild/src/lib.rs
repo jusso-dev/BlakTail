@@ -19,7 +19,8 @@ pub mod acl_filter;
 pub mod dns;
 pub mod relay_client;
 pub use dns::{
-    configure_system_dns, dns_domain, published_resolver_suffixes, remove_system_dns, MagicDns,
+    configure_system_dns, dns_domain, organisation_dns_managed, organisation_resolver_suffixes,
+    published_resolver_suffixes, remove_system_dns, MagicDns,
 };
 pub use relay_client::RelayMesh;
 
