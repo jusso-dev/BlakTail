@@ -234,6 +234,8 @@ pub struct NodeState {
     #[serde(default)]
     pub org_dns: Option<OrgDnsSnapshot>,
     #[serde(default)]
+    pub dns_degraded: Option<String>,
+    #[serde(default)]
     pub control_revision: i64,
 }
 
@@ -249,6 +251,8 @@ pub struct OrgDnsSnapshot {
     pub search_domains: Vec<String>,
     #[serde(default)]
     pub split: Vec<OrgDnsSplit>,
+    #[serde(default)]
+    pub global_resolvers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -539,6 +543,7 @@ impl Coordinator {
             relay_endpoint_reported_at: 0,
             dns_mode: None,
             org_dns: None,
+            dns_degraded: None,
             control_revision: 0,
         })
     }
@@ -1953,9 +1958,7 @@ pub fn validate_interface(name: &str) -> Result<(), Error> {
 }
 
 fn apply_org_dns_snapshot(state: &mut NodeState, incoming: Option<OrgDnsSnapshot>) {
-    if incoming.is_some() {
-        state.org_dns = incoming;
-    }
+    dns::adopt_org_dns_snapshot(state, incoming);
 }
 
 #[cfg(test)]
@@ -2129,6 +2132,7 @@ mod tests {
             relay_endpoint_reported_at: 0,
             dns_mode: None,
             org_dns: None,
+            dns_degraded: None,
             control_revision: 0,
         };
         let mut network = RecordingNetwork::default();
@@ -2190,6 +2194,7 @@ mod tests {
                 search_domains: vec!["internal.example".into()],
                 ..OrgDnsSnapshot::default()
             }),
+            dns_degraded: None,
             control_revision: 3,
         };
         apply_org_dns_snapshot(&mut state, None);
