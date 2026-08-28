@@ -15,6 +15,9 @@ use uuid::Uuid;
 pub(crate) const KIND: &str = "wireguard_only";
 const MAX_ALLOWED_IPS: usize = 8;
 const MAX_NAME_CHARS: usize = 64;
+const MIN_OVERLAP_SECS: i64 = 15;
+const MAX_OVERLAP_SECS: i64 = 86_400;
+const DEFAULT_OVERLAP_SECS: i64 = 300;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +33,14 @@ pub(crate) struct CreateWireGuardOnlyPeer {
     expires_at: Option<i64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RotateWireGuardOnlyPeer {
+    wg_public_key: String,
+    #[serde(default)]
+    overlap_seconds: Option<i64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WireGuardOnlyPeer {
     pub id: Uuid,
@@ -43,6 +54,10 @@ pub(crate) struct WireGuardOnlyPeer {
     pub expires_at: Option<i64>,
     pub revoked_at: Option<i64>,
     pub revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_wg_public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_until: Option<i64>,
 }
 
 pub(crate) async fn list_console(
@@ -86,6 +101,19 @@ pub(crate) async fn revoke_console(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub(crate) async fn rotate_console(
+    State(state): State<AppState>,
+    UrlPath((org_id, peer_id)): UrlPath<(Uuid, Uuid)>,
+    headers: HeaderMap,
+    Json(input): Json<RotateWireGuardOnlyPeer>,
+) -> Result<Json<WireGuardOnlyPeer>, ApiError> {
+    let session = console_session(&state, &headers, org_id).await?;
+    require_writer(&session)?;
+    Ok(Json(
+        rotate_peer(&state, org_id, peer_id, &session, input).await?,
+    ))
+}
+
 pub(crate) async fn list_for_org(
     state: &AppState,
     org_id: Uuid,
@@ -117,6 +145,16 @@ pub(crate) async fn revoke_for_org(
     session: &Session,
 ) -> Result<(), ApiError> {
     revoke_peer(state, org_id, peer_id, session).await
+}
+
+pub(crate) async fn rotate_for_org(
+    state: &AppState,
+    org_id: Uuid,
+    peer_id: Uuid,
+    session: &Session,
+    input: RotateWireGuardOnlyPeer,
+) -> Result<WireGuardOnlyPeer, ApiError> {
+    rotate_peer(state, org_id, peer_id, session, input).await
 }
 
 fn require_writer(session: &Session) -> Result<(), ApiError> {
@@ -228,12 +266,14 @@ async fn insert_peer(
         expires_at: input.expires_at,
         revoked_at: None,
         revision: 1,
+        previous_wg_public_key: None,
+        overlap_until: None,
     })
 }
 
 async fn list_peers(state: &AppState, org_id: Uuid) -> Result<Vec<WireGuardOnlyPeer>, ApiError> {
     let rows = sqlx::query(
-        "SELECT id,name,kind,wg_public_key,endpoint,allowed_ips_json,tags_json,created_at,expires_at,revoked_at,revision
+        "SELECT id,name,kind,wg_public_key,endpoint,allowed_ips_json,tags_json,created_at,expires_at,revoked_at,revision,previous_wg_public_key,overlap_until
          FROM wireguard_only_peers WHERE org_id=$1 ORDER BY name",
     )
     .bind(org_id.to_string())
@@ -248,7 +288,7 @@ async fn load_peer(
     peer_id: Uuid,
 ) -> Result<WireGuardOnlyPeer, ApiError> {
     let row = sqlx::query(
-        "SELECT id,name,kind,wg_public_key,endpoint,allowed_ips_json,tags_json,created_at,expires_at,revoked_at,revision
+        "SELECT id,name,kind,wg_public_key,endpoint,allowed_ips_json,tags_json,created_at,expires_at,revoked_at,revision,previous_wg_public_key,overlap_until
          FROM wireguard_only_peers WHERE id=$1 AND org_id=$2",
     )
     .bind(peer_id.to_string())
@@ -304,8 +344,103 @@ async fn revoke_peer(
     Ok(())
 }
 
+async fn rotate_peer(
+    state: &AppState,
+    org_id: Uuid,
+    peer_id: Uuid,
+    session: &Session,
+    input: RotateWireGuardOnlyPeer,
+) -> Result<WireGuardOnlyPeer, ApiError> {
+    let next_key = validate_public_key(&input.wg_public_key)?;
+    let overlap_seconds = input.overlap_seconds.unwrap_or(DEFAULT_OVERLAP_SECS);
+    if !(MIN_OVERLAP_SECS..=MAX_OVERLAP_SECS).contains(&overlap_seconds) {
+        return Err(ApiError::BadRequest(format!(
+            "overlap_seconds must be between {MIN_OVERLAP_SECS} and {MAX_OVERLAP_SECS}"
+        )));
+    }
+    let current = load_peer(state, org_id, peer_id).await?;
+    if current.revoked_at.is_some() {
+        return Err(ApiError::Conflict(
+            "wireguard-only peer is already revoked".into(),
+        ));
+    }
+    if next_key == current.wg_public_key {
+        return Err(ApiError::BadRequest(
+            "rotated public key must differ from the current key".into(),
+        ));
+    }
+    let now = now();
+    let overlap_until = now + overlap_seconds;
+    let overlap_peer_id = Uuid::new_v4();
+    let mut tx = state.store.pool.begin().await?;
+    let node_key_taken: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM nodes WHERE org_id=$1 AND wg_public_key=$2 AND revoked_at IS NULL AND deleted_at IS NULL",
+    )
+    .bind(org_id.to_string())
+    .bind(&next_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if node_key_taken.is_some() {
+        return Err(ApiError::Conflict(
+            "a managed node already uses that public key".into(),
+        ));
+    }
+    let peer_key_taken: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM wireguard_only_peers
+         WHERE org_id=$1 AND id<>$2 AND revoked_at IS NULL
+           AND (wg_public_key=$3 OR (previous_wg_public_key=$3 AND overlap_until IS NOT NULL AND overlap_until>$4))",
+    )
+    .bind(org_id.to_string())
+    .bind(peer_id.to_string())
+    .bind(&next_key)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if peer_key_taken.is_some() {
+        return Err(ApiError::Conflict(
+            "wireguard-only peer name or public key already exists".into(),
+        ));
+    }
+    let changed = sqlx::query(
+        "UPDATE wireguard_only_peers
+         SET wg_public_key=$1, previous_wg_public_key=$2, overlap_until=$3, overlap_peer_id=$4, revision=revision+1
+         WHERE id=$5 AND org_id=$6 AND revoked_at IS NULL",
+    )
+    .bind(&next_key)
+    .bind(&current.wg_public_key)
+    .bind(overlap_until)
+    .bind(overlap_peer_id.to_string())
+    .bind(peer_id.to_string())
+    .bind(org_id.to_string())
+    .execute(&mut *tx)
+    .await
+    .map_err(conflict("wireguard-only peer name or public key already exists"))?
+    .rows_affected();
+    if changed == 0 {
+        return Err(ApiError::NotFound);
+    }
+    bump_control_revision(&mut tx, org_id.to_string()).await?;
+    append_audit(
+        &mut tx,
+        org_id,
+        session,
+        "wireguard_only.rotated",
+        "wireguard_only_peer",
+        Some(&peer_id.to_string()),
+        &serde_json::json!({
+            "kind": KIND,
+            "overlap_until": overlap_until,
+        }),
+    )
+    .await?;
+    tx.commit().await?;
+    load_peer(state, org_id, peer_id).await
+}
+
 fn row_to_peer(row: sqlx::any::AnyRow) -> Result<WireGuardOnlyPeer, ApiError> {
     let id: String = row.try_get(0)?;
+    let previous: Option<String> = row.try_get(11)?;
+    let overlap_until: Option<i64> = row.try_get(12)?;
     Ok(WireGuardOnlyPeer {
         id: Uuid::parse_str(&id).map_err(|_| ApiError::CorruptData)?,
         name: row.try_get(1)?,
@@ -319,6 +454,8 @@ fn row_to_peer(row: sqlx::any::AnyRow) -> Result<WireGuardOnlyPeer, ApiError> {
         expires_at: row.try_get(8)?,
         revoked_at: row.try_get(9)?,
         revision: row.try_get(10)?,
+        previous_wg_public_key: previous.filter(|key| !key.is_empty()),
+        overlap_until,
     })
 }
 
@@ -513,28 +650,52 @@ pub(crate) async fn active_export_rows(
     pool: &sqlx::AnyPool,
     org_id: &str,
 ) -> Result<Vec<(Uuid, String, String, String, Vec<String>, Vec<DeviceTag>)>, ApiError> {
+    let observed = now();
     let rows = sqlx::query(
-        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,tags_json
+        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,tags_json,previous_wg_public_key,overlap_until,overlap_peer_id
          FROM wireguard_only_peers
          WHERE org_id=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at>$2)
          ORDER BY name",
     )
     .bind(org_id)
-    .bind(now())
+    .bind(observed)
     .fetch_all(pool)
     .await?;
-    rows.into_iter()
-        .map(|row| {
-            let id: String = row.try_get(0)?;
-            Ok((
-                Uuid::parse_str(&id).map_err(|_| ApiError::CorruptData)?,
-                row.try_get(1)?,
-                row.try_get(2)?,
-                row.try_get(3)?,
-                serde_json::from_str(&row.try_get::<String, _>(4)?)
-                    .map_err(|_| ApiError::CorruptData)?,
-                serde_json::from_str(&row.try_get::<String, _>(5)?).unwrap_or_default(),
-            ))
-        })
-        .collect()
+    let mut exported = Vec::new();
+    for row in rows {
+        let id: String = row.try_get(0)?;
+        let name: String = row.try_get(1)?;
+        let wg_public_key: String = row.try_get(2)?;
+        let endpoint: String = row.try_get(3)?;
+        let allowed_ips: Vec<String> = serde_json::from_str(&row.try_get::<String, _>(4)?)
+            .map_err(|_| ApiError::CorruptData)?;
+        let tags: Vec<DeviceTag> =
+            serde_json::from_str(&row.try_get::<String, _>(5)?).unwrap_or_default();
+        exported.push((
+            Uuid::parse_str(&id).map_err(|_| ApiError::CorruptData)?,
+            name.clone(),
+            wg_public_key,
+            endpoint.clone(),
+            allowed_ips.clone(),
+            tags.clone(),
+        ));
+        let previous: Option<String> = row.try_get(6)?;
+        let overlap_until: Option<i64> = row.try_get(7)?;
+        let overlap_peer_id: Option<String> = row.try_get(8)?;
+        if let (Some(previous), Some(until), Some(overlap_id)) =
+            (previous, overlap_until, overlap_peer_id)
+        {
+            if until > observed && !previous.is_empty() {
+                exported.push((
+                    Uuid::parse_str(&overlap_id).map_err(|_| ApiError::CorruptData)?,
+                    name,
+                    previous,
+                    endpoint,
+                    allowed_ips,
+                    tags,
+                ));
+            }
+        }
+    }
+    Ok(exported)
 }

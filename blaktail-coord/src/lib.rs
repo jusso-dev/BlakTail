@@ -64,7 +64,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 11;
+pub const CURRENT_SCHEMA_VERSION: i64 = 12;
 const MAX_CONTROL_UPDATE_WAIT_SECS: u64 = 25;
 const MAX_CONTROL_VIEWS: usize = 10_000;
 type ControlViewMap = HashMap<Uuid, (i64, BTreeSet<Uuid>)>;
@@ -177,6 +177,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 11,
         name: "organisation webhook destinations and outbox",
         postgres_sql: include_str!("../migrations/postgres/0011_webhooks.sql"),
+    },
+    Migration {
+        version: 12,
+        name: "wireguard-only public-key overlap rotation",
+        postgres_sql: include_str!("../migrations/postgres/0012_wg_only_overlap.sql"),
     },
 ];
 
@@ -374,6 +379,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             9 => migrate_sqlite_to_v9(&mut tx).await?,
             10 => migrate_sqlite_to_v10(&mut tx).await?,
             11 => migrate_sqlite_to_v11(&mut tx).await?,
+            12 => migrate_sqlite_to_v12(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -390,6 +396,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             9 => "PRAGMA user_version=9",
             10 => "PRAGMA user_version=10",
             11 => "PRAGMA user_version=11",
+            12 => "PRAGMA user_version=12",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -785,6 +792,15 @@ async fn migrate_sqlite_to_v11(
     Ok(())
 }
 
+async fn migrate_sqlite_to_v12(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    ensure_column(tx, "wireguard_only_peers", "previous_wg_public_key", "TEXT").await?;
+    ensure_column(tx, "wireguard_only_peers", "overlap_until", "INTEGER").await?;
+    ensure_column(tx, "wireguard_only_peers", "overlap_peer_id", "TEXT").await?;
+    Ok(())
+}
+
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
     let rows =
         sqlx::query("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")
@@ -1017,6 +1033,10 @@ pub fn app_with_relays_console_and_metrics(
         .route(
             "/v1/orgs/:org_id/wireguard-only-peers/:peer_id",
             get(wg_only::get_console).delete(wg_only::revoke_console),
+        )
+        .route(
+            "/v1/orgs/:org_id/wireguard-only-peers/:peer_id/rotate",
+            post(wg_only::rotate_console),
         )
         .route("/v1/orgs/:org_id/security", get(get_security_policy))
         .route("/v1/orgs/:org_id/security", put(put_security_policy))
@@ -10037,6 +10057,129 @@ mod tests {
             .to_ascii_uppercase()
             .find("PRIVATE")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn wireguard_only_rotation_exports_both_keys_then_drops_the_old_one() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "wg-rotate-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let node =
+            register_test_node(&router, org.id, &owner, "office-one", "office-key", &[]).await;
+        sqlx::query("UPDATE nodes SET tags_json=$1 WHERE id=$2")
+            .bind(r#"["office"]"#)
+            .bind(node.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let created: crate::wg_only::WireGuardOnlyPeer = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/wireguard-only-peers", org.id),
+                serde_json::json!({
+                    "name": "site-router",
+                    "kind": "wireguard_only",
+                    "wg_public_key": "oldRouterPublicKeyExample+/=",
+                    "endpoint": "203.0.113.10:51820",
+                    "allowed_ips": ["10.8.0.0/24"],
+                    "tags": ["office"]
+                }),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!(
+                    "/v1/orgs/{}/wireguard-only-peers/{}/rotate",
+                    org.id, created.id
+                ),
+                serde_json::json!({
+                    "wg_public_key": "newRouterPublicKeyExample+/=",
+                    "overlap_seconds": 15
+                }),
+                Some(&member),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        let rotated: crate::wg_only::WireGuardOnlyPeer = body(
+            call(
+                &router,
+                Method::POST,
+                &format!(
+                    "/v1/orgs/{}/wireguard-only-peers/{}/rotate",
+                    org.id, created.id
+                ),
+                serde_json::json!({
+                    "wg_public_key": "newRouterPublicKeyExample+/=",
+                    "overlap_seconds": 15
+                }),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(rotated.wg_public_key, "newRouterPublicKeyExample+/=");
+        assert_eq!(
+            rotated.previous_wg_public_key.as_deref(),
+            Some("oldRouterPublicKeyExample+/=")
+        );
+        assert!(rotated.overlap_until.is_some_and(|until| until > now()));
+        let overlapping: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        let keys: Vec<_> = overlapping
+            .peers
+            .iter()
+            .filter(|peer| peer.kind == "wireguard_only")
+            .map(|peer| peer.wg_public_key.as_str())
+            .collect();
+        assert!(keys.contains(&"newRouterPublicKeyExample+/="));
+        assert!(keys.contains(&"oldRouterPublicKeyExample+/="));
+        sqlx::query("UPDATE wireguard_only_peers SET overlap_until=$1 WHERE id=$2")
+            .bind(now() - 1)
+            .bind(created.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let after_overlap: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        let remaining: Vec<_> = after_overlap
+            .peers
+            .iter()
+            .filter(|peer| peer.kind == "wireguard_only")
+            .map(|peer| peer.wg_public_key.as_str())
+            .collect();
+        assert_eq!(remaining, vec!["newRouterPublicKeyExample+/="]);
+        assert!(!after_overlap
+            .peers
+            .iter()
+            .any(|peer| peer.wg_public_key == "oldRouterPublicKeyExample+/="));
     }
 
     #[tokio::test]

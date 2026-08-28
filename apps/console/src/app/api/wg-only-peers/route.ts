@@ -1,6 +1,7 @@
 import {
   createWgOnlyPeer,
   listAllWgOnlyPeers,
+  rotateWgOnlyPeer,
   revokeWgOnlyPeer,
   type DeviceTag,
 } from "@/lib/coord";
@@ -96,6 +97,48 @@ export async function POST(request: Request): Promise<Response> {
       endpoint,
       allowed_ips: allowedIps,
       tags,
+    });
+    return Response.json({
+      ...peer,
+      organisation_id: ctx.organisationId,
+      organisation_name: ctx.organisationName,
+    });
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
+
+export async function PATCH(request: Request): Promise<Response> {
+  try {
+    assertSameOrigin(request);
+    const person = await context(request);
+    if (!person) {
+      return Response.json({ error: "Authentication required." }, { status: 401 });
+    }
+    const body = (await request.json()) as Record<string, unknown>;
+    const organisationId =
+      typeof body.organisationId === "string" ? body.organisationId : "";
+    const peerId = typeof body.peerId === "string" ? body.peerId : "";
+    const wgPublicKey =
+      typeof body.wgPublicKey === "string" ? body.wgPublicKey.trim() : "";
+    const overlapSeconds =
+      typeof body.overlapSeconds === "number" ? body.overlapSeconds : 300;
+    const ctx = organisationContext(person, organisationId);
+    if (!canMutateTailnet(ctx.role)) {
+      return Response.json(
+        { error: "Only owners and admins can rotate unmanaged WireGuard peers." },
+        { status: 403 },
+      );
+    }
+    if (!peerId || !wgPublicKey) {
+      return Response.json(
+        { error: "Peer and new public key are required." },
+        { status: 400 },
+      );
+    }
+    const peer = await rotateWgOnlyPeer(ctx, peerId, {
+      wg_public_key: wgPublicKey,
+      overlap_seconds: overlapSeconds,
     });
     return Response.json({
       ...peer,

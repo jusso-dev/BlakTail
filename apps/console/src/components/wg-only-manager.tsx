@@ -4,6 +4,7 @@ import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import {
   createWgOnlyPeerAction,
+  rotateWgOnlyPeerAction,
   revokeWgOnlyPeerAction,
 } from "@/app/actions";
 import { ACL_TAGS } from "@/lib/acl";
@@ -105,7 +106,7 @@ export function WgOnlyManager({
           </button>
         </form>
       ) : (
-        <p className="muted">Members can see unmanaged peers but cannot add or revoke them.</p>
+        <p className="muted">Members can see unmanaged peers but cannot add, rotate, or revoke them.</p>
       )}
       {error ? <p className="error">{error}</p> : null}
       {peers.length ? (
@@ -139,29 +140,73 @@ export function WgOnlyManager({
                     >
                       {peer.revoked_at ? "Revoked" : "Unmanaged"}
                     </span>
+                    {peer.previous_wg_public_key &&
+                    peer.overlap_until &&
+                    peer.overlap_until * 1000 > Date.now() ? (
+                      <div className="muted">
+                        Overlap until {new Date(peer.overlap_until * 1000).toISOString()}
+                      </div>
+                    ) : null}
                   </td>
                   <td>
                     {canMutate && !peer.revoked_at ? (
-                      <button
-                        type="button"
-                        className="danger"
-                        disabled={pending}
-                        onClick={() => {
-                          const form = new FormData();
-                          form.set("peerId", peer.id);
-                          form.set("organisationId", peer.organisation_id);
-                          startTransition(async () => {
-                            const result = await revokeWgOnlyPeerAction(form);
-                            if (!result.ok) {
-                              setError(result.error);
-                              return;
-                            }
-                            router.refresh();
-                          });
-                        }}
-                      >
-                        Revoke
-                      </button>
+                      <div className="stack">
+                        <form
+                          onSubmit={(event) => {
+                            event.preventDefault();
+                            const form = event.currentTarget;
+                            const data = new FormData(form);
+                            data.set("peerId", peer.id);
+                            data.set("organisationId", peer.organisation_id);
+                            setError(null);
+                            startTransition(async () => {
+                              const result = await rotateWgOnlyPeerAction(data);
+                              if (!result.ok) {
+                                setError(result.error);
+                                return;
+                              }
+                              form.reset();
+                              router.refresh();
+                            });
+                          }}
+                        >
+                          <input
+                            className="mono"
+                            name="wgPublicKey"
+                            required
+                            placeholder="new public key"
+                            aria-label={`Rotate ${peer.name} public key`}
+                          />
+                          <input
+                            type="hidden"
+                            name="overlapSeconds"
+                            value="300"
+                          />
+                          <button type="submit" disabled={pending} data-testid="wg-only-rotate">
+                            Rotate
+                          </button>
+                        </form>
+                        <button
+                          type="button"
+                          className="danger"
+                          disabled={pending}
+                          onClick={() => {
+                            const form = new FormData();
+                            form.set("peerId", peer.id);
+                            form.set("organisationId", peer.organisation_id);
+                            startTransition(async () => {
+                              const result = await revokeWgOnlyPeerAction(form);
+                              if (!result.ok) {
+                                setError(result.error);
+                                return;
+                              }
+                              router.refresh();
+                            });
+                          }}
+                        >
+                          Revoke
+                        </button>
+                      </div>
                     ) : null}
                   </td>
                 </tr>

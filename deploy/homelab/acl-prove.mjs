@@ -174,9 +174,39 @@ if (command === "identity") {
     );
   }
   process.stdout.write(`ok revoked ${peerId}\n`);
+} else if (command === "rotate-wg-only") {
+  const peerId = process.argv[3];
+  const pubkey = process.argv[4];
+  const overlapSeconds = Number(process.argv[5] ?? "30");
+  if (!peerId || !pubkey) {
+    throw new Error(
+      "usage: acl-prove.mjs rotate-wg-only PEER_ID PUBKEY [overlap_seconds]",
+    );
+  }
+  const response = await fetch(
+    `${base}/v1/orgs/${row.coord_org_id}/wireguard-only-peers/${peerId}/rotate`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${sign(row)}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        wg_public_key: pubkey,
+        overlap_seconds: overlapSeconds,
+      }),
+    },
+  );
+  if (!response.ok) {
+    throw new Error(
+      `rotate wg-only ${response.status} ${await response.text()}`,
+    );
+  }
+  const rotated = await response.json();
+  process.stdout.write(`${JSON.stringify(rotated)}\n`);
 } else {
   throw new Error(
-    "usage: acl-prove.mjs identity|mint|put-acl|put-dns|purge-nodes|create-wg-only|revoke-wg-only",
+    "usage: acl-prove.mjs identity|mint|put-acl|put-dns|purge-nodes|create-wg-only|revoke-wg-only|rotate-wg-only",
   );
 }
 
