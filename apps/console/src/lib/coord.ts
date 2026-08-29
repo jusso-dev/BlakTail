@@ -36,6 +36,16 @@ export type CoordNode = {
   hostname?: string | null;
   capabilities?: string[];
   ephemeral?: boolean;
+  shares?: DeviceShare[];
+  dns_applied_revision?: number;
+};
+
+export type DeviceShare = {
+  label: string;
+  path: string;
+  port: number;
+  read_only: boolean;
+  enabled: boolean;
 };
 
 export type ApiClient = {
@@ -387,6 +397,34 @@ export async function listWebhookDeliveries(
   return res.json() as Promise<WebhookDelivery[]>;
 }
 
+export async function emitMembershipUpdated(
+  ctx: ConsoleContext,
+  payload: { membership_id: string; role: string; status: string },
+): Promise<void> {
+  if (ctx.role !== "owner") {
+    return;
+  }
+  try {
+    const res = await coordFetch(`/v1/orgs/${ctx.coordOrgId}/webhooks/events`, {
+      method: "POST",
+      ctx,
+      body: JSON.stringify({
+        event_type: "membership.updated",
+        payload,
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`membership webhook enqueue failed: ${await readError(res)}`);
+    }
+  } catch (error) {
+    console.warn(
+      `membership webhook enqueue failed: ${
+        error instanceof Error ? error.message : "unknown error"
+      }`,
+    );
+  }
+}
+
 export async function replayWebhookDelivery(
   ctx: ConsoleContext,
   deliveryId: string,
@@ -554,6 +592,9 @@ export type OrgDnsResponse = {
   has_previous: boolean;
   magic_dns_suffix: string;
   dns: OrgDnsSettings;
+  record_preview?: { name: string; split_suffix: string | null }[];
+  applied?: number;
+  enrolled?: number;
 };
 
 export async function getDns(ctx: ConsoleContext): Promise<OrgDnsResponse> {

@@ -24,7 +24,7 @@ status_of() {
 magic_dns_ip() {
   local text
   text="$(status_of "$1")" || return 1
-  awk '/^ipv6 address:/ { sub("/128","",$3); print $3; exit }' <<<"$text"
+  awk '$1 == "address:" { sub("/32","",$2); print $2; exit }' <<<"$text"
 }
 
 container_ip() {
@@ -134,6 +134,29 @@ ensure_dig
 office_dns="$(magic_dns_ip agent-office)"
 store_dns="$(magic_dns_ip agent-store)"
 [[ -n "$office_dns" && -n "$store_dns" ]]
+
+wait_peer_name() {
+  local agent="$1"
+  local name="$2"
+  local expect="$3"
+  local deadline=$((SECONDS + 45))
+  while (( SECONDS < deadline )); do
+    local answer
+    answer="$("${COMPOSE[@]}" exec -T "$agent" getent hosts "$name" || true)"
+    if [[ "$answer" == *"${expect}"* ]]; then
+      echo "ok ${agent} resolves ${name}"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "FAIL ${agent} did not resolve ${name} through the system resolver" >&2
+  "${COMPOSE[@]}" exec -T "$agent" getent hosts "$name" >&2 || true
+  status_of "$agent" >&2 || true
+  return 1
+}
+
+wait_peer_name agent-office "$store_name" "$store_dns"
+wait_peer_name agent-store "$office_name" "$office_dns"
 
 echo "== publish extra A/AAAA ${RECORD_NAME} -> ${RECORD_IP} / ${RECORD_IP6}"
 console_bun put-dns "$(python3 -c "import json; print(json.dumps({

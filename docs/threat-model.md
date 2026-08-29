@@ -24,7 +24,7 @@ BlakTail is a WireGuard mesh. Devices join an organisation tailnet, talk peer to
 | Bootstrap/invitation credentials | Shown once to operator/invitee; SHA-256 hashes in Postgres | First-owner or invited-role takeover before expiry/use |
 | TLS private key | Coordinator host | Intercept of control-plane HTTP |
 
-The coordinator stores hashes of join keys and node tokens, not the secrets themselves. It never stores user file contents. WireGuard payload ciphertext is not a coordinator asset.
+The coordinator stores hashes of join keys and node tokens, not the secrets themselves. It never stores user file contents. Shared-folder configuration is metadata only: label, absolute path, port, and enabled flag. File bytes stay on the publishing node and move only over the WireGuard overlay. WireGuard payload ciphertext is not a coordinator asset.
 Browser enrollment follows the same rule: SQLite stores hashes of the high-entropy
 device secret and the short display code. Approval creates a single-use grant bound
 to the waiting node name and WireGuard public key; the raw secret stays in the agent.
@@ -122,6 +122,12 @@ recovery: if the private key may have leaked, revoke the node and enrol a new on
 **Join-key theft enrols an attacker.** If they redeem the key before you revoke it, you now have a hostile node with whatever tags that key carried. Revoking the join key afterwards does not kick them off; you must revoke the node they created. Unused keys in chat logs, email, ticket systems, or shell history are live credentials.
 
 **Revoke is not instant if the coordinator is down.** Peers keep the last applied WireGuard configuration when polling fails, so existing tunnels survive a coordinator outage. That is deliberate. It also means a revoke does not propagate until peers can reach the coordinator again.
+
+**Overlay shares are unauthenticated HTTP and read-only WebDAV.** The listener
+binds only the node's tailnet IPv4 address. Anyone who can already reach that
+node over the overlay can list and read the published directory. There is no
+share password. macOS still has no packet filter, so the bind is the control
+there. Writable uploads are rejected.
 
 **This is not IRAP.** Public code, org-held keys, and onshore hosting are the product. Formal accreditation is out of scope.
 

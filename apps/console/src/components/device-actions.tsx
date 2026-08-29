@@ -97,6 +97,7 @@ export function DeviceActions({
         node.organisation_name,
         node.id,
         ownerLabel(node, people),
+        ...(node.shares ?? []).map((share) => share.label),
       ]
         .join(" ")
         .toLowerCase()
@@ -426,6 +427,38 @@ function DeviceRow({
                   </button>
                 </form>
               ) : null}
+
+              {(node.shares ?? []).some((share) => share.enabled) ? (
+                <div>
+                  <p className="eyebrow">Shared folders</p>
+                  <ul className="muted">
+                    {(node.shares ?? [])
+                      .filter((share) => share.enabled)
+                      .map((share) => (
+                        <li key={`${node.id}-${share.label}`}>
+                          <span className="mono">
+                            http://{node.dns_name}:{share.port}/{share.label}/
+                          </span>
+                          {share.path ? ` · ${share.path}` : ""}
+                        </li>
+                      ))}
+                  </ul>
+                  <p className="muted">
+                    Reachable over the overlay. Browse the URL or, on a Mac,
+                    Finder → Go → Connect to Server. Policy must allow the
+                    device; the share port is opened for peers that can already
+                    see it.
+                  </p>
+                </div>
+              ) : (
+                <p className="muted">
+                  No shared folders. On the device run{" "}
+                  <span className="mono">
+                    blaktaild share enable --path /absolute/dir
+                  </span>
+                  .
+                </p>
+              )}
 
               {node.advertised_routes.length > 0 ? (
                 <form

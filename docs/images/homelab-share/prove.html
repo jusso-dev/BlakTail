@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BlakTail overlay share prove — homelab 2026-08-29</title>
+  <style>
+    body { font: 16px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 32px; color: #111; background: #f6f4ef; }
+    h1 { font: 600 22px/1.2 ui-sans-serif, system-ui, sans-serif; margin: 0 0 8px; }
+    .meta { color: #555; margin-bottom: 24px; }
+    section { background: #fff; border: 1px solid #d8d2c4; border-radius: 10px; padding: 16px 20px; margin: 0 0 16px; }
+    h2 { font: 600 15px/1.2 ui-sans-serif, system-ui, sans-serif; margin: 0 0 10px; }
+    pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
+    .ok { color: #0b6b2e; font-weight: 700; }
+    a { color: #0b4f8a; }
+  </style>
+</head>
+<body>
+  <h1>Overlay share prove on homelab</h1>
+  <p class="meta">29 Aug 2026 · office-share-3294 → store-share-3294 · overlay 100.64.0.149:5647</p>
+
+  <section>
+    <h2>GET /files/note.txt</h2>
+    <pre class="ok">HTTP/1.1 200 OK
+Content-Type: text/plain; charset=utf-8
+Content-Length: 17
+
+hello-from-store</pre>
+  </section>
+
+  <section>
+    <h2>Browser listing GET /files/</h2>
+    <h1 style="font-size:18px">/files/</h1>
+    <ul>
+      <li><a href="/files/note.txt">note.txt</a></li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>WebDAV PROPFIND Depth: 1</h2>
+    <pre>HTTP/1.1 207 Multi-Status
+DAV: 1
+Content-Type: text/xml; charset="utf-8"
+
+&lt;D:multistatus xmlns:D="DAV:"&gt;
+  &lt;D:response&gt;
+    &lt;D:href&gt;/files/&lt;/D:href&gt;
+    &lt;D:resourcetype&gt;&lt;D:collection/&gt;&lt;/D:resourcetype&gt;
+    &lt;D:displayname&gt;files&lt;/D:displayname&gt;
+  &lt;/D:response&gt;
+  &lt;D:response&gt;
+    &lt;D:href&gt;/files/note.txt&lt;/D:href&gt;
+    &lt;D:getcontentlength&gt;17&lt;/D:getcontentlength&gt;
+    &lt;D:getcontenttype&gt;text/plain; charset=utf-8&lt;/D:getcontenttype&gt;
+    &lt;D:displayname&gt;note.txt&lt;/D:displayname&gt;
+  &lt;/D:response&gt;
+&lt;/D:multistatus&gt;</pre>
+  </section>
+
+  <section>
+    <h2>Office agent sees the published share</h2>
+    <pre>peers: 1
+peer share: http://store-share-3294.41f1f8fb.blaktail:5647/files/
+  store-share-3294 172.25.0.7:51820 100.64.0.149/32 all</pre>
+  </section>
+</body>
+</html>

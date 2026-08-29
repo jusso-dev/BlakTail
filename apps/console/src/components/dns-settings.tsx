@@ -32,14 +32,17 @@ export function DnsSettings({
       <div>
         <h2>Organisation DNS</h2>
         <p className="muted">
-          Publish split suffixes, upstream resolvers, search domains, and extra
-          A/AAAA records. MagicDNS stays authoritative for{" "}
-          <span className="mono">{initial.magic_dns_suffix}</span>. Agents
-          receive the snapshot; they do not yet apply split forwarding.
+          Publish split suffixes, search domains, and extra A/AAAA records.
+          Agents apply split forwarding. MagicDNS stays authoritative for{" "}
+          <span className="mono">{initial.magic_dns_suffix}</span>. Global
+          resolvers are stored for later use; public names stay refused.
         </p>
         <p className="muted">
           Revision {initial.revision}
           {initial.has_previous ? " · previous revision available" : ""}
+          {typeof initial.enrolled === "number"
+            ? ` · ${initial.applied ?? 0} of ${initial.enrolled} enrolled devices on this revision`
+            : ""}
         </p>
       </div>
       <label>
@@ -69,6 +72,16 @@ export function DnsSettings({
             <li key={`${record.type}-${record.name}-${record.value}`}>
               {record.type} <span className="mono">{record.name}</span>{" "}
               {record.value}
+            </li>
+          ))}
+          {(initial.record_preview ?? []).map((route) => (
+            <li key={`preview-${route.name}`}>
+              {route.name} →{" "}
+              {route.split_suffix ? (
+                <span className="mono">{route.split_suffix}</span>
+              ) : (
+                "local / MagicDNS only"
+              )}
             </li>
           ))}
         </ul>

@@ -1,6 +1,7 @@
 mod admin;
 mod metrics;
 mod org_dns;
+mod shares;
 mod webhooks;
 mod wg_only;
 
@@ -64,7 +65,7 @@ use tracing::info;
 use uuid::Uuid;
 
 const SCHEMA: &str = include_str!("../schema.sql");
-pub const CURRENT_SCHEMA_VERSION: i64 = 12;
+pub const CURRENT_SCHEMA_VERSION: i64 = 13;
 const MAX_CONTROL_UPDATE_WAIT_SECS: u64 = 25;
 const MAX_CONTROL_VIEWS: usize = 10_000;
 type ControlViewMap = HashMap<Uuid, (i64, BTreeSet<Uuid>)>;
@@ -182,6 +183,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 12,
         name: "wireguard-only public-key overlap rotation",
         postgres_sql: include_str!("../migrations/postgres/0012_wg_only_overlap.sql"),
+    },
+    Migration {
+        version: 13,
+        name: "node shares and applied DNS revision",
+        postgres_sql: include_str!("../migrations/postgres/0013_shares_and_dns_applied.sql"),
     },
 ];
 
@@ -380,6 +386,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             10 => migrate_sqlite_to_v10(&mut tx).await?,
             11 => migrate_sqlite_to_v11(&mut tx).await?,
             12 => migrate_sqlite_to_v12(&mut tx).await?,
+            13 => migrate_sqlite_to_v13(&mut tx).await?,
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -397,6 +404,7 @@ async fn apply_sqlite_migrations(pool: &AnyPool) -> Result<(), StoreError> {
             10 => "PRAGMA user_version=10",
             11 => "PRAGMA user_version=11",
             12 => "PRAGMA user_version=12",
+            13 => "PRAGMA user_version=13",
             found => {
                 return Err(StoreError::InvalidMigrationPlan { expected, found });
             }
@@ -801,6 +809,20 @@ async fn migrate_sqlite_to_v12(
     Ok(())
 }
 
+async fn migrate_sqlite_to_v13(
+    tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+) -> Result<(), sqlx::Error> {
+    ensure_column(tx, "nodes", "shares_json", "TEXT NOT NULL DEFAULT '[]'").await?;
+    ensure_column(
+        tx,
+        "nodes",
+        "dns_applied_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    Ok(())
+}
+
 async fn normalise_dns_names(tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<(), sqlx::Error> {
     let rows =
         sqlx::query("SELECT id,org_id,name,dns_name FROM nodes ORDER BY org_id,created_at,id")
@@ -1054,6 +1076,10 @@ pub fn app_with_relays_console_and_metrics(
             get(webhooks::list_destinations_console).post(webhooks::create_destination_console),
         )
         .route(
+            "/v1/orgs/:org_id/webhooks/events",
+            post(webhooks::enqueue_console_event),
+        )
+        .route(
             "/v1/orgs/:org_id/webhooks/:destination_id",
             delete(webhooks::delete_destination_console),
         )
@@ -1072,6 +1098,7 @@ pub fn app_with_relays_console_and_metrics(
         .route("/v1/nodes/:node_id/peers", get(list_peers))
         .route("/v1/nodes/:node_id/updates", get(list_updates))
         .route("/v1/nodes/:node_id/routes", put(update_advertised_routes))
+        .route("/v1/nodes/:node_id/shares", put(update_node_shares))
         .route(
             "/v1/nodes/:node_id/relay-endpoint",
             put(update_relay_endpoint),
@@ -2382,6 +2409,41 @@ async fn update_advertised_routes(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn update_node_shares(
+    State(s): State<AppState>,
+    UrlPath(node_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<shares::ShareUpdate>,
+) -> Result<Json<Vec<shares::NodeShare>>, ApiError> {
+    let shares = shares::canonicalise(input.shares)?;
+    let token = bearer(&headers)?;
+    let mut tx = s.store.pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT org_id,credential_expires_at FROM nodes WHERE id=$1 AND token_hash=$2 AND revoked_at IS NULL AND deleted_at IS NULL",
+    )
+    .bind(node_id.to_string())
+    .bind(token)
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|row| {
+        Ok::<_, sqlx::Error>((row.try_get::<String, _>(0)?, row.try_get::<i64, _>(1)?))
+    })
+    .transpose()?;
+    let (org_id, credential_expires_at) = row.ok_or(ApiError::Unauthorized)?;
+    if credential_expires_at <= now() {
+        return Err(ApiError::CredentialExpired);
+    }
+    sqlx::query("UPDATE nodes SET shares_json=$1 WHERE id=$2")
+        .bind(serde_json::to_string(&shares).unwrap())
+        .bind(node_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+    bump_control_revision(&mut tx, org_id).await?;
+    tx.commit().await?;
+    info!(%node_id, shares = shares.len(), "node shares updated");
+    Ok(Json(shares))
+}
+
 async fn approve_node_routes(
     State(s): State<AppState>,
     UrlPath((org_id, node_id)): UrlPath<(Uuid, Uuid)>,
@@ -2636,6 +2698,8 @@ struct PeersResponse {
     relay_expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dns: Option<org_dns::OrgDnsAgentView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shares: Vec<shares::PublishedShare>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     control_updates: Option<ControlUpdatesCapability>,
 }
@@ -2663,6 +2727,8 @@ struct PeerSelection {
     exit_node: Option<String>,
     #[serde(default)]
     ipv6: bool,
+    #[serde(default)]
+    dns_revision: Option<i64>,
 }
 
 #[derive(Default, Deserialize)]
@@ -2677,6 +2743,8 @@ struct UpdateSelection {
     exit_node: Option<String>,
     #[serde(default)]
     ipv6: bool,
+    #[serde(default)]
+    dns_revision: Option<i64>,
 }
 
 async fn list_peers(
@@ -2705,9 +2773,10 @@ async fn list_peers(
     if credential_expires_at <= now() {
         return Err(ApiError::CredentialExpired);
     }
-    sqlx::query("UPDATE nodes SET last_seen_at=$1 WHERE id=$2")
+    sqlx::query("UPDATE nodes SET last_seen_at=$1,dns_applied_revision=CASE WHEN $3>=0 THEN $3 ELSE dns_applied_revision END WHERE id=$2")
         .bind(now())
         .bind(node_id.to_string())
+        .bind(selection.dns_revision.unwrap_or(-1))
         .execute(&s.store.pool)
         .await?;
     expire_ephemeral_nodes(&s.store, &org).await?;
@@ -2723,7 +2792,7 @@ async fn list_peers(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let rows = sqlx::query("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>$3 THEN relay_endpoint ELSE NULL END,approved_routes_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL AND deleted_at IS NULL AND credential_expires_at>$4 ORDER BY name")
+    let rows = sqlx::query("SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CASE WHEN relay_endpoint_updated_at>$3 THEN relay_endpoint ELSE NULL END,approved_routes_json,shares_json FROM nodes WHERE org_id=$1 AND id!=$2 AND revoked_at IS NULL AND deleted_at IS NULL AND credential_expires_at>$4 ORDER BY name")
         .bind(org.clone())
         .bind(node_id.to_string())
         .bind(now() - RELAY_ENDPOINT_FRESH_SECS)
@@ -2739,6 +2808,8 @@ async fn list_peers(
                 serde_json::from_str(&row.try_get::<String, _>(8)?).unwrap_or_default();
             let approved: Vec<String> =
                 serde_json::from_str(&row.try_get::<String, _>(10)?).unwrap_or_default();
+            let dest_shares =
+                shares::parse_shares(&row.try_get::<String, _>(11).unwrap_or_else(|_| "[]".into()));
             Ok::<_, ApiError>((
                 Peer {
                     id: Uuid::parse_str(&id).map_err(|_| ApiError::CorruptData)?,
@@ -2760,17 +2831,25 @@ async fn list_peers(
                 )
                 .with_user(row.try_get::<String, _>(6)?),
                 approved,
+                dest_shares,
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut exit_node_active = false;
     let mut peers = candidates
         .into_iter()
-        .filter_map(|(mut peer, destination, approved)| {
+        .filter_map(|(mut peer, destination, approved, dest_shares)| {
             if !acl.allows(&source, &destination) {
                 return None;
             }
-            peer.ingress = Some(acl.peer_ingress(&destination, &source));
+            let mut ingress = acl.peer_ingress(&destination, &source);
+            shares::grant_share_ports(
+                &mut ingress.tcp,
+                &ingress.deny_tcp,
+                ingress.all,
+                &dest_shares,
+            );
+            peer.ingress = Some(ingress);
             let exit_matches = requested_exit.is_some_and(|requested| {
                 requested == peer.id.to_string()
                     || requested == peer.name
@@ -2826,6 +2905,8 @@ async fn list_peers(
     let dns = org_dns::parse_settings(&org_dns_json)
         .ok()
         .map(|settings| settings.agent_view(&org, org_dns_revision));
+    let visible_ids = peers.iter().map(|peer| peer.id).collect::<BTreeSet<_>>();
+    let published_shares = shares::load_published(&s.store.pool, &org, &visible_ids).await?;
     Ok(Json(PeersResponse {
         peers,
         assigned_ips,
@@ -2836,6 +2917,7 @@ async fn list_peers(
         relay_token,
         relay_expires_at,
         dns,
+        shares: published_shares,
         control_updates: Some(ControlUpdatesCapability {
             wait_max_seconds: MAX_CONTROL_UPDATE_WAIT_SECS,
         }),
@@ -2885,6 +2967,7 @@ async fn list_updates(
                 Query(PeerSelection {
                     exit_node: selection.exit_node,
                     ipv6: selection.ipv6,
+                    dns_revision: selection.dns_revision,
                 }),
                 headers,
             )
@@ -3256,6 +3339,10 @@ pub(crate) struct NodeRow {
     capabilities: Vec<String>,
     #[serde(default)]
     ephemeral: bool,
+    #[serde(default)]
+    shares: Vec<shares::NodeShare>,
+    #[serde(default)]
+    dns_applied_revision: i64,
 }
 
 #[derive(Default, Deserialize)]
@@ -3288,7 +3375,7 @@ pub(crate) async fn load_nodes(
     let limit = i64::from(query.limit.unwrap_or(200).clamp(1, 200));
     let current_time = now();
     let rows = sqlx::query(
-        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CAST(created_at AS BIGINT),credential_expires_at,CASE WHEN credential_expires_at<=$2 THEN 1 ELSE 0 END,CASE WHEN credential_expires_at<=$3 THEN 1 ELSE 0 END,CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END,advertised_routes_json,approved_routes_json,display_name,last_seen_at,os,os_version,agent_version,hostname,capabilities_json,ephemeral,CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END FROM nodes WHERE org_id=$1 ORDER BY LOWER(COALESCE(NULLIF(TRIM(display_name),''),name)),name",
+        "SELECT id,name,wg_public_key,endpoint,allowed_ips_json,dns_name,user_id,user_role,tags_json,CAST(created_at AS BIGINT),credential_expires_at,CASE WHEN credential_expires_at<=$2 THEN 1 ELSE 0 END,CASE WHEN credential_expires_at<=$3 THEN 1 ELSE 0 END,CASE WHEN revoked_at IS NOT NULL THEN 1 ELSE 0 END,advertised_routes_json,approved_routes_json,display_name,last_seen_at,os,os_version,agent_version,hostname,capabilities_json,ephemeral,CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END,shares_json,dns_applied_revision FROM nodes WHERE org_id=$1 ORDER BY LOWER(COALESCE(NULLIF(TRIM(display_name),''),name)),name",
     )
     .bind(org_id.to_string())
     .bind(current_time)
@@ -3350,6 +3437,10 @@ pub(crate) async fn load_nodes(
                 capabilities: serde_json::from_str(&row.try_get::<String, _>(22)?)
                     .unwrap_or_default(),
                 ephemeral: row.try_get::<i64, _>(23)? != 0,
+                shares: shares::parse_shares(
+                    &row.try_get::<String, _>(25).unwrap_or_else(|_| "[]".into()),
+                ),
+                dns_applied_revision: row.try_get::<i64, _>(26).unwrap_or(0),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -3381,6 +3472,12 @@ pub(crate) async fn load_nodes(
                 node.os.as_deref().unwrap_or(""),
                 node.agent_version.as_deref().unwrap_or(""),
                 &node.id.to_string(),
+                &node
+                    .shares
+                    .iter()
+                    .map(|share| share.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
             ]
             .join(" ")
             .to_ascii_lowercase();
@@ -3805,7 +3902,11 @@ pub(crate) async fn load_org_dns(
         .fetch_optional(&store.pool)
         .await?
         .ok_or(ApiError::NotFound)?;
-    org_dns_from_row(org_id, row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)
+    let mut response = org_dns_from_row(org_id, row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)?;
+    let (applied, enrolled) = shares::dns_applied_counts(store, org_id, response.revision).await?;
+    response.applied = applied;
+    response.enrolled = enrolled;
+    Ok(response)
 }
 
 pub(crate) async fn load_org_dns_tx(
@@ -3850,6 +3951,8 @@ fn org_dns_from_row(
         magic_dns_suffix: org_dns::organisation_magic_dns_suffix(&org_id.to_string()),
         dns,
         record_preview,
+        applied: 0,
+        enrolled: 0,
     })
 }
 
@@ -8285,6 +8388,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn console_owner_enqueues_membership_webhook_events() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "membership-webhooks").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let admin = signed_session(org.id, "admin-1", Role::Admin, now() + 60);
+        let member = signed_session(org.id, "member-1", Role::Member, now() + 60);
+        let dest: crate::webhooks::WebhookDestination = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks", org.id),
+                serde_json::json!({"name":"inventory","url":"https://example.com/hook"}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let accepted = call(
+            &router,
+            Method::POST,
+            &format!("/v1/orgs/{}/webhooks/events", org.id),
+            serde_json::json!({
+                "event_type": "membership.updated",
+                "payload": {
+                    "membership_id": "mem-1",
+                    "role": "admin",
+                    "status": "active"
+                }
+            }),
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks/events", org.id),
+                serde_json::json!({
+                    "event_type": "membership.updated",
+                    "payload": {"membership_id": "mem-1", "role": "member"}
+                }),
+                Some(&admin),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks/events", org.id),
+                serde_json::json!({
+                    "event_type": "membership.updated",
+                    "payload": {"membership_id": "mem-1"}
+                }),
+                Some(&member),
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks/events", org.id),
+                serde_json::json!({
+                    "event_type": "device.enrolled",
+                    "payload": {"membership_id": "mem-1"}
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks/events", org.id),
+                serde_json::json!({
+                    "event_type": "membership.updated",
+                    "payload": {"role": "admin"}
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let deliveries: Vec<crate::webhooks::WebhookDelivery> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/webhooks/{}/deliveries", org.id, dest.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].event_type, "membership.updated");
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_matrix_handles_timeout_429_and_redirect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let server = axum::Router::new()
+                .route(
+                    "/too-many",
+                    axum::routing::post(|| async { StatusCode::TOO_MANY_REQUESTS }),
+                )
+                .route(
+                    "/hang",
+                    axum::routing::post(|| async {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        StatusCode::NO_CONTENT
+                    }),
+                )
+                .route(
+                    "/redirect",
+                    axum::routing::post(|| async {
+                        (
+                            StatusCode::FOUND,
+                            [(
+                                axum::http::header::LOCATION,
+                                "https://example.com/elsewhere",
+                            )],
+                        )
+                    }),
+                );
+            axum::serve(listener, server).await.ok();
+        });
+
+        let store = Store::memory().await.unwrap();
+        let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "webhook-matrix").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let too_many: crate::webhooks::WebhookDestination = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks", org.id),
+                serde_json::json!({"name":"too-many","url": format!("http://{addr}/too-many")}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let hang: crate::webhooks::WebhookDestination = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks", org.id),
+                serde_json::json!({"name":"hang","url": format!("http://{addr}/hang")}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let redirect: crate::webhooks::WebhookDestination = body(
+            call(
+                &router,
+                Method::POST,
+                &format!("/v1/orgs/{}/webhooks", org.id),
+                serde_json::json!({"name":"redirect","url": format!("http://{addr}/redirect")}),
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let _node =
+            register_test_node(&router, org.id, &owner, "office-1", "office-key", &[]).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let mut hang_error = None;
+        let mut too_many_attempts = 0;
+        let mut redirect_error = None;
+        while tokio::time::Instant::now() < deadline {
+            let listed = |destination_id: uuid::Uuid| {
+                let router = router.clone();
+                let owner = owner.clone();
+                let org_id = org.id;
+                async move {
+                    let deliveries: Vec<crate::webhooks::WebhookDelivery> = body(
+                        call(
+                            &router,
+                            Method::GET,
+                            &format!("/v1/orgs/{org_id}/webhooks/{destination_id}/deliveries"),
+                            serde_json::Value::Null,
+                            Some(&owner),
+                        )
+                        .await,
+                    )
+                    .await;
+                    deliveries
+                }
+            };
+            let too_many_row = listed(too_many.id).await;
+            let hang_row = listed(hang.id).await;
+            let redirect_row = listed(redirect.id).await;
+            too_many_attempts = too_many_row.first().map(|row| row.attempts).unwrap_or(0);
+            hang_error = hang_row.first().and_then(|row| row.last_error.clone());
+            redirect_error = redirect_row.first().and_then(|row| row.last_error.clone());
+            if too_many_attempts >= 1 && hang_error.is_some() && redirect_error.is_some() {
+                assert!(too_many_row[0].delivered_at.is_none());
+                assert!(hang_row[0].delivered_at.is_none());
+                assert!(redirect_row[0].delivered_at.is_none());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            too_many_attempts >= 1,
+            "429 destination did not retry, attempts={too_many_attempts}"
+        );
+        let hang_error = hang_error.expect("hang destination produced no error");
+        let hang_error = hang_error.to_ascii_lowercase();
+        assert!(
+            hang_error.contains("timeout")
+                || hang_error.contains("timed out")
+                || hang_error.contains("error sending request"),
+            "{hang_error}"
+        );
+        let redirect_error = redirect_error.expect("redirect destination produced no error");
+        assert!(redirect_error.contains("302"), "{redirect_error}");
+    }
+
+    #[tokio::test]
     async fn named_groups_allow_cross_tag_peers_for_listed_people() {
         let store = Store::memory().await.unwrap();
         let r = app(store.clone(), "ap-southeast-2".into(), TEST_SECRET);
@@ -8455,6 +8793,106 @@ mod tests {
         assert_eq!(ingress.tcp, vec!["22", "8080"]);
         assert_eq!(ingress.ssh_users, vec!["blaktail"]);
         assert!(!ingress.icmp);
+    }
+
+    #[tokio::test]
+    async fn node_can_publish_overlay_shares_visible_to_allowed_peers() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "share-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let office =
+            register_test_node(&router, org.id, &owner, "office-1", "office-key", &[]).await;
+        let store_node =
+            register_test_node(&router, org.id, &owner, "store-1", "store-key", &[]).await;
+        assert_eq!(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/orgs/{}/acl", org.id),
+                serde_json::json!({
+                    "defaults":"deny",
+                    "groups":{"crew":["owner-1"]},
+                    "rules":[{
+                        "action":"allow",
+                        "src_groups":["crew"],
+                        "dst_groups":["crew"],
+                        "dst_ports":["22"],
+                        "protocols":["tcp"]
+                    }]
+                }),
+                Some(&owner),
+            )
+            .await
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let published: Vec<crate::shares::NodeShare> = body(
+            call(
+                &router,
+                Method::PUT,
+                &format!("/v1/nodes/{}/shares", store_node.id),
+                serde_json::json!({
+                    "shares":[{
+                        "label":"Files",
+                        "path":"/srv/shared",
+                        "port":5647,
+                        "read_only":true,
+                        "enabled":true
+                    }]
+                }),
+                Some(&store_node.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(published[0].label, "files");
+        let from_office: PeersResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/peers?dns_revision=3", office.id),
+                serde_json::Value::Null,
+                Some(&office.node_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(from_office.shares.len(), 1);
+        assert_eq!(from_office.shares[0].label, "files");
+        assert_eq!(from_office.shares[0].port, 5647);
+        assert_eq!(from_office.shares[0].node_id, store_node.id);
+        let ingress = from_office.peers[0].ingress.as_ref().expect("ingress");
+        assert!(ingress.tcp.contains(&"5647".into()));
+        let listed: Vec<NodeRow> = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/nodes", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        let store_row = listed
+            .iter()
+            .find(|node| node.id == store_node.id)
+            .expect("store");
+        assert_eq!(store_row.shares[0].path, "/srv/shared");
+        let dns: crate::org_dns::OrgDnsResponse = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/orgs/{}/dns", org.id),
+                serde_json::Value::Null,
+                Some(&owner),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(dns.enrolled, 2);
+        assert_eq!(dns.applied, 1);
     }
 
     #[tokio::test]
@@ -8697,7 +9135,7 @@ mod tests {
         ));
         let pool = connect_sqlite(&path, true).await.unwrap();
         // Must stay one past CURRENT_SCHEMA_VERSION so open() rejects a future database.
-        sqlx::raw_sql("PRAGMA user_version=13")
+        sqlx::raw_sql("PRAGMA user_version=14")
             .execute(&pool)
             .await
             .unwrap();
@@ -10440,6 +10878,85 @@ mod tests {
             .await
             .status(),
             StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn control_view_storm_clears_baselines_so_the_next_poll_is_a_snapshot() {
+        let views = Mutex::new(ControlViewMap::new());
+        let observer = Uuid::from_u128(1);
+        let peers = BTreeSet::from([Uuid::from_u128(9)]);
+        assert!(remember_and_baseline(&views, observer, 1, &peers).is_none());
+        assert_eq!(
+            remember_and_baseline(&views, observer, 2, &peers).map(|(revision, _)| revision),
+            Some(1)
+        );
+        {
+            let mut map = views.lock().unwrap();
+            map.clear();
+            for index in 0..MAX_CONTROL_VIEWS {
+                map.insert(Uuid::from_u128(1_000 + index as u128), (1, BTreeSet::new()));
+            }
+        }
+        assert!(remember_and_baseline(&views, observer, 3, &peers).is_none());
+        assert_eq!(views.lock().unwrap().len(), 1);
+        assert_eq!(
+            remember_and_baseline(&views, observer, 4, &peers).map(|(revision, _)| revision),
+            Some(3)
+        );
+    }
+
+    #[tokio::test]
+    async fn control_updates_many_waiters_finish_within_the_wait_cap() {
+        let store = Store::memory().await.unwrap();
+        let router = app(store, "ap-southeast-2".into(), TEST_SECRET);
+        let org = create_test_org(&router, "control-storm-org").await;
+        let owner = signed_session(org.id, "owner-1", Role::Owner, now() + 60);
+        let node =
+            register_test_node(&router, org.id, &owner, "office-one", "office-key", &[]).await;
+        let snapshot: serde_json::Value = body(
+            call(
+                &router,
+                Method::GET,
+                &format!("/v1/nodes/{}/updates?since=0&wait=0", node.id),
+                serde_json::Value::Null,
+                Some(&node.node_token),
+            )
+            .await,
+        )
+        .await;
+        let revision = snapshot["revision"].as_i64().unwrap();
+        let started = Instant::now();
+        let mut waiters = Vec::new();
+        for _ in 0..16 {
+            let router = router.clone();
+            let token = node.node_token.clone();
+            let path = format!("/v1/nodes/{}/updates?since={revision}&wait=1", node.id);
+            waiters.push(tokio::spawn(async move {
+                call(
+                    &router,
+                    Method::GET,
+                    &path,
+                    serde_json::Value::Null,
+                    Some(&token),
+                )
+                .await
+            }));
+        }
+        let mut statuses = Vec::new();
+        for waiter in waiters {
+            statuses.push(waiter.await.unwrap().status());
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "waiters took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            statuses
+                .iter()
+                .all(|status| *status == StatusCode::NO_CONTENT),
+            "{statuses:?}"
         );
     }
 

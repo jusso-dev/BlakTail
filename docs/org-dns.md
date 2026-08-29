@@ -36,14 +36,20 @@ sent. Members are read-only.
 - Split suffixes, search domains, and extra records cannot use `.blaktail`.
 - Extra A/AAAA records must sit under a configured split suffix or search domain.
 - Resolvers are IPv4 or IPv6 addresses only. Encrypted transport is not in this slice.
+- `global_resolvers` are stored and used when probing a new snapshot. They are
+  not a public recursive forwarder; names outside MagicDNS, extra records, and
+  split suffixes stay REFUSED.
 - Longest matching split suffix wins. Duplicate suffixes after canonicalisation fail closed.
 
 ## Agent apply
 
 Peer poll responses include the published snapshot as `dns`. Agents persist that
-snapshot and keep the last successful copy when a later poll omits `dns` or
-fails. Extra A/AAAA records are answered locally by full name only. Published
-search domains are prepended after the MagicDNS domain (six suffixes total).
+snapshot, report the applied revision on the next poll, and keep the last
+successful copy when a later poll omits `dns` or fails. Extra A/AAAA records
+are answered locally by full name only. Published search domains are prepended
+after the MagicDNS domain (six suffixes total). The console Settings page shows
+which extra records match a split suffix and how many enrolled devices have
+applied the current revision.
 Names under a split suffix without a local extra record are forwarded to that
 suffix's resolvers. MagicDNS peer names stay coordinator-authoritative:
 `*.blaktail` is never forwarded, unknown `*.blaktail` names stay NXDOMAIN, and

@@ -18,11 +18,16 @@ use zeroize::Zeroize;
 pub mod acl_filter;
 pub mod dns;
 pub mod relay_client;
+pub mod share;
 pub use dns::{
     configure_system_dns, dns_domain, organisation_dns_managed, organisation_resolver_suffixes,
     published_resolver_suffixes, remove_system_dns, MagicDns,
 };
 pub use relay_client::RelayMesh;
+pub use share::{
+    disable_share, enable_share, load_shares, overlay_ipv4, save_shares, LocalShare,
+    PublishedShare, ShareServer, DEFAULT_SHARE_PORT,
+};
 
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/blaktail";
 pub const DEFAULT_INTERFACE: &str = "blaktail0";
@@ -239,6 +244,8 @@ pub struct NodeState {
     pub dns_degraded: Option<String>,
     #[serde(default)]
     pub control_revision: i64,
+    #[serde(default)]
+    pub published_shares: Vec<crate::PublishedShare>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -378,6 +385,8 @@ struct PeersResponse {
     dns: Option<OrgDnsSnapshot>,
     #[serde(default)]
     revision: Option<i64>,
+    #[serde(default)]
+    shares: Vec<crate::PublishedShare>,
 }
 
 #[derive(Serialize)]
@@ -547,6 +556,7 @@ impl Coordinator {
             org_dns: None,
             dns_degraded: None,
             control_revision: 0,
+            published_shares: vec![],
         })
     }
     pub async fn peers(&self, state: &mut NodeState) -> Result<Vec<Peer>, Error> {
@@ -555,6 +565,9 @@ impl Coordinator {
             .get(format!("{}/v1/nodes/{}/peers", self.base, state.node_id))
             .bearer_auth(&state.node_token);
         request = request.query(&[("ipv6", "true")]);
+        if let Some(revision) = state.org_dns.as_ref().map(|dns| dns.revision) {
+            request = request.query(&[("dns_revision", revision.to_string())]);
+        }
         if let Some(exit_node) = state.exit_node.as_deref() {
             request = request.query(&[("exit_node", exit_node)]);
         }
@@ -579,6 +592,9 @@ impl Coordinator {
             ("ipv6", "true".into()),
             ("version", "2".into()),
         ]);
+        if let Some(revision) = state.org_dns.as_ref().map(|dns| dns.revision) {
+            request = request.query(&[("dns_revision", revision.to_string())]);
+        }
         if let Some(exit_node) = state.exit_node.as_deref() {
             request = request.query(&[("exit_node", exit_node)]);
         }
@@ -616,7 +632,32 @@ impl Coordinator {
         state.relay_token = body.relay_token;
         state.relay_expires_at = body.relay_expires_at;
         apply_org_dns_snapshot(state, body.dns);
+        state.published_shares = body.shares;
         Ok(peers)
+    }
+
+    pub async fn publish_shares(
+        &self,
+        state: &NodeState,
+        shares: &[crate::LocalShare],
+    ) -> Result<(), Error> {
+        let response = self
+            .client
+            .put(format!("{}/v1/nodes/{}/shares", self.base, state.node_id))
+            .bearer_auth(&state.node_token)
+            .json(&serde_json::json!({ "shares": shares }))
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response
+                .json::<ApiErrorResponse>()
+                .await
+                .map(|body| body.error)
+                .unwrap_or_else(|_| format!("coordinator returned {status}"));
+            return Err(Error::Message(format!("share publish rejected: {message}")));
+        }
+        Ok(())
     }
 
     fn apply_control_peers(current: &[Peer], body: &PeersResponse) -> Vec<Peer> {
@@ -2155,6 +2196,7 @@ mod tests {
             org_dns: None,
             dns_degraded: None,
             control_revision: 0,
+            published_shares: vec![],
         };
         let mut network = RecordingNetwork::default();
         let dir =
@@ -2217,6 +2259,7 @@ mod tests {
             }),
             dns_degraded: None,
             control_revision: 3,
+            published_shares: vec![],
         };
         apply_org_dns_snapshot(&mut state, None);
         assert_eq!(state.org_dns.as_ref().map(|dns| dns.revision), Some(4));
@@ -2306,6 +2349,7 @@ mod tests {
             relay_expires_at: 0,
             dns: None,
             revision: Some(9),
+            shares: vec![],
         };
         let merged = Coordinator::apply_control_peers(&current, &body);
         assert_eq!(

@@ -36,12 +36,25 @@ sudo /usr/local/bin/blaktaild status
 
 The daemon runs `blaktaild run`, which resumes the persisted enrollment and re-applies the full peer set every poll (30 seconds by default). `KeepAlive.NetworkState` and WireGuard's 25-second persistent keepalive restore sessions after sleep/wake and apply node revocations. Logs contain node IDs and peer counts only.
 
-MagicDNS runs as an authoritative UDP stub on the node's ULA address and answers
-both A and AAAA records. The agent
-creates a marked `/etc/resolver/<org-prefix>.blaktail` scoped resolver, including the
-search suffix that makes both `peer-name` and the full MagicDNS name work. BlakTail
-answers only its private suffix and never forwards public DNS. Graceful shutdown and
-`down` remove only the marked file; an existing unmanaged file is never overwritten.
+MagicDNS runs as an authoritative UDP stub on the node's tailnet IPv4 address
+and still answers both A and AAAA records. The agent writes marked
+`/etc/resolver/<org-prefix>.blaktail` and `/etc/resolver/blaktail` files, then
+installs the organisation search suffix through `scutil` so both `peer-name`
+and the full MagicDNS name resolve. `up --exit-after-join` leaves those files
+in place for `blaktaild run`. BlakTail answers only its private suffix and never
+forwards public DNS. `down` and `pause` remove only marked files and the
+BlakTail `scutil` search entry; unmanaged resolver files are never overwritten.
+
+Share a folder with other devices on the same organisation:
+
+```sh
+sudo blaktaild share enable --path /Users/shared/files --name files
+```
+
+Peers browse `http://<this-node>.<org>.blaktail:5647/files/` over the overlay.
+On another Mac, Finder → Go → Connect to Server and enter that URL (guest,
+read-only). The share binds only the tailnet IPv4 address.
+`blaktaild share disable` withdraws it.
 
 `blaktaild status` shows credential expiry. To renew without changing the node's
 tailnet IP or WireGuard key, mint a fresh join key and pipe it to the agent:

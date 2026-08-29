@@ -12,7 +12,10 @@ Run:
 scripts/control-update-baseline.sh
 ```
 
-Both cases run in CI. A laptop debug run on 2026-08-28 printed:
+Both cases run in CI. A storm that fills the 10k in-memory view cap drops
+baselines so the next poll is a snapshot rather than an unbounded delta
+history. Concurrent waiters on a quiet revision return 204 within the wait
+cap. A laptop debug run on 2026-08-28 printed:
 
 | Nodes | Snapshot ms | Snapshot bytes | Peers in snapshot | Delta ms | Delta bytes | Connections |
 | --- | --- | --- | --- | --- | --- | --- |

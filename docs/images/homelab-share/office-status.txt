@@ -1,0 +1,16 @@
+joined
+node: 0ffed1d4-c8da-4d95-842a-490132c73634
+interface: blaktail0
+address: 100.64.0.148/32
+ipv6 address: fd4e:9ac6:b732:750::94/128
+dns: office-share-3294.41f1f8fb.blaktail
+coordinator: https://coord:8443
+credential: expires at Unix 1795742142 (in 90 day(s))
+advertised routes: none
+exit node: none
+peers: 1
+dns revision: 28
+dns managed: yes
+dns health: ok
+peer share: http://store-share-3294.41f1f8fb.blaktail:5647/files/
+  store-share-3294 172.25.0.7:51820 100.64.0.149/32,fd4e:9ac6:b732:750::95/128 all

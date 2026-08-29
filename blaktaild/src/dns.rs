@@ -1,7 +1,6 @@
 use crate::{Error, NodeState, OrgDnsSnapshot};
 #[cfg(test)]
 use std::net::Ipv4Addr;
-#[cfg(not(target_os = "macos"))]
 use std::process::{Command, Stdio};
 use std::{
     collections::HashMap,
@@ -202,7 +201,7 @@ fn state_ip(state: &NodeState) -> Result<IpAddr, Error> {
     addresses
         .iter()
         .copied()
-        .find(IpAddr::is_ipv6)
+        .find(IpAddr::is_ipv4)
         .or_else(|| addresses.first().copied())
         .ok_or_else(|| Error::Message("assigned tailnet address is invalid".into()))
 }
@@ -718,18 +717,25 @@ fn configure_platform_dns(
     let path = directory.join(domain);
     refuse_unmanaged_file(&path)?;
     write_atomic(&path, desired.as_bytes(), 0o644)?;
+    let tld = directory.join("blaktail");
+    refuse_unmanaged_file(&tld)?;
+    write_atomic(&tld, desired.as_bytes(), 0o644)?;
     for suffix in extra_suffixes {
         let extra = directory.join(suffix);
         refuse_unmanaged_file(&extra)?;
         write_atomic(&extra, desired.as_bytes(), 0o644)?;
     }
+    let _ = configure_macos_search(dns_ip, domain, extra_suffixes);
     if let Ok(entries) = fs::read_dir(directory) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if name == domain || extra_suffixes.iter().any(|suffix| suffix == name) {
+            if name == domain
+                || name == "blaktail"
+                || extra_suffixes.iter().any(|suffix| suffix == name)
+            {
                 continue;
             }
             let path = entry.path();
@@ -758,12 +764,56 @@ fn remove_platform_dns(
     if valid_domain(domain) {
         remove_managed_file(&Path::new("/etc/resolver").join(domain))?;
     }
+    remove_managed_file(Path::new("/etc/resolver/blaktail"))?;
     for suffix in extra_suffixes {
         if valid_published_suffix(suffix) {
             remove_managed_file(&Path::new("/etc/resolver").join(suffix))?;
         }
     }
+    let _ = remove_macos_search();
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_search(
+    dns_ip: IpAddr,
+    domain: &str,
+    extra_suffixes: &[String],
+) -> Result<(), Error> {
+    let search = std::iter::once(domain)
+        .chain(extra_suffixes.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!(
+        "d.init\nd.add ServerAddresses * {dns_ip}\nd.add SearchDomains * {search}\nd.add SupplementalMatchDomains * {search}\nset State:/Network/Service/BlakTail/DNS\n"
+    );
+    run_scutil(&script)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_macos_search() -> Result<(), Error> {
+    run_scutil("remove State:/Network/Service/BlakTail/DNS\n")
+}
+
+#[cfg(target_os = "macos")]
+fn run_scutil(script: &str) -> Result<(), Error> {
+    let mut child = Command::new("scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| Error::Message(format!("could not execute scutil: {error}")))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = write!(stdin, "{script}");
+    }
+    let status = child
+        .wait()
+        .map_err(|error| Error::Message(format!("scutil failed: {error}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Error::Message("scutil exited unsuccessfully".into()))
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -984,6 +1034,7 @@ mod tests {
             org_dns: None,
             dns_degraded: None,
             control_revision: 0,
+            published_shares: vec![],
         }
     }
 
@@ -1025,7 +1076,7 @@ mod tests {
         let state = state();
         assert_eq!(
             state_ip(&state).unwrap(),
-            "fd12:3456:789a:bcde::1".parse::<IpAddr>().unwrap()
+            "100.64.0.1".parse::<IpAddr>().unwrap()
         );
         let records = records_from_state(&state, "12345678.blaktail");
         let request = query("peer.12345678.blaktail", 28);

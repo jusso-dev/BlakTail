@@ -27,6 +27,8 @@ const WEBHOOK_SECRET_PREFIX: &str = "btw";
 const SEALED_SECRET_PREFIX: &str = "bte1.";
 const MAX_DESTINATIONS: i64 = 8;
 const MAX_ATTEMPTS: i64 = 8;
+const MAX_CONSOLE_EVENT_PAYLOAD: usize = 4_096;
+const ALLOWED_CONSOLE_EVENTS: &[&str] = &["membership.updated"];
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -89,6 +91,13 @@ pub(crate) struct WebhookDestination {
 pub(crate) struct CreateWebhook {
     name: String,
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConsoleWebhookEvent {
+    event_type: String,
+    payload: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -433,6 +442,51 @@ pub(crate) async fn create_destination(
     let (org_id, caller) = crate::admin::authenticate_org_header(&s, &headers).await?;
     crate::admin::require_scope(&caller, crate::admin::Scope::WebhooksWrite)?;
     insert_destination(&s, org_id, &caller.session, input).await
+}
+
+pub(crate) async fn enqueue_console_event(
+    State(s): State<AppState>,
+    UrlPath(org_id): UrlPath<Uuid>,
+    headers: HeaderMap,
+    Json(input): Json<ConsoleWebhookEvent>,
+) -> Result<StatusCode, ApiError> {
+    let session = crate::console_session(&s, &headers, org_id).await?;
+    if session.role != Role::Owner {
+        return Err(ApiError::Forbidden);
+    }
+    if !ALLOWED_CONSOLE_EVENTS.contains(&input.event_type.as_str()) {
+        return Err(ApiError::BadRequest("event type is not allowed".into()));
+    }
+    if !input.payload.is_object() {
+        return Err(ApiError::BadRequest("payload must be an object".into()));
+    }
+    let membership_id = input
+        .payload
+        .get("membership_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    if membership_id.is_empty() {
+        return Err(ApiError::BadRequest("membership_id is required".into()));
+    }
+    let encoded = input.payload.to_string();
+    if encoded.len() > MAX_CONSOLE_EVENT_PAYLOAD {
+        return Err(ApiError::BadRequest("payload is too large".into()));
+    }
+    let mut tx = s.store.pool.begin().await?;
+    enqueue(&mut tx, org_id, &input.event_type, &input.payload).await?;
+    crate::append_audit(
+        &mut tx,
+        org_id,
+        &session,
+        "webhook.event_enqueued",
+        "webhook_event",
+        Some(membership_id),
+        &serde_json::json!({"event_type": input.event_type}),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 pub(crate) async fn create_destination_console(

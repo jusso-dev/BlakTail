@@ -16,6 +16,7 @@ import {
   createWgOnlyPeer,
   rotateWgOnlyPeer,
   disableWebhook,
+  emitMembershipUpdated,
   listWebhookDeliveries,
   replayWebhookDelivery,
   revokeApiClient,
@@ -719,7 +720,7 @@ export async function changeMembershipAction(
     if (!membershipId) {
       return { ok: false, error: "Choose a membership." };
     }
-    await changeMembership({
+    const next = await changeMembership({
       organisationId: ctx.organisationId,
       membershipId,
       status: status || undefined,
@@ -727,6 +728,11 @@ export async function changeMembershipAction(
       actorUserId: ctx.userId,
       actorEmail: ctx.email,
       actorRole: ctx.role,
+    });
+    await emitMembershipUpdated(ctx, {
+      membership_id: membershipId,
+      role: next.role,
+      status: next.status,
     });
     revalidatePath("/settings");
     return { ok: true, data: undefined };

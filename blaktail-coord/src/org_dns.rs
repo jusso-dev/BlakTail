@@ -81,6 +81,10 @@ pub struct OrgDnsResponse {
     pub dns: OrgDnsSettings,
     #[serde(default)]
     pub record_preview: Vec<DnsRoutePreview>,
+    #[serde(default)]
+    pub applied: i64,
+    #[serde(default)]
+    pub enrolled: i64,
 }
 
 #[derive(Debug, Serialize)]

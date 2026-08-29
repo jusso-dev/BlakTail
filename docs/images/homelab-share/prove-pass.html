@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>prove-share.sh passed on homelab</title>
+  <style>
+    body { font: 15px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 28px; background: #111; color: #e8e4d9; }
+    h1 { font: 600 20px/1.2 ui-sans-serif, system-ui, sans-serif; color: #fff; }
+    .ok { color: #6ee7a8; }
+  </style>
+</head>
+<body>
+  <h1>deploy/homelab/prove-share.sh</h1>
+  <pre>
+== enrol office-share-2aba at 172.25.0.7:51820
+joined
+address: 100.64.0.150/32
+== enrol store-share-2aba at 172.25.0.8:51820
+joined
+address: 100.64.0.151/32
+== publish store share
+share enabled http://store-share-2aba.41f1f8fb.blaktail:5647/files/
+== allow overlay reachability
+ok ACL PUT 204
+<span class="ok">ok office fetched store share over the overlay
+ok office listed store share over WebDAV
+overlay_share passed</span>
+  </pre>
+</body>
+</html>

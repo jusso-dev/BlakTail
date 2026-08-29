@@ -1,9 +1,10 @@
 use blaktail_config::{AgentConfig, ConfigHandle, LoadedConfig, ReloadPlan, Service};
 use blaktaild::{
-    apply_peer_map, configure_system_dns, dns_domain, ensure_private_key, organisation_dns_managed,
-    organisation_resolver_suffixes, peer_key_hex, published_resolver_suffixes, read_state,
-    remove_system_dns, restore_peers, sync_once, validate_advertised_routes, validate_interface,
-    write_state, Coordinator, MagicDns, Network, Registration, RelayMesh, DIRECT_GRACE_SECS,
+    apply_peer_map, configure_system_dns, disable_share, dns_domain, enable_share,
+    ensure_private_key, load_shares, organisation_dns_managed, organisation_resolver_suffixes,
+    overlay_ipv4, peer_key_hex, published_resolver_suffixes, read_state, remove_system_dns,
+    restore_peers, sync_once, validate_advertised_routes, validate_interface, write_state,
+    Coordinator, MagicDns, Network, Registration, RelayMesh, ShareServer, DIRECT_GRACE_SECS,
     DIRECT_RETRY_SECS, HANDSHAKE_FRESH_SECS,
 };
 use clap::{Parser, Subcommand};
@@ -84,10 +85,33 @@ enum Command {
     },
     /// Show persisted node and peer status without exposing credentials.
     Status,
+    /// Publish or withdraw a read-only HTTP/WebDAV folder on the overlay.
+    Share {
+        #[command(subcommand)]
+        action: ShareCommand,
+    },
     /// Stop the local tunnel while retaining enrollment for a later resume.
     Pause,
     /// Revoke this node and remove its WireGuard interface.
     Down,
+}
+
+#[derive(Subcommand)]
+enum ShareCommand {
+    /// Serve an absolute directory over the tailnet as read-only HTTP and WebDAV.
+    Enable {
+        #[arg(long)]
+        path: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Stop serving a named share, or every share on this node.
+    Disable {
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List local and peer shares.
+    List,
 }
 
 #[derive(Clone, Default)]
@@ -126,7 +150,11 @@ impl AgentOverrides {
                 }
             }
             Command::Run { poll_seconds } => overrides.poll_seconds = *poll_seconds,
-            Command::Reauth { .. } | Command::Status | Command::Pause | Command::Down => {}
+            Command::Reauth { .. }
+            | Command::Status
+            | Command::Share { .. }
+            | Command::Pause
+            | Command::Down => {}
         }
         overrides
     }
@@ -364,6 +392,7 @@ async fn sync_loop(
 ) -> Result<(), blaktaild::Error> {
     let mut mesh: Option<RelayMesh> = None;
     let mut dns: Option<MagicDns> = None;
+    let mut shares: Option<ShareServer> = None;
     let mut paths: HashMap<Uuid, PeerPath> = HashMap::new();
     loop {
         match sync_once(coordinator, network, state, state_dir).await {
@@ -374,14 +403,14 @@ async fn sync_loop(
             }
         }
         manage_magic_dns(&mut dns, state, state_dir).await;
+        manage_shares(&mut shares, coordinator, state, state_dir).await;
         manage_paths(network, &mut mesh, state, &mut paths).await;
         report_relay_endpoint(coordinator, mesh.as_ref(), state, state_dir).await;
         if exit_after_join {
             if let Some(active) = mesh.take() {
                 active.stop();
             }
-            shutdown_magic_dns(&mut dns, state, state_dir);
-            info!("initial peer sync complete; handing over to the service manager");
+            info!("initial peer sync complete; leaving MagicDNS resolver files for the service manager");
             return Ok(());
         }
         let previous_assigned_ips = state.assigned_ips.clone();
@@ -419,8 +448,56 @@ async fn sync_loop(
     if let Some(active) = mesh.take() {
         active.stop();
     }
+    if let Some(active) = shares.take() {
+        active.stop();
+    }
     shutdown_magic_dns(&mut dns, state, state_dir);
     Ok(())
+}
+
+async fn manage_shares(
+    server: &mut Option<ShareServer>,
+    coordinator: &Coordinator,
+    state: &blaktaild::NodeState,
+    state_dir: &std::path::Path,
+) {
+    let local = match load_shares(state_dir) {
+        Ok(shares) => shares,
+        Err(error) => {
+            warn!(%error, "could not read local share configuration");
+            return;
+        }
+    };
+    let enabled = local.iter().any(|share| share.enabled);
+    if !enabled {
+        if let Some(active) = server.take() {
+            active.stop();
+        }
+        return;
+    }
+    let Ok(bind_ip) = overlay_ipv4(state) else {
+        warn!("cannot serve shares without a tailnet IPv4 address");
+        return;
+    };
+    if server
+        .as_ref()
+        .is_some_and(|active| active.matches(bind_ip, &local))
+    {
+        return;
+    }
+    if let Some(active) = server.take() {
+        active.stop();
+    }
+    match ShareServer::spawn(bind_ip, &local).await {
+        Ok(created) => {
+            info!(address = %created.listen_addr(), "overlay file share listening");
+            if let Err(error) = coordinator.publish_shares(state, &local).await {
+                warn!(%error, "could not publish shares to the coordinator");
+            }
+            *server = Some(created);
+        }
+        Err(error) => warn!(%error, "could not bind overlay file share"),
+    }
 }
 
 async fn manage_magic_dns(
@@ -1186,6 +1263,22 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                 Some(reason) => println!("dns health: degraded ({reason})"),
                 None => println!("dns health: ok"),
             }
+            match load_shares(state_dir) {
+                Ok(shares) if !shares.is_empty() => {
+                    for share in shares {
+                        println!(
+                            "share: {} {} {}",
+                            if share.enabled { "enabled" } else { "disabled" },
+                            share.url(&state.dns_name),
+                            share.path
+                        );
+                    }
+                }
+                _ => {}
+            }
+            for share in &state.published_shares {
+                println!("peer share: {}", share.url());
+            }
             for peer in state.peers {
                 println!(
                     "  {} {} {} {}",
@@ -1194,6 +1287,36 @@ async fn run(cli: Cli, operator_config: AgentConfig) -> Result<(), blaktaild::Er
                     peer.allowed_ips.join(","),
                     peer.ingress_summary()
                 );
+            }
+        }
+        Command::Share { action } => {
+            let state = read_state(state_dir)?;
+            let coordinator = coordinator_client(&state.coord, cli.coord_ca.as_deref())?;
+            match action {
+                ShareCommand::Enable { path, name } => {
+                    let share = enable_share(state_dir, &path, name.as_deref())?;
+                    let shares = load_shares(state_dir)?;
+                    coordinator.publish_shares(&state, &shares).await?;
+                    println!("share enabled {}", share.url(&state.dns_name));
+                }
+                ShareCommand::Disable { name } => {
+                    let shares = disable_share(state_dir, name.as_deref())?;
+                    coordinator.publish_shares(&state, &shares).await?;
+                    println!("share disabled");
+                }
+                ShareCommand::List => {
+                    for share in load_shares(state_dir)? {
+                        println!(
+                            "{} {} {}",
+                            if share.enabled { "enabled" } else { "disabled" },
+                            share.url(&state.dns_name),
+                            share.path
+                        );
+                    }
+                    for share in &state.published_shares {
+                        println!("peer {}", share.url());
+                    }
+                }
             }
         }
         Command::Pause => {

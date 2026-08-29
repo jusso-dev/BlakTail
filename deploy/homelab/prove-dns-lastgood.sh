@@ -24,7 +24,7 @@ status_of() {
 magic_dns_ip() {
   local text
   text="$(status_of)" || return 1
-  awk '/^ipv6 address:/ { sub("/128","",$3); print $3; exit }' <<<"$text"
+  awk '$1 == "address:" { sub("/32","",$2); print $2; exit }' <<<"$text"
 }
 
 container_ip() {

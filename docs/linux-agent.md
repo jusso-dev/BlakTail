@@ -84,11 +84,13 @@ node-to-node IPv6 is enabled independently.
 
 ## MagicDNS
 
-The agent runs an authoritative UDP DNS stub on its own ULA address, port 53.
+The agent runs an authoritative UDP DNS stub on its tailnet IPv4 address, port 53.
 It answers A and AAAA records for the node and currently authorised peers under the
 organisation's `<org-prefix>.blaktail` domain. Unknown private names return
 `NXDOMAIN`; names outside that suffix are refused and never forwarded by BlakTail.
 Both `peer-name` and `peer-name.<org-prefix>.blaktail` resolve locally.
+`up --exit-after-join` leaves system resolver configuration in place for
+`blaktaild run`.
 
 On systemd-resolved hosts, the agent installs a per-interface search and route-only
 domain with `resolvectl`; otherwise it uses `resolvconf`. The final fallback safely
@@ -96,8 +98,20 @@ backs up and prepends `/etc/resolv.conf`, refuses to overwrite a symlink, and re
 the exact backup on `blaktaild down`. If the file changes after BlakTail manages it,
 the agent preserves the backup and refuses to overwrite the operator's change.
 
-Using the ULA for the local stub keeps private name resolution working when the
-BlakTail interface's IPv4 address is deliberately disabled.
+The stub prefers the IPv4 overlay address so `ping peer-name` keeps working when
+IPv6 is unroutable. AAAA answers remain available.
+
+Share a folder with other devices on the same organisation:
+
+```sh
+sudo blaktaild share enable --path /srv/shared --name files
+```
+
+Peers browse `http://<this-node>.<org>.blaktail:5647/files/` over the overlay.
+Finder can mount that URL with Go → Connect to Server (read-only WebDAV).
+The listener binds only the tailnet IPv4 address. Policy that already allows a
+peer to see the node also opens TCP 5647 unless a deny rule blocks it.
+`blaktaild share disable` withdraws the share.
 
 ## IPv6-only path drill
 

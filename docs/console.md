@@ -177,7 +177,14 @@ and persisted agent state do not change.
 
 Settings can publish organisation DNS: split suffixes, upstream resolvers, search
 domains, and extra A/AAAA records. Members are read-only. MagicDNS names stay
-coordinator-authoritative and cannot be impersonated from this form.
+coordinator-authoritative and cannot be impersonated from this form. The page
+shows which extra records match a split suffix and how many enrolled devices have
+applied the current revision.
+
+Device details list overlay file shares published by `blaktaild share enable`.
+The coordinator stores the path and label only; file bytes never leave the node
+except over the tailnet. Peers open the URL in a browser or mount it read-only
+in Finder with Connect to Server.
 
 The Audit log is readable by every organisation member. Bootstrap, invitation use
 and revocation, role assignment, denied invitation administration, join-key

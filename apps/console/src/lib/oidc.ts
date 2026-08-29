@@ -474,7 +474,7 @@ export async function changeMembership(input: {
   actorUserId: string;
   actorEmail: string;
   actorRole: "owner" | "admin" | "member";
-}): Promise<void> {
+}): Promise<{ role: "owner" | "admin" | "member"; status: string }> {
   if (input.actorRole !== "owner") {
     throw new OidcError("Only owners can change membership.");
   }
@@ -504,6 +504,10 @@ export async function changeMembership(input: {
       status: input.status ?? target.status,
     })
     .where(eq(membership.id, input.membershipId));
+  const next = {
+    role: input.role ?? target.role,
+    status: input.status ?? target.status,
+  };
   await writeConsoleAudit({
     organisationId: input.organisationId,
     actorUserId: input.actorUserId,
@@ -514,6 +518,7 @@ export async function changeMembership(input: {
     result: "ok",
     targetType: "membership",
     targetId: input.membershipId,
-    details: { role: input.role ?? target.role, status: input.status ?? target.status },
+    details: next,
   });
+  return next;
 }

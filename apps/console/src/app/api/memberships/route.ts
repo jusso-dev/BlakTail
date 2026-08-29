@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { emitMembershipUpdated } from "@/lib/coord";
 import { changeMembership, OidcError } from "@/lib/oidc";
 import { requireConsoleContext } from "@/lib/session";
 
@@ -13,7 +14,7 @@ export async function PATCH(request: Request) {
     if (!body.membershipId) {
       return NextResponse.json({ error: "membershipId is required" }, { status: 400 });
     }
-    await changeMembership({
+    const next = await changeMembership({
       organisationId: ctx.organisationId,
       membershipId: body.membershipId,
       role: body.role,
@@ -21,6 +22,11 @@ export async function PATCH(request: Request) {
       actorUserId: ctx.userId,
       actorEmail: ctx.email,
       actorRole: ctx.role,
+    });
+    await emitMembershipUpdated(ctx, {
+      membership_id: body.membershipId,
+      role: next.role,
+      status: next.status,
     });
     return NextResponse.json({ ok: true });
   } catch (error) {
