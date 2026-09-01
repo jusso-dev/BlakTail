@@ -10,6 +10,9 @@ unit, but do not enrol or enable the service.
 ```sh
 sudo install -d -m 0700 /var/lib/blaktail
 blaktail-config check-config --service agent
+# Laptop Compose stack from scripts/quickstart.sh:
+sudo blaktaild up --coord https://127.0.0.1:8443 --coord-ca certs/ca.crt
+# Deployed coordinator:
 sudo blaktaild up --coord https://coord.example.org \
   --endpoint 203.0.113.10:51820
 sudo blaktaild status

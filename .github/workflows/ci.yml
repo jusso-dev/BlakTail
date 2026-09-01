@@ -64,6 +64,9 @@ jobs:
       - name: Conformance lab self-test
         run: scripts/conformance/lab-static-test.sh
 
+      - name: Validate getting-started path
+        run: bash scripts/validate-getting-started.sh
+
       - name: Build and inspect Linux packages
         run: |
           sudo apt-get update

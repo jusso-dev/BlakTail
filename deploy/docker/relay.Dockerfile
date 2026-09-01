@@ -1,5 +1,5 @@
 # Australia-pinned UDP relay. Stateless; scale horizontally behind a UDP NLB.
-FROM rust:1.95-slim AS build
+FROM rust:1.98-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY config ./config

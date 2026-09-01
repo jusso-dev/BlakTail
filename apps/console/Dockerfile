@@ -1,5 +1,5 @@
 # BlakTail console (Next.js + Better Auth + Drizzle). Migrations are an explicit gate.
-FROM rust:1.95-slim-bookworm AS config-build
+FROM rust:1.98-slim-bookworm AS config-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY config ./config

@@ -1,6 +1,6 @@
 # BlakTail coordination server. TLS terminates inside the binary (rustls),
 # so a load balancer can pass traffic through untouched.
-FROM rust:1.95-slim-bookworm AS build
+FROM rust:1.98-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY config ./config

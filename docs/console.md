@@ -195,6 +195,10 @@ sessions, join keys, node tokens, and browser device codes are never included.
 
 ## Local development
 
+To run console, coordinator, and relay together, use
+`scripts/quickstart.sh` ([getting-started.md](getting-started.md)).
+The steps below are console-only.
+
 ```sh
 cp apps/console/.env.example apps/console/.env
 # point DATABASE_URL at onshore Postgres, then:

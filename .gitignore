@@ -30,6 +30,12 @@ wg*.conf
 *.sqlite3
 *.db
 
+# Laptop quickstart (certs, first-owner password, bootstrap token)
+/certs/
+/owner-password
+/bootstrap-token
+/.quickstart/
+
 # Local scanner installs
 .tools/
 

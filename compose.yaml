@@ -1,6 +1,19 @@
-# Single-host BlakTail stack (EC2 or any Docker host).
+# Single-host BlakTail stack (laptop or any Docker host).
+# Laptop first run: scripts/quickstart.sh (see README.md).
 # Production/scalable deployment: see deploy/aws and docs/deploy-aws.md.
+# Certificates live in the coordcerts volume so bind mounts are not required
+# when Docker runs on another machine (DOCKER_CONTEXT).
 services:
+  certs-init:
+    build:
+      context: .
+      dockerfile: deploy/docker/certs.Dockerfile
+    restart: "no"
+    volumes:
+      - coordcerts:/certs
+    environment:
+      BLAKTAIL_TLS_EXTRA_SAN: ${BLAKTAIL_TLS_EXTRA_SAN:-}
+
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -24,9 +37,12 @@ services:
     read_only: true
     tmpfs:
       - /tmp:mode=0700
+    depends_on:
+      certs-init:
+        condition: service_completed_successfully
     volumes:
       - coorddata:/data
-      - ./certs:/certs:ro
+      - coordcerts:/certs:ro
     environment:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
       BLAKTAIL_BIND: 0.0.0.0:8443
@@ -59,7 +75,7 @@ services:
       - "127.0.0.1:9701:9701"
     volumes:
       - coorddata:/data
-      - ./certs:/certs:ro
+      - coordcerts:/certs:ro
     environment:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
       BLAKTAIL_BIND: 0.0.0.0:8443
@@ -104,8 +120,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      certs-init:
+        condition: service_completed_successfully
     volumes:
-      - ./certs:/certs:ro
+      - coordcerts:/certs:ro
     environment:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
       DATABASE_URL: postgres://blaktail:${POSTGRES_PASSWORD}@postgres:5432/blaktail
@@ -133,7 +151,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - ./certs:/certs:ro
+      - coordcerts:/certs:ro
       - consolecache:/app/.next/cache
     environment:
       BLAKTAIL_REGION: ${BLAKTAIL_REGION:-ap-southeast-2}
@@ -149,3 +167,4 @@ volumes:
   pgdata:
   coorddata:
   consolecache:
+  coordcerts:

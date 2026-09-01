@@ -13,7 +13,7 @@ services:
     ports:
       - "3443:3443"
     volumes:
-      - ./certs:/certs:ro
+      - coordcerts:/certs:ro
       - ./deploy/homelab/Caddyfile:/etc/caddy/Caddyfile:ro
     depends_on:
       console:
@@ -35,7 +35,7 @@ services:
     devices:
       - /dev/net/tun
     volumes:
-      - ./certs/ca.crt:/certs/ca.crt:ro
+      - coordcerts:/certs:ro
       - agent-office-data:/var/lib/blaktail
     environment:
       BLAKTAIL_COORD_CA: /certs/ca.crt
@@ -59,7 +59,7 @@ services:
     devices:
       - /dev/net/tun
     volumes:
-      - ./certs/ca.crt:/certs/ca.crt:ro
+      - coordcerts:/certs:ro
       - agent-store-data:/var/lib/blaktail
     environment:
       BLAKTAIL_COORD_CA: /certs/ca.crt
