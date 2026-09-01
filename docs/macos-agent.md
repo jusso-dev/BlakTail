@@ -17,7 +17,13 @@ sudo install -m 0755 target/release/blaktaild /usr/local/bin/blaktaild
 sudo install -m 0644 packaging/macos/com.blaktail.agent.plist /Library/LaunchDaemons/com.blaktail.agent.plist
 ```
 
-Root is required to create/configure `utun` and routes. Agent state, the WireGuard private key, and the coordinator node credential are stored under `/var/lib/blaktail` with mode `0600`. They are never included in logs. Supply a join key through stdin to keep it out of shell history and process listings:
+Root is required to create/configure `utun` and routes. Agent state, the WireGuard private key, and the coordinator node credential are stored under `/var/lib/blaktail` with mode `0600`. They are never included in logs. The laptop Compose stack from `scripts/quickstart.sh` does not need a join key:
+
+```sh
+sudo blaktaild up --coord https://127.0.0.1:8443 --coord-ca certs/ca.crt
+```
+
+For a deployed coordinator, supply a join key through stdin to keep it out of shell history and process listings:
 
 ```sh
 printf '%s' "$BLAKTAIL_JOIN_KEY" | sudo /usr/local/bin/blaktaild up \

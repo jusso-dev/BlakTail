@@ -11,6 +11,12 @@ command -v openssl >/dev/null || { echo "openssl is required" >&2; exit 1; }
 mkdir -p "$DIR"
 umask 077
 
+# Extra SAN entries for a remote Docker host, e.g. DNS:homelab,IP:192.168.1.19
+SAN="DNS:coord,DNS:localhost,IP:127.0.0.1"
+if [ -n "${BLAKTAIL_TLS_EXTRA_SAN:-}" ]; then
+  SAN="${SAN},${BLAKTAIL_TLS_EXTRA_SAN}"
+fi
+
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -keyout "$DIR/ca.key" -out "$DIR/ca.crt" -days 3650 \
   -subj "/CN=BlakTail Development CA" \
@@ -20,12 +26,12 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -keyout "$DIR/coord.key" -out "$DIR/coord.csr" \
   -subj "/CN=coord" \
-  -addext "subjectAltName=DNS:coord,DNS:localhost,IP:127.0.0.1"
+  -addext "subjectAltName=${SAN}"
 
 openssl x509 -req -in "$DIR/coord.csr" \
   -CA "$DIR/ca.crt" -CAkey "$DIR/ca.key" -CAcreateserial \
   -out "$DIR/coord.crt" -days 825 \
-  -extfile <(printf "subjectAltName=DNS:coord,DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth")
+  -extfile <(printf "subjectAltName=${SAN}\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth")
 
 rm -f "$DIR/coord.csr"
 chmod 600 "$DIR/coord.key" "$DIR/ca.key"

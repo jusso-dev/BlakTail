@@ -1,0 +1,14 @@
+# Agent file for the laptop Compose stack from scripts/quickstart.sh.
+# Secrets never go in this file. Pass the coordinator CA with
+# --coord-ca certs/ca.crt or BLAKTAIL_COORD_CA.
+schema_version = 1
+
+[deployment]
+profile = "development"
+
+[agent]
+state_dir = "/var/lib/blaktail"
+coordinator_url = "https://127.0.0.1:8443"
+interface = "blaktail0"
+poll_seconds = 30
+advertised_routes = []
